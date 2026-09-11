@@ -449,6 +449,7 @@ static VAStatus hobot_vaTerminate(VADriverContextP ctx) {
         free(drv);
         ctx->pDriverData = NULL;
         hb_mem_module_close();
+        unlink("/dev/shm/hobot_va_watchdog");
     }
     return VA_STATUS_SUCCESS;
 }
@@ -878,6 +879,10 @@ static VAStatus hobot_vaCreateContext(
             c->current_render_target = VA_INVALID_SURFACE;
             c->enc_coded_buf = 0;
             c->frame_count = 0;
+            c->watchdog_anomaly_count = 0;
+            c->last_anomaly_sec = 0;
+            c->watchdog_trace_countdown = 0;
+            unlink("/dev/shm/hobot_va_watchdog");
 
             int is_enc = (cfg->entrypoint == VAEntrypointEncSlice || cfg->entrypoint == VAEntrypointEncPicture);
             c->is_encoder = is_enc;
@@ -999,6 +1004,7 @@ static VAStatus hobot_vaDestroyContext(VADriverContextP ctx, VAContextID context
             hctx->vpu_running = 0;
         }
         hctx->allocated = 0;
+        unlink("/dev/shm/hobot_va_watchdog");
     }
     return VA_STATUS_SUCCESS;
 }
@@ -1557,7 +1563,7 @@ static VAStatus hobot_vaSyncSurface(VADriverContextP ctx, VASurfaceID render_tar
 
                 FILE *wfp = fopen("/dev/shm/hobot_va_watchdog", "w");
                 if (wfp) {
-                    fprintf(wfp, "%d %ld %d %d\n", hctx->watchdog_anomaly_count, (long)now_ts.tv_sec, err_mb, total_mb);
+                    fprintf(wfp, "%d %d %ld %d %d\n", (int)getpid(), hctx->watchdog_anomaly_count, (long)time(NULL), err_mb, total_mb);
                     fclose(wfp);
                 }
             } else if (hctx->watchdog_anomaly_count > 0) {
