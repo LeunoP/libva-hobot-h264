@@ -1556,8 +1556,8 @@ static VAStatus hobot_vaExportSurfaceHandle(
     }
 
     HobotSurface *surf = &drv->surfaces[surface_id];
-    if (surf->dma_fd < 0 && !surf->has_decoded_frame) {
-        va_trace("vaExportSurfaceHandle: surface=%u no dma_fd, syncing...", surface_id);
+    if (!surf->has_decoded_frame) {
+        va_trace("vaExportSurfaceHandle: surface=%u syncing for decoded frame...", surface_id);
         hobot_vaSyncSurface(ctx, surface_id);
     }
     if (surf->dma_fd < 0) {
@@ -1591,6 +1591,13 @@ static VAStatus hobot_vaExportSurfaceHandle(
         uv_offset = pitch * vstride;
     }
 
+    uint64_t phys_addr = 0;
+    if (surf->has_decoded_frame && surf->vpu_out_buf.vframe_buf.phy_ptr[0] > 0) {
+        phys_addr = surf->vpu_out_buf.vframe_buf.phy_ptr[0];
+    } else if (surf->has_preallocated && surf->preallocated_gbuf.phys_addr[0] > 0) {
+        phys_addr = surf->preallocated_gbuf.phys_addr[0];
+    }
+
     VADRMPRIMESurfaceDescriptor *desc = (VADRMPRIMESurfaceDescriptor *)descriptor;
     desc->fourcc = VA_FOURCC_NV12;
     desc->width = surf->width;
@@ -1598,7 +1605,7 @@ static VAStatus hobot_vaExportSurfaceHandle(
     desc->num_objects = 1;
     desc->objects[0].fd = exp_fd;
     desc->objects[0].size = buf_size;
-    desc->objects[0].drm_format_modifier = 0;
+    desc->objects[0].drm_format_modifier = phys_addr;
 
     desc->num_layers = 1;
     desc->layers[0].drm_format = VA_FOURCC_NV12;
@@ -1611,8 +1618,8 @@ static VAStatus hobot_vaExportSurfaceHandle(
     desc->layers[0].offset[1] = uv_offset;
     desc->layers[0].pitch[1] = pitch;
 
-    va_trace("vaExportSurfaceHandle -> success: surf=%u, dma_fd=%d, exp_fd=%d, %ux%u",
-             surface_id, surf->dma_fd, exp_fd, desc->width, desc->height);
+    va_trace("vaExportSurfaceHandle -> success: surf=%u, dma_fd=%d, exp_fd=%d, phys=0x%lx, %ux%u",
+             surface_id, surf->dma_fd, exp_fd, (unsigned long)phys_addr, desc->width, desc->height);
     return VA_STATUS_SUCCESS;
 }
 
