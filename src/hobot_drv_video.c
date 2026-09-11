@@ -398,6 +398,7 @@ typedef struct {
     media_codec_buffer_t dec_in_buf;
     int dec_in_buf_valid;
     int dec_in_buf_offset;
+    int watchdog_trace_countdown;
 } HobotContext;
 
 /* Internal Image Object */
@@ -1514,6 +1515,51 @@ static VAStatus hobot_vaSyncSurface(VADriverContextP ctx, VASurfaceID render_tar
             } else {
                 target = render_target;
             }
+
+            uint32_t err_reason = (uint32_t)out_info.video_frame_info.error_reason;
+            int err_mb = out_info.video_frame_info.err_mb_in_frame_display;
+            int total_mb = out_info.video_frame_info.total_mb_in_frame_display;
+            int disp_idx = out_info.video_frame_info.frame_display_index;
+            int deco_idx = out_info.video_frame_info.frame_decoded_index;
+
+            if (err_reason != 0 || err_mb > 0) {
+                hctx->watchdog_trace_countdown = 20;
+                fprintf(stderr, "\n[HOBOT-VA][WATCHDOG] >>> VPU ANOMALY / TIMEOUT DETECTED <<<\n"
+                                "[HOBOT-VA][WATCHDOG] target_surf=%u disp_idx=%d deco_idx=%d\n"
+                                "[HOBOT-VA][WATCHDOG] error_reason=0x%08x warn_info=0x%08x\n"
+                                "[HOBOT-VA][WATCHDOG] err_mb=%d total_mb=%d (%.1f%% corrupted)\n"
+                                "[HOBOT-VA][WATCHDOG] phy=[0x%llx, 0x%llx] fd=%d stride=%d size=%u (%dx%d)\n\n",
+                        target, disp_idx, deco_idx,
+                        err_reason, (uint32_t)out_info.video_frame_info.warn_info,
+                        err_mb, total_mb,
+                        total_mb > 0 ? ((double)err_mb * 100.0 / total_mb) : 0.0,
+                        (unsigned long long)out_buf.vframe_buf.phy_ptr[0],
+                        (unsigned long long)out_buf.vframe_buf.phy_ptr[1],
+                        out_buf.vframe_buf.fd[0],
+                        out_buf.vframe_buf.stride,
+                        out_buf.vframe_buf.size,
+                        out_buf.vframe_buf.width,
+                        out_buf.vframe_buf.height);
+            } else if (hctx->watchdog_trace_countdown > 0) {
+                hctx->watchdog_trace_countdown--;
+                fprintf(stderr, "[HOBOT-VA][POST-WD #%02d] target_surf=%u disp_idx=%d deco_idx=%d err_reason=0x%08x err_mb=%d/%d phy=[0x%llx, 0x%llx] fd=%d size=%u\n",
+                        20 - hctx->watchdog_trace_countdown,
+                        target, disp_idx, deco_idx,
+                        err_reason, err_mb, total_mb,
+                        (unsigned long long)out_buf.vframe_buf.phy_ptr[0],
+                        (unsigned long long)out_buf.vframe_buf.phy_ptr[1],
+                        out_buf.vframe_buf.fd[0],
+                        out_buf.vframe_buf.size);
+            }
+
+            /* Phase A: Frame Drop Experiment (Discard corrupted frames) */
+            if (err_mb > 0 || (err_reason & 0x00020000)) {
+                fprintf(stderr, "[HOBOT-VA][DROP] Dropping corrupted frame (err_mb=%d/%d, err_reason=0x%08x) for target=%u\n",
+                        err_mb, total_mb, err_reason, target);
+                hb_mm_mc_queue_output_buffer(mctx, &out_buf, 50);
+                continue;
+            }
+
             if (target > 0 && target < MAX_SURFACES && drv->surfaces[target].allocated) {
                 HobotSurface *tsurf = &drv->surfaces[target];
                 if (tsurf->has_decoded_frame) {
