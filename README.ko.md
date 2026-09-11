@@ -4,6 +4,9 @@
 
 RDK X5 (D-Robotics, ARM AArch64) 플랫폼의 VPU를 위한 커스텀 VA-API 드라이버.
 
+> [!NOTE]
+> **알림**: 해당 코드는 AI(Google DeepMind Antigravity / Gemini)가 작성 및 최적화했습니다.
+
 ## 지원 환경
 
 - **보드**: RDK X5 (D-Robotics, Cortex-A55)

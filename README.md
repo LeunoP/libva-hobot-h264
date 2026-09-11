@@ -11,6 +11,10 @@
 
 It delivers hardware-accelerated **1080p 60fps H.264 decoding and encoding** with rock-solid frame pacing, 0 dropped frames, and low CPU utilization, making it ideal for media playback (mpv, Kodi) and cloud game streaming (Moonlight).
 
+> [!NOTE]
+> **Notice**: This codebase and driver architecture were researched, developed, and optimized by AI (Google DeepMind Antigravity / Gemini) in collaboration with LeunoP.
+> *(해당 코드는 AI가 작성 및 최적화했습니다.)*
+
 ---
 
 ## Key Features

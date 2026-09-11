@@ -1,3 +1,13 @@
+/*
+ * D-Robotics RDK-X5 VPU VA-API Driver (libva-hobot)
+ *
+ * Notice: This code was developed and optimized by AI (Google DeepMind Antigravity / Gemini)
+ * in collaboration with LeunoP for the D-Robotics RDK-X5 platform.
+ * (해당 코드는 AI에 의해 작성 및 최적화되었습니다.)
+ *
+ * Licensed under the MIT License.
+ */
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
