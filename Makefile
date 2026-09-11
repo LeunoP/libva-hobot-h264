@@ -1,0 +1,20 @@
+CC ?= gcc
+CFLAGS ?= -O2 -Wall -fPIC -I/usr/include
+LDFLAGS ?= -shared -L/usr/hobot/lib -lva -lva-drm -lmultimedia -Wl,-rpath=/usr/hobot/lib
+
+TARGET = hobot_drv_video.so
+SRCS = src/hobot_drv_video.c
+
+all: $(TARGET)
+
+$(TARGET): $(SRCS)
+	$(CC) $(CFLAGS) $(SRCS) $(LDFLAGS) -o $@
+
+install: $(TARGET)
+	install -d /usr/lib/aarch64-linux-gnu/dri
+	install -m 755 $(TARGET) /usr/lib/aarch64-linux-gnu/dri/$(TARGET)
+
+clean:
+	rm -f $(TARGET) test_vpu_c test_sps_gen
+
+.PHONY: all install clean

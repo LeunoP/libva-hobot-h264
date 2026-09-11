@@ -1,0 +1,5 @@
+*.so
+*.o
+*.tar.gz
+test_vpu_c
+test_sps_gen
