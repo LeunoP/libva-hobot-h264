@@ -7,9 +7,8 @@
 --    - When 3 anomalies accumulate during the probe:
 --        Switches decoder to software mode (hwdec=no),
 --        Rewinds to beginning (00:00:00),
---        Reveals screen, restores audio, and displays centered 2-line OSD alert:
---          SW디코더로 전환 합니다
---          잠시만 기다려주세요
+--        Reveals screen, restores audio, and displays top-left OSD notice:
+--          SW 디코더 (1.5s)
 -- 3. Probing Success (Clean 5 seconds):
 --    - Rewinds to beginning (00:00:00), reveals screen, restores audio,
 --      and continues smooth HW playback.
@@ -17,8 +16,8 @@
 --    - If an error/anomaly occurs during playback:
 --        Does NOT rewind (continues playing as-is),
 --        Switches decoder to software mode (hwdec=no),
---        Displays small notice in the top-left corner for 3 seconds:
---          SW디코더 전환
+--        Displays top-left OSD notice:
+--          SW 디코더 (1.5s)
 
 local probing = false
 local prev_mute = false
@@ -33,39 +32,23 @@ black_ov.res_x = 1920
 black_ov.res_y = 1080
 black_ov.data = "{\\an7\\pos(0,0)\\bord0\\shad0\\1c&H000000&\\p1}m 0 0 l 1920 0 l 1920 1080 l 0 1080{\\p0}"
 
--- Centered OSD overlay for probing fallback
-local notice_center_ov = mp.create_osd_overlay("ass-events")
-notice_center_ov.res_x = 1920
-notice_center_ov.res_y = 1080
-local center_timer = nil
+-- Top-left small OSD overlay for SW decoder notice (1.5s)
+local notice_ov = mp.create_osd_overlay("ass-events")
+notice_ov.res_x = 1920
+notice_ov.res_y = 1080
+local notice_timer = nil
 
-local function show_sw_notice_center()
-    notice_center_ov.data = "{\\an5\\pos(960,540)}{\\fs45}{\\b1}SW디코더로 전환 합니다\\N잠시만 기다려주세요"
-    notice_center_ov:update()
-    if center_timer then center_timer:kill() end
-    center_timer = mp.add_timeout(3.5, function()
-        notice_center_ov:remove()
-        center_timer = nil
+local function show_sw_notice()
+    notice_ov.data = "{\\an7\\pos(30,30)}{\\fs26}{\\b1\\bord2\\shad1\\c&HFFFFFF&\\3c&H111111&}SW 디코더"
+    notice_ov:update()
+    if notice_timer then notice_timer:kill() end
+    notice_timer = mp.add_timeout(1.5, function()
+        notice_ov:remove()
+        notice_timer = nil
     end)
 end
 
--- Top-left small OSD overlay for mid-playback fallback
-local notice_tl_ov = mp.create_osd_overlay("ass-events")
-notice_tl_ov.res_x = 1920
-notice_tl_ov.res_y = 1080
-local tl_timer = nil
-
-local function show_sw_notice_top_left()
-    notice_tl_ov.data = "{\\an7\\pos(30,30)}{\\fs26}{\\b1\\bord2\\shad1\\c&HFFFFFF&\\3c&H111111&}SW디코더 전환"
-    notice_tl_ov:update()
-    if tl_timer then tl_timer:kill() end
-    tl_timer = mp.add_timeout(3.0, function()
-        notice_tl_ov:remove()
-        tl_timer = nil
-    end)
-end
-
--- Probing SW switch: rewinds to 00:00:00, shows centered alert, reveals screen
+-- Probing SW switch: rewinds to 00:00:00, shows top-left notice, reveals screen
 local function switch_to_sw_probe(reason)
     if is_switching then return end
     is_switching = true
@@ -75,7 +58,7 @@ local function switch_to_sw_probe(reason)
 
     mp.set_property("hwdec", "no")
     mp.commandv("seek", 0, "absolute", "exact")
-    show_sw_notice_center()
+    show_sw_notice()
 
     mp.add_timeout(0.2, function()
         black_ov:remove()
@@ -93,7 +76,7 @@ local function switch_to_sw_playback(reason)
     mp.msg.warn("[fallback-restart] [PLAYBACK] Mid-playback anomaly (" .. reason .. "). Switching to SW in place...")
 
     mp.set_property("hwdec", "no")
-    show_sw_notice_top_left()
+    show_sw_notice()
     mp.msg.info("[fallback-restart] Switched to SW mode seamlessly at current playback position.")
 end
 
@@ -162,10 +145,8 @@ end
 mp.add_periodic_timer(0.05, check_watchdog_ipc)
 
 mp.register_event("file-loaded", function()
-    if notice_tl_ov then notice_tl_ov:remove() end
-    if notice_center_ov then notice_center_ov:remove() end
-    if tl_timer then tl_timer:kill() tl_timer = nil end
-    if center_timer then center_timer:kill() center_timer = nil end
+    if notice_ov then notice_ov:remove() end
+    if notice_timer then notice_timer:kill() notice_timer = nil end
 
     local default_hwdec = mp.get_property("options/hwdec") or "vaapi"
     if default_hwdec ~= "no" then

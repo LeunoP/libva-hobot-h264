@@ -173,9 +173,9 @@ The repository includes a suite of helper scripts in [`misc/mpv_scripts/`](misc/
 
 | Playback Stage | Condition | Player Action | OSD Notification |
 | :--- | :--- | :--- | :--- |
-| **Initial Probing (First 5s)** | 3 anomalies accumulated OR hardware decode error | Rewinds to `00:00:00`, switches to SW decoder (`hwdec=no`), reveals screen & unmutes | **Centered 2-line alert (3.5s)**:<br>`SW디코더로 전환 합니다`<br>`잠시만 기다려주세요` |
+| **Initial Probing (First 5s)** | 3 anomalies accumulated OR hardware decode error | Rewinds to `00:00:00`, switches to SW decoder (`hwdec=no`), reveals screen & unmutes | **Top-left small notice (1.5s)**:<br>`SW 디코더` |
 | **Initial Probing (First 5s)** | Clean playback (0 anomalies) | Rewinds to `00:00:00`, reveals screen & unmutes, keeps HW DirectVIV | *(None — seamless reveal)* |
-| **Post-Probing (Mid-Playback)** | 3 anomalies accumulated OR decode failure | **Does NOT rewind** (keeps current playback position), switches to SW in-place | **Top-left small notice (3.0s)**:<br>`SW디코더 전환` |
+| **Post-Probing (Mid-Playback)** | 3 anomalies accumulated OR decode failure | **Does NOT rewind** (keeps current playback position), switches to SW in-place | **Top-left small notice (1.5s)**:<br>`SW 디코더` |
 
 ### 2. `mpv.conf` (Optimized RDK-X5 Profile)
 Pre-configured for DRM/GBM DirectVIV zero-copy (`vo=gpu`, `gpu-context=drm`, `hwdec=vaapi`, `vd-lavc-software-fallback=1`), YouTube 1080p AVC preference, and automatic HLS/live stream CPU decoding.
