@@ -15,6 +15,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/ioctl.h>
+#include <time.h>
 #include <va/va.h>
 #include <va/va_backend.h>
 #include <va/va_drmcommon.h>
@@ -399,6 +400,8 @@ typedef struct {
     int dec_in_buf_valid;
     int dec_in_buf_offset;
     int watchdog_trace_countdown;
+    int watchdog_anomaly_count;
+    time_t last_anomaly_sec;
 } HobotContext;
 
 /* Internal Image Object */
@@ -1523,12 +1526,23 @@ static VAStatus hobot_vaSyncSurface(VADriverContextP ctx, VASurfaceID render_tar
             int deco_idx = out_info.video_frame_info.frame_decoded_index;
 
             if (err_reason != 0 || err_mb > 0) {
+                struct timespec now_ts;
+                clock_gettime(CLOCK_MONOTONIC, &now_ts);
+                if (hctx->last_anomaly_sec > 0 && (now_ts.tv_sec - hctx->last_anomaly_sec) >= 10) {
+                    fprintf(stderr, "[HOBOT-VA][WATCHDOG] 10s clean period elapsed. Anomaly count reset from %d to 0.\n",
+                            hctx->watchdog_anomaly_count);
+                    hctx->watchdog_anomaly_count = 0;
+                }
+                hctx->last_anomaly_sec = now_ts.tv_sec;
+                hctx->watchdog_anomaly_count++;
+
                 hctx->watchdog_trace_countdown = 20;
-                fprintf(stderr, "\n[HOBOT-VA][WATCHDOG] >>> VPU ANOMALY / TIMEOUT DETECTED <<<\n"
+                fprintf(stderr, "\n[HOBOT-VA][WATCHDOG] >>> VPU ANOMALY DETECTED (#%d/3) <<<\n"
                                 "[HOBOT-VA][WATCHDOG] target_surf=%u disp_idx=%d deco_idx=%d\n"
                                 "[HOBOT-VA][WATCHDOG] error_reason=0x%08x warn_info=0x%08x\n"
                                 "[HOBOT-VA][WATCHDOG] err_mb=%d total_mb=%d (%.1f%% corrupted)\n"
                                 "[HOBOT-VA][WATCHDOG] phy=[0x%llx, 0x%llx] fd=%d stride=%d size=%u (%dx%d)\n\n",
+                        hctx->watchdog_anomaly_count,
                         target, disp_idx, deco_idx,
                         err_reason, (uint32_t)out_info.video_frame_info.warn_info,
                         err_mb, total_mb,
@@ -1540,6 +1554,22 @@ static VAStatus hobot_vaSyncSurface(VADriverContextP ctx, VASurfaceID render_tar
                         out_buf.vframe_buf.size,
                         out_buf.vframe_buf.width,
                         out_buf.vframe_buf.height);
+
+                if (ctx->error_callback) {
+                    char err_msg[160];
+                    snprintf(err_msg, sizeof(err_msg),
+                             "[HOBOT-VA-WATCHDOG] Anomaly #%d/3: err_mb=%d/%d err_reason=0x%08x",
+                             hctx->watchdog_anomaly_count, err_mb, total_mb, err_reason);
+                    ctx->error_callback(ctx, err_msg);
+                }
+            } else if (hctx->watchdog_anomaly_count > 0) {
+                struct timespec now_ts;
+                clock_gettime(CLOCK_MONOTONIC, &now_ts);
+                if (hctx->last_anomaly_sec > 0 && (now_ts.tv_sec - hctx->last_anomaly_sec) >= 10) {
+                    fprintf(stderr, "[HOBOT-VA][WATCHDOG] 10s clean playback elapsed. Anomaly count reset from %d to 0.\n",
+                            hctx->watchdog_anomaly_count);
+                    hctx->watchdog_anomaly_count = 0;
+                }
             } else if (hctx->watchdog_trace_countdown > 0) {
                 hctx->watchdog_trace_countdown--;
                 fprintf(stderr, "[HOBOT-VA][POST-WD #%02d] target_surf=%u disp_idx=%d deco_idx=%d err_reason=0x%08x err_mb=%d/%d phy=[0x%llx, 0x%llx] fd=%d size=%u\n",
@@ -1554,9 +1584,14 @@ static VAStatus hobot_vaSyncSurface(VADriverContextP ctx, VASurfaceID render_tar
 
             /* Phase A: Frame Drop Experiment (Discard corrupted frames) */
             if (err_mb > 0 || (err_reason & 0x00020000)) {
-                fprintf(stderr, "[HOBOT-VA][DROP] Dropping corrupted frame (err_mb=%d/%d, err_reason=0x%08x) for target=%u\n",
-                        err_mb, total_mb, err_reason, target);
+                fprintf(stderr, "[HOBOT-VA][DROP] Dropping corrupted frame (err_mb=%d/%d, err_reason=0x%08x) for target=%u (anomaly=%d/3)\n",
+                        err_mb, total_mb, err_reason, target, hctx->watchdog_anomaly_count);
                 hb_mm_mc_queue_output_buffer(mctx, &out_buf, 50);
+
+                if (hctx->watchdog_anomaly_count >= 3) {
+                    fprintf(stderr, "[HOBOT-VA][WATCHDOG] >>> ANOMALY THRESHOLD (3) REACHED! FORCING DECODE ERROR <<<\n");
+                    return VA_STATUS_ERROR_DECODING_ERROR;
+                }
                 continue;
             }
 
