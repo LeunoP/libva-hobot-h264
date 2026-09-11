@@ -1555,20 +1555,19 @@ static VAStatus hobot_vaSyncSurface(VADriverContextP ctx, VASurfaceID render_tar
                         out_buf.vframe_buf.width,
                         out_buf.vframe_buf.height);
 
-                if (ctx->error_callback) {
-                    char err_msg[160];
-                    snprintf(err_msg, sizeof(err_msg),
-                             "[HOBOT-VA-WATCHDOG] Anomaly #%d/3: err_mb=%d/%d err_reason=0x%08x",
-                             hctx->watchdog_anomaly_count, err_mb, total_mb, err_reason);
-                    ctx->error_callback(ctx, err_msg);
+                FILE *wfp = fopen("/dev/shm/hobot_va_watchdog", "w");
+                if (wfp) {
+                    fprintf(wfp, "%d %ld %d %d\n", hctx->watchdog_anomaly_count, (long)now_ts.tv_sec, err_mb, total_mb);
+                    fclose(wfp);
                 }
             } else if (hctx->watchdog_anomaly_count > 0) {
                 struct timespec now_ts;
                 clock_gettime(CLOCK_MONOTONIC, &now_ts);
                 if (hctx->last_anomaly_sec > 0 && (now_ts.tv_sec - hctx->last_anomaly_sec) >= 10) {
-                    fprintf(stderr, "[HOBOT-VA][WATCHDOG] 10s clean playback elapsed. Anomaly count reset from %d to 0.\n",
+                    fprintf(stderr, "[HOBOT-VA][WATCHDOG] 10s clean playback elapsed. Resetting anomaly count (%d -> 0).\n",
                             hctx->watchdog_anomaly_count);
                     hctx->watchdog_anomaly_count = 0;
+                    unlink("/dev/shm/hobot_va_watchdog");
                 }
             } else if (hctx->watchdog_trace_countdown > 0) {
                 hctx->watchdog_trace_countdown--;
@@ -1587,11 +1586,6 @@ static VAStatus hobot_vaSyncSurface(VADriverContextP ctx, VASurfaceID render_tar
                 fprintf(stderr, "[HOBOT-VA][DROP] Dropping corrupted frame (err_mb=%d/%d, err_reason=0x%08x) for target=%u (anomaly=%d/3)\n",
                         err_mb, total_mb, err_reason, target, hctx->watchdog_anomaly_count);
                 hb_mm_mc_queue_output_buffer(mctx, &out_buf, 50);
-
-                if (hctx->watchdog_anomaly_count >= 3) {
-                    fprintf(stderr, "[HOBOT-VA][WATCHDOG] >>> ANOMALY THRESHOLD (3) REACHED! FORCING DECODE ERROR <<<\n");
-                    return VA_STATUS_ERROR_DECODING_ERROR;
-                }
                 continue;
             }
 
