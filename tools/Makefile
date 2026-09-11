@@ -1,7 +1,7 @@
 CC ?= gcc
 CFLAGS ?= -O2 -Wall -I/usr/include -I/usr/include/libdrm
 LDFLAGS ?= -L/usr/hobot/lib -lEGL -lGLESv2 -lgbm -ldrm -lhbmem -Wl,-rpath=/usr/hobot/lib
-BENCH_LDFLAGS ?= $(LDFLAGS) -lavcodec -lavformat -lavutil -lva -lva-drm
+BENCH_LDFLAGS ?= $(LDFLAGS) -lavcodec -lavformat -lavutil -lva -lva-drm -ldl
 
 TARGETS = test_directviv test_render_directviv test_nv12_overlay test_va_directviv_bench
 

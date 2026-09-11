@@ -13,6 +13,7 @@
 #include <GLES2/gl2ext.h>
 #include <va/va.h>
 #include <va/va_drmcommon.h>
+#include <va/va_hobot.h>
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
 #include <libavutil/hwcontext.h>
@@ -189,9 +190,6 @@ int main(int argc, char **argv) {
     #define MAX_CACHED_SURFACES 128
     struct TextureEntry {
         GLuint tex;
-        void *mmap_ptr;
-        uint32_t size;
-        int dma_fd;
         uint64_t phys_addr;
     } tex_cache[MAX_CACHED_SURFACES] = {0};
 
@@ -213,49 +211,27 @@ int main(int argc, char **argv) {
                     if (frame->format == AV_PIX_FMT_VAAPI) {
                         VASurfaceID surf_id = (VASurfaceID)(uintptr_t)frame->data[3];
 
-                        // Explicitly sync surface so VPU finishes and dequeues output
-                        vaSyncSurface(va_dpy, surf_id);
+                        // Query hardware surface info via vaGetHobotSurfaceInfo
+                        struct hobot_surface_info hinfo = {0};
+                        VAStatus va_ret = vaGetHobotSurfaceInfo(va_dpy, surf_id, &hinfo);
 
-                        // Export Surface Handle to get DMA-BUF FD & Physical Address
-                        VADRMPRIMESurfaceDescriptor desc = {0};
-                        VAStatus va_ret = vaExportSurfaceHandle(
-                            va_dpy,
-                            surf_id,
-                            VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2,
-                            VA_EXPORT_SURFACE_READ_ONLY,
-                            &desc
-                        );
-
-                        if (va_ret == VA_STATUS_SUCCESS && desc.num_objects > 0) {
-                            int dma_fd = desc.objects[0].fd;
-                            uint64_t phys_addr = desc.objects[0].drm_format_modifier;
-                            uint32_t size = desc.objects[0].size;
-                            uint32_t stride = desc.layers[0].pitch[0];
-                            uint32_t uv_offset = desc.layers[0].offset[1];
-
+                        if (va_ret == VA_STATUS_SUCCESS && hinfo.phys_addr[0] > 0) {
                             if (total_frames == 0) {
-                                printf("--- First Decoded VPU Surface Info ---\n");
-                                printf("  VASurfaceID:  %u\n", surf_id);
-                                printf("  DMA-BUF fd:   %d\n", dma_fd);
-                                printf("  Buffer size:  %u bytes\n", size);
-                                printf("  Dimensions:   %ux%u, Stride: %u\n", desc.width, desc.height, stride);
-                                printf("  UV offset:    %u\n", uv_offset);
-                                printf("  PHYSICAL ADDR: 0x%010llx\n", (unsigned long long)phys_addr);
+                                printf("--- First Decoded VPU Surface Info (vaGetHobotSurfaceInfo) ---\n");
+                                printf("  VASurfaceID:   %u\n", surf_id);
+                                printf("  DMA-BUF fd:    %d\n", hinfo.dma_fd);
+                                printf("  Dimensions:    %ux%u, Stride: %u, VStride: %u\n",
+                                       hinfo.width, hinfo.height, hinfo.stride, hinfo.vstride);
+                                printf("  PHYSICAL ADDR: Y=0x%010llx, UV=0x%010llx\n",
+                                       (unsigned long long)hinfo.phys_addr[0], (unsigned long long)hinfo.phys_addr[1]);
+                                printf("  VIRTUAL ADDR:  Y=%p, UV=%p\n", hinfo.virt_addr[0], hinfo.virt_addr[1]);
                             }
 
                             // Manage Texture Cache for this Surface
                             struct TextureEntry *entry = &tex_cache[surf_id % MAX_CACHED_SURFACES];
-                            if (entry->tex == 0 || entry->phys_addr != phys_addr) {
-                                if (entry->mmap_ptr && entry->size > 0) {
-                                    munmap(entry->mmap_ptr, entry->size);
-                                }
-                                if (entry->dma_fd > 0) close(entry->dma_fd);
+                            if (entry->tex == 0 || entry->phys_addr != hinfo.phys_addr[0]) {
                                 if (entry->tex == 0) glGenTextures(1, &entry->tex);
-
-                                entry->mmap_ptr = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, dma_fd, 0);
-                                entry->size = size;
-                                entry->dma_fd = dma_fd;
-                                entry->phys_addr = phys_addr;
+                                entry->phys_addr = hinfo.phys_addr[0];
 
                                 glBindTexture(GL_TEXTURE_2D, entry->tex);
                                 glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
@@ -264,17 +240,16 @@ int main(int argc, char **argv) {
                                 glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
 
                                 GLvoid *logical[2] = {
-                                    entry->mmap_ptr,
-                                    (char *)entry->mmap_ptr + uv_offset
+                                    hinfo.virt_addr[0],
+                                    hinfo.virt_addr[1]
                                 };
                                 GLuint physical[2] = {
-                                    (GLuint)phys_addr,
-                                    (GLuint)(phys_addr + uv_offset)
+                                    (GLuint)hinfo.phys_addr[0],
+                                    (GLuint)hinfo.phys_addr[1]
                                 };
 
-                                glTexDirectVIVMap(GL_TEXTURE_2D, desc.width, desc.height, GL_VIV_NV12, logical, physical);
+                                glTexDirectVIVMap(GL_TEXTURE_2D, hinfo.width, hinfo.height, GL_VIV_NV12, logical, physical);
                             } else {
-                                close(dma_fd); // Close duplicated FD from export
                                 glBindTexture(GL_TEXTURE_2D, entry->tex);
                                 if (glTexDirectInvalidateVIV) {
                                     glTexDirectInvalidateVIV(GL_TEXTURE_2D);
@@ -320,8 +295,6 @@ int main(int argc, char **argv) {
     // Cleanup
     for (int i = 0; i < MAX_CACHED_SURFACES; i++) {
         if (tex_cache[i].tex) glDeleteTextures(1, &tex_cache[i].tex);
-        if (tex_cache[i].mmap_ptr && tex_cache[i].size > 0) munmap(tex_cache[i].mmap_ptr, tex_cache[i].size);
-        if (tex_cache[i].dma_fd > 0) close(tex_cache[i].dma_fd);
     }
 
     av_frame_free(&frame);

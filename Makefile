@@ -13,6 +13,8 @@ $(TARGET): $(SRCS)
 install: $(TARGET)
 	install -d /usr/lib/aarch64-linux-gnu/dri
 	install -m 755 $(TARGET) /usr/lib/aarch64-linux-gnu/dri/$(TARGET)
+	install -d /usr/include/va
+	install -m 644 include/va/va_hobot.h /usr/include/va/va_hobot.h
 
 clean:
 	rm -f $(TARGET) test_vpu_c test_sps_gen

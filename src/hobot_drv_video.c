@@ -23,6 +23,8 @@
 #include <va/va_enc_jpeg.h>
 #include <va/va_dec_hevc.h>
 #include <va/va_dec_jpeg.h>
+#define HOBOT_DRIVER_BUILD 1
+#include "../include/va/va_hobot.h"
 #include <hb_media_codec.h>
 #include <hb_media_error.h>
 #include <hb_mem_mgr.h>
@@ -1605,7 +1607,7 @@ static VAStatus hobot_vaExportSurfaceHandle(
     desc->num_objects = 1;
     desc->objects[0].fd = exp_fd;
     desc->objects[0].size = buf_size;
-    desc->objects[0].drm_format_modifier = phys_addr;
+    desc->objects[0].drm_format_modifier = 0; /* DRM_FORMAT_MOD_LINEAR */
 
     desc->num_layers = 1;
     desc->layers[0].drm_format = VA_FOURCC_NV12;
@@ -2083,6 +2085,81 @@ static VAStatus hobot_init_driver(VADriverContextP ctx) {
     vtable->vaGetImage = hobot_vaGetImage;
     vtable->vaPutImage = hobot_vaPutImage;
     vtable->vaDeriveImage = hobot_vaDeriveImage;
+
+    return VA_STATUS_SUCCESS;
+}
+
+VAStatus vaGetHobotSurfaceInfo(
+    VADisplay dpy,
+    VASurfaceID surface,
+    struct hobot_surface_info *info
+) {
+    if (!dpy || !info) return VA_STATUS_ERROR_INVALID_PARAMETER;
+
+    struct VADisplayContext *disp_ctx = (struct VADisplayContext *)dpy;
+    if (disp_ctx->vadpy_magic != VA_DISPLAY_MAGIC) {
+        return VA_STATUS_ERROR_INVALID_DISPLAY;
+    }
+    VADriverContextP drv_ctx = disp_ctx->pDriverContext;
+    if (!drv_ctx || !drv_ctx->pDriverData) {
+        return VA_STATUS_ERROR_INVALID_CONTEXT;
+    }
+    HobotDriverData *drv = (HobotDriverData *)drv_ctx->pDriverData;
+
+    if (surface <= 0 || surface >= MAX_SURFACES || !drv->surfaces[surface].allocated) {
+        return VA_STATUS_ERROR_INVALID_SURFACE;
+    }
+
+    HobotSurface *surf = &drv->surfaces[surface];
+
+    /* Ensure decoded frame is ready and synced */
+    if (!surf->has_decoded_frame) {
+        hobot_vaSyncSurface(drv_ctx, surface);
+    }
+
+    if (!surf->has_decoded_frame && !surf->has_preallocated) {
+        return VA_STATUS_ERROR_OPERATION_FAILED;
+    }
+
+    memset(info, 0, sizeof(*info));
+    info->width = surf->width;
+    info->height = surf->height;
+    info->stride = surf->stride > 0 ? surf->stride : surf->width;
+    info->dma_fd = surf->dma_fd;
+
+    if (surf->has_decoded_frame) {
+        info->vstride = surf->vpu_out_buf.vframe_buf.vstride > 0 ?
+                        surf->vpu_out_buf.vframe_buf.vstride : ((surf->height + 7) & ~7);
+        info->phys_addr[0] = surf->vpu_out_buf.vframe_buf.phy_ptr[0];
+        info->phys_addr[1] = surf->vpu_out_buf.vframe_buf.phy_ptr[1];
+        info->virt_addr[0] = (void *)surf->vpu_out_buf.vframe_buf.vir_ptr[0];
+        info->virt_addr[1] = (void *)surf->vpu_out_buf.vframe_buf.vir_ptr[1];
+        if (surf->vpu_out_buf.vframe_buf.fd[0] > 0) {
+            info->dma_fd = surf->vpu_out_buf.vframe_buf.fd[0];
+        }
+    } else if (surf->has_preallocated) {
+        info->vstride = ((surf->height + 7) & ~7);
+        info->phys_addr[0] = surf->preallocated_gbuf.phys_addr[0];
+        info->phys_addr[1] = surf->preallocated_gbuf.phys_addr[1];
+        info->virt_addr[0] = (void *)surf->preallocated_gbuf.virt_addr[0];
+        info->virt_addr[1] = (void *)surf->preallocated_gbuf.virt_addr[1];
+        if (surf->preallocated_gbuf.fd[0] > 0) {
+            info->dma_fd = surf->preallocated_gbuf.fd[0];
+        }
+    }
+
+    uint32_t uv_offset = info->stride * info->vstride;
+    if (info->phys_addr[1] == 0 && info->phys_addr[0] != 0) {
+        info->phys_addr[1] = info->phys_addr[0] + uv_offset;
+    }
+    if (info->virt_addr[1] == NULL && info->virt_addr[0] != NULL) {
+        info->virt_addr[1] = (char *)info->virt_addr[0] + uv_offset;
+    }
+
+    va_trace("vaGetHobotSurfaceInfo: surf=%u, %ux%u, stride=%u, vstride=%u, phys=[0x%lx, 0x%lx], virt=[%p, %p], fd=%d",
+             surface, info->width, info->height, info->stride, info->vstride,
+             (unsigned long)info->phys_addr[0], (unsigned long)info->phys_addr[1],
+             info->virt_addr[0], info->virt_addr[1], info->dma_fd);
 
     return VA_STATUS_SUCCESS;
 }

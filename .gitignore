@@ -3,3 +3,7 @@
 *.tar.gz
 test_vpu_c
 test_sps_gen
+tools/test_directviv
+tools/test_render_directviv
+tools/test_nv12_overlay
+tools/test_va_directviv_bench
