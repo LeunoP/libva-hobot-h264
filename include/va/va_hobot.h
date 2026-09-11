@@ -19,9 +19,9 @@ extern "C" {
 
 /**
  * Vendor-specific memory type for vaExportSurfaceHandle to retrieve Hobot graphics buffer details.
- * FourCC: 'H' 'O' 'B' '1' (0x484F4231)
+ * Dedicated vendor bit 31 set with zero standard bitmask collisions (not VA, V4L2, USER_PTR, or DRM_PRIME).
  */
-#define VA_SURFACE_ATTRIB_MEM_TYPE_HOBOT_GRAPH_BUF 0x484F4231
+#define VA_SURFACE_ATTRIB_MEM_TYPE_HOBOT_GRAPH_BUF 0x80484F10
 
 /**
  * Surface hardware information required for Vivante DirectVIV zero-copy mapping.

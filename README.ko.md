@@ -125,7 +125,7 @@ fs=yes
 
 ## DirectVIV 서피스 확장 인터페이스 (`va/va_hobot.h`)
 
-`vaExportSurfaceHandle` 표준 디스패치와 벤더 메모리 타입 `VA_SURFACE_ATTRIB_MEM_TYPE_HOBOT_GRAPH_BUF` (`0x484F4231`)를 통해 VPU 물리/가상 주소를 질의합니다:
+`vaExportSurfaceHandle` 표준 디스패치와 벤더 메모리 타입 `VA_SURFACE_ATTRIB_MEM_TYPE_HOBOT_GRAPH_BUF` (`0x80484F10`)를 통해 VPU 물리/가상 주소를 질의합니다:
 
 ```c
 #include <va/va.h>

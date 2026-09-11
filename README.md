@@ -209,7 +209,7 @@ if (status == VA_STATUS_SUCCESS) {
 }
 ```
 
-This uses the standard `vaExportSurfaceHandle` entry point with vendor memory type `VA_SURFACE_ATTRIB_MEM_TYPE_HOBOT_GRAPH_BUF` (`0x484F4231`), eliminating any need for dynamic symbol lookups or linker hacks.
+This uses the standard `vaExportSurfaceHandle` entry point with vendor memory type `VA_SURFACE_ATTRIB_MEM_TYPE_HOBOT_GRAPH_BUF` (`0x80484F10`), eliminating any need for dynamic symbol lookups or linker hacks.
 
 ---
 
