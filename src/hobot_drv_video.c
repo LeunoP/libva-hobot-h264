@@ -1558,6 +1558,7 @@ static VAStatus hobot_fill_surface_info(
         hobot_vaSyncSurface(ctx, surface);
     }
 
+
     if (!surf->has_decoded_frame && !surf->has_preallocated) {
         return VA_STATUS_ERROR_OPERATION_FAILED;
     }
@@ -1619,6 +1620,10 @@ static VAStatus hobot_vaExportSurfaceHandle(
 
     if (mem_type == VA_SURFACE_ATTRIB_MEM_TYPE_HOBOT_GRAPH_BUF) {
         return hobot_fill_surface_info(ctx, surface_id, (struct hobot_surface_info *)descriptor);
+    } else if (mem_type != VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2 &&
+               mem_type != VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME) {
+        va_trace("vaExportSurfaceHandle: unsupported mem_type=0x%x", mem_type);
+        return VA_STATUS_ERROR_UNSUPPORTED_MEMORY_TYPE;
     }
 
     HobotDriverData *drv = (HobotDriverData *)ctx->pDriverData;
