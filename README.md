@@ -9,7 +9,7 @@
 
 `libva-hobot-h264` is an open-source, high-performance VA-API (Video Acceleration API) backend driver for the **D-Robotics RDK-X5** single-board computer (powered by Chips&Media Wave521 VPU and ARM Cortex-A55).
 
-It delivers hardware-accelerated **1080p 60fps H.264 decoding and encoding** with rock-solid frame pacing, 0 dropped frames, and low CPU utilization, making it ideal for media playback (mpv, Kodi) and cloud game streaming (Moonlight).
+It delivers hardware-accelerated **1080p 60fps H.264 decoding and encoding** with rock-solid frame pacing, 0 dropped frames, and low CPU utilization, providing a compliant VA-API implementation for standard Linux media applications (mpv, ffmpeg, Chromium).
 
 > [!NOTE]
 > **Notice**: This codebase and driver architecture were researched, developed, and optimized by AI (Google DeepMind Antigravity / Gemini) in collaboration with LeunoP.
@@ -21,8 +21,8 @@ It delivers hardware-accelerated **1080p 60fps H.264 decoding and encoding** wit
 
 - **Standard VA-API Implementation**: Full compatibility with `libva` 1.14+ / 2.x API.
 - **Flawless H.264 B-Frame Pacing**: Solves the Wave521 VPU B-frame jitter issue by disabling internal VPU reordering (`reorder_enable = 0`) and managing presentation order via a dedicated 128-entry FIFO queue (`submitted_surfaces`). Verified **0 dropped frames** on 1080p 60fps high-bitrate video.
-- **Multi-Slice Frame Assembly**: Aggregates multi-slice pictures (e.g. from Moonlight / Sunshine game streaming or broadcast encoders) into single VPU frames per the `MC_FEEDING_MODE_FRAME_SIZE` specification.
-- **Zero-Copy DRM PRIME 2 Export**: Implements `vaExportSurfaceHandle` with duplicate file descriptor management (`dup(fd)`) to guarantee correct DMA-BUF lifecycle across external renderers without closing underlying driver buffers.
+- **Multi-Slice Frame Assembly**: Aggregates multi-slice pictures (e.g. from broadcast encoders or streaming servers) into single VPU frames per the `MC_FEEDING_MODE_FRAME_SIZE` specification.
+- **DMA-BUF Pre-allocation & DRM PRIME 2 Export**: Pre-allocates hardware graphics buffers upon surface creation (`vaCreateSurfaces2`) using Hobot memory management (`hb_mem_alloc_graph_buf`), allowing clients to immediately export valid DRM PRIME 2 DMA-BUF handles (`vaExportSurfaceHandle`) with `dup(fd)` lifecycle safety.
 - **Row-by-Row Pitch Alignment**: Handles VPU 8-line vertical padding (`vstride = (height + 7) & ~7`) and horizontal stride discrepancies cleanly during surface copies and export.
 
 ---
