@@ -12,11 +12,16 @@
 
 #include <va/va.h>
 #include <stdint.h>
-#include <dlfcn.h>
 
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+/**
+ * Vendor-specific memory type for vaExportSurfaceHandle to retrieve Hobot graphics buffer details.
+ * FourCC: 'H' 'O' 'B' '1' (0x484F4231)
+ */
+#define VA_SURFACE_ATTRIB_MEM_TYPE_HOBOT_GRAPH_BUF 0x484F4231
 
 /**
  * Surface hardware information required for Vivante DirectVIV zero-copy mapping.
@@ -31,16 +36,9 @@ struct hobot_surface_info {
     int dma_fd;             /**< DMA-BUF file descriptor */
 };
 
-typedef VAStatus (*vaGetHobotSurfaceInfo_fn)(
-    VADisplay dpy,
-    VASurfaceID surface,
-    struct hobot_surface_info *info
-);
-
 #ifdef HOBOT_DRIVER_BUILD
 /**
- * Query internal surface memory descriptors (physical address, virtual address, stride).
- * Exported by hobot_drv_video.so.
+ * Exported symbol in hobot_drv_video.so for direct C linkage or backwards compatibility.
  */
 VAStatus vaGetHobotSurfaceInfo(
     VADisplay dpy,
@@ -49,26 +47,22 @@ VAStatus vaGetHobotSurfaceInfo(
 );
 #else
 /**
- * Inline dispatch wrapper that dynamically resolves vaGetHobotSurfaceInfo
- * from the loaded VA-API driver without requiring link-time -lhobot_drv_video.
+ * Query Hobot surface hardware information via standard libva dispatch (vaExportSurfaceHandle).
+ *
+ * This uses the official VA-API driver dispatch mechanism:
+ *   vaExportSurfaceHandle(dpy, surface, VA_SURFACE_ATTRIB_MEM_TYPE_HOBOT_GRAPH_BUF, 0, info)
+ *
+ * Clean, standard, and portable: zero external dependencies (no dlopen, no dlsym, no dlfcn.h).
  */
 static inline VAStatus vaGetHobotSurfaceInfo(
     VADisplay dpy,
     VASurfaceID surface,
     struct hobot_surface_info *info
 ) {
-    static vaGetHobotSurfaceInfo_fn pfn = NULL;
-    if (!pfn) {
-        pfn = (vaGetHobotSurfaceInfo_fn)dlsym(RTLD_DEFAULT, "vaGetHobotSurfaceInfo");
-        if (!pfn) {
-            void *handle = dlopen("/usr/lib/aarch64-linux-gnu/dri/hobot_drv_video.so", RTLD_LAZY | RTLD_NOLOAD);
-            if (handle) {
-                pfn = (vaGetHobotSurfaceInfo_fn)dlsym(handle, "vaGetHobotSurfaceInfo");
-            }
-        }
-    }
-    if (!pfn) return VA_STATUS_ERROR_UNKNOWN;
-    return pfn(dpy, surface, info);
+    return vaExportSurfaceHandle(dpy, surface,
+                                 VA_SURFACE_ATTRIB_MEM_TYPE_HOBOT_GRAPH_BUF,
+                                 0,
+                                 (void *)info);
 }
 #endif
 

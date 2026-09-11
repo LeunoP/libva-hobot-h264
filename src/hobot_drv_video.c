@@ -1539,7 +1539,73 @@ static VAStatus hobot_vaSyncSurface(VADriverContextP ctx, VASurfaceID render_tar
     return VA_STATUS_ERROR_TIMEDOUT;
 }
 
-/* Zero-Copy Export Surface Handle for mpv and Chromium (DRM PRIME 2) */
+static VAStatus hobot_fill_surface_info(
+    VADriverContextP ctx,
+    VASurfaceID surface,
+    struct hobot_surface_info *info
+) {
+    if (!info) return VA_STATUS_ERROR_INVALID_PARAMETER;
+    HobotDriverData *drv = (HobotDriverData *)ctx->pDriverData;
+
+    if (surface <= 0 || surface >= MAX_SURFACES || !drv->surfaces[surface].allocated) {
+        return VA_STATUS_ERROR_INVALID_SURFACE;
+    }
+
+    HobotSurface *surf = &drv->surfaces[surface];
+
+    /* Ensure decoded frame is ready and synced */
+    if (!surf->has_decoded_frame) {
+        hobot_vaSyncSurface(ctx, surface);
+    }
+
+    if (!surf->has_decoded_frame && !surf->has_preallocated) {
+        return VA_STATUS_ERROR_OPERATION_FAILED;
+    }
+
+    memset(info, 0, sizeof(*info));
+    info->width = surf->width;
+    info->height = surf->height;
+    info->stride = surf->stride > 0 ? surf->stride : surf->width;
+    info->dma_fd = surf->dma_fd;
+
+    if (surf->has_decoded_frame) {
+        info->vstride = surf->vpu_out_buf.vframe_buf.vstride > 0 ?
+                        surf->vpu_out_buf.vframe_buf.vstride : ((surf->height + 7) & ~7);
+        info->phys_addr[0] = surf->vpu_out_buf.vframe_buf.phy_ptr[0];
+        info->phys_addr[1] = surf->vpu_out_buf.vframe_buf.phy_ptr[1];
+        info->virt_addr[0] = (void *)surf->vpu_out_buf.vframe_buf.vir_ptr[0];
+        info->virt_addr[1] = (void *)surf->vpu_out_buf.vframe_buf.vir_ptr[1];
+        if (surf->vpu_out_buf.vframe_buf.fd[0] > 0) {
+            info->dma_fd = surf->vpu_out_buf.vframe_buf.fd[0];
+        }
+    } else if (surf->has_preallocated) {
+        info->vstride = ((surf->height + 7) & ~7);
+        info->phys_addr[0] = surf->preallocated_gbuf.phys_addr[0];
+        info->phys_addr[1] = surf->preallocated_gbuf.phys_addr[1];
+        info->virt_addr[0] = (void *)surf->preallocated_gbuf.virt_addr[0];
+        info->virt_addr[1] = (void *)surf->preallocated_gbuf.virt_addr[1];
+        if (surf->preallocated_gbuf.fd[0] > 0) {
+            info->dma_fd = surf->preallocated_gbuf.fd[0];
+        }
+    }
+
+    uint32_t uv_offset = info->stride * info->vstride;
+    if (info->phys_addr[1] == 0 && info->phys_addr[0] != 0) {
+        info->phys_addr[1] = info->phys_addr[0] + uv_offset;
+    }
+    if (info->virt_addr[1] == NULL && info->virt_addr[0] != NULL) {
+        info->virt_addr[1] = (char *)info->virt_addr[0] + uv_offset;
+    }
+
+    va_trace("hobot_fill_surface_info: surf=%u, %ux%u, stride=%u, vstride=%u, phys=[0x%lx, 0x%lx], virt=[%p, %p], fd=%d",
+             surface, info->width, info->height, info->stride, info->vstride,
+             (unsigned long)info->phys_addr[0], (unsigned long)info->phys_addr[1],
+             info->virt_addr[0], info->virt_addr[1], info->dma_fd);
+
+    return VA_STATUS_SUCCESS;
+}
+
+/* Zero-Copy Export Surface Handle for mpv, Chromium (DRM PRIME 2) and DirectVIV */
 static VAStatus hobot_vaExportSurfaceHandle(
     VADriverContextP ctx,
     VASurfaceID surface_id,
@@ -1550,6 +1616,11 @@ static VAStatus hobot_vaExportSurfaceHandle(
     va_trace("vaExportSurfaceHandle: surface=%u, mem_type=0x%x, flags=0x%x, desc=%p",
              surface_id, mem_type, flags, descriptor);
     if (!descriptor) return VA_STATUS_ERROR_INVALID_PARAMETER;
+
+    if (mem_type == VA_SURFACE_ATTRIB_MEM_TYPE_HOBOT_GRAPH_BUF) {
+        return hobot_fill_surface_info(ctx, surface_id, (struct hobot_surface_info *)descriptor);
+    }
+
     HobotDriverData *drv = (HobotDriverData *)ctx->pDriverData;
 
     if (surface_id <= 0 || surface_id >= MAX_SURFACES || !drv->surfaces[surface_id].allocated) {
@@ -2104,64 +2175,8 @@ VAStatus vaGetHobotSurfaceInfo(
     if (!drv_ctx || !drv_ctx->pDriverData) {
         return VA_STATUS_ERROR_INVALID_CONTEXT;
     }
-    HobotDriverData *drv = (HobotDriverData *)drv_ctx->pDriverData;
 
-    if (surface <= 0 || surface >= MAX_SURFACES || !drv->surfaces[surface].allocated) {
-        return VA_STATUS_ERROR_INVALID_SURFACE;
-    }
-
-    HobotSurface *surf = &drv->surfaces[surface];
-
-    /* Ensure decoded frame is ready and synced */
-    if (!surf->has_decoded_frame) {
-        hobot_vaSyncSurface(drv_ctx, surface);
-    }
-
-    if (!surf->has_decoded_frame && !surf->has_preallocated) {
-        return VA_STATUS_ERROR_OPERATION_FAILED;
-    }
-
-    memset(info, 0, sizeof(*info));
-    info->width = surf->width;
-    info->height = surf->height;
-    info->stride = surf->stride > 0 ? surf->stride : surf->width;
-    info->dma_fd = surf->dma_fd;
-
-    if (surf->has_decoded_frame) {
-        info->vstride = surf->vpu_out_buf.vframe_buf.vstride > 0 ?
-                        surf->vpu_out_buf.vframe_buf.vstride : ((surf->height + 7) & ~7);
-        info->phys_addr[0] = surf->vpu_out_buf.vframe_buf.phy_ptr[0];
-        info->phys_addr[1] = surf->vpu_out_buf.vframe_buf.phy_ptr[1];
-        info->virt_addr[0] = (void *)surf->vpu_out_buf.vframe_buf.vir_ptr[0];
-        info->virt_addr[1] = (void *)surf->vpu_out_buf.vframe_buf.vir_ptr[1];
-        if (surf->vpu_out_buf.vframe_buf.fd[0] > 0) {
-            info->dma_fd = surf->vpu_out_buf.vframe_buf.fd[0];
-        }
-    } else if (surf->has_preallocated) {
-        info->vstride = ((surf->height + 7) & ~7);
-        info->phys_addr[0] = surf->preallocated_gbuf.phys_addr[0];
-        info->phys_addr[1] = surf->preallocated_gbuf.phys_addr[1];
-        info->virt_addr[0] = (void *)surf->preallocated_gbuf.virt_addr[0];
-        info->virt_addr[1] = (void *)surf->preallocated_gbuf.virt_addr[1];
-        if (surf->preallocated_gbuf.fd[0] > 0) {
-            info->dma_fd = surf->preallocated_gbuf.fd[0];
-        }
-    }
-
-    uint32_t uv_offset = info->stride * info->vstride;
-    if (info->phys_addr[1] == 0 && info->phys_addr[0] != 0) {
-        info->phys_addr[1] = info->phys_addr[0] + uv_offset;
-    }
-    if (info->virt_addr[1] == NULL && info->virt_addr[0] != NULL) {
-        info->virt_addr[1] = (char *)info->virt_addr[0] + uv_offset;
-    }
-
-    va_trace("vaGetHobotSurfaceInfo: surf=%u, %ux%u, stride=%u, vstride=%u, phys=[0x%lx, 0x%lx], virt=[%p, %p], fd=%d",
-             surface, info->width, info->height, info->stride, info->vstride,
-             (unsigned long)info->phys_addr[0], (unsigned long)info->phys_addr[1],
-             info->virt_addr[0], info->virt_addr[1], info->dma_fd);
-
-    return VA_STATUS_SUCCESS;
+    return hobot_fill_surface_info(drv_ctx, surface, info);
 }
 
 VAStatus __vaDriverInit_1_0(VADriverContextP ctx) {
