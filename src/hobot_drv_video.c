@@ -15,6 +15,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/ioctl.h>
+#include <time.h>
 #include <va/va.h>
 #include <va/va_backend.h>
 #include <va/va_drmcommon.h>
@@ -398,6 +399,9 @@ typedef struct {
     media_codec_buffer_t dec_in_buf;
     int dec_in_buf_valid;
     int dec_in_buf_offset;
+    int watchdog_trace_countdown;
+    int watchdog_anomaly_count;
+    time_t last_anomaly_sec;
 } HobotContext;
 
 /* Internal Image Object */
@@ -445,6 +449,7 @@ static VAStatus hobot_vaTerminate(VADriverContextP ctx) {
         free(drv);
         ctx->pDriverData = NULL;
         hb_mem_module_close();
+        unlink("/dev/shm/hobot_va_watchdog");
     }
     return VA_STATUS_SUCCESS;
 }
@@ -874,6 +879,10 @@ static VAStatus hobot_vaCreateContext(
             c->current_render_target = VA_INVALID_SURFACE;
             c->enc_coded_buf = 0;
             c->frame_count = 0;
+            c->watchdog_anomaly_count = 0;
+            c->last_anomaly_sec = 0;
+            c->watchdog_trace_countdown = 0;
+            unlink("/dev/shm/hobot_va_watchdog");
 
             int is_enc = (cfg->entrypoint == VAEntrypointEncSlice || cfg->entrypoint == VAEntrypointEncPicture);
             c->is_encoder = is_enc;
@@ -995,6 +1004,7 @@ static VAStatus hobot_vaDestroyContext(VADriverContextP ctx, VAContextID context
             hctx->vpu_running = 0;
         }
         hctx->allocated = 0;
+        unlink("/dev/shm/hobot_va_watchdog");
     }
     return VA_STATUS_SUCCESS;
 }
@@ -1514,6 +1524,77 @@ static VAStatus hobot_vaSyncSurface(VADriverContextP ctx, VASurfaceID render_tar
             } else {
                 target = render_target;
             }
+
+            uint32_t err_reason = (uint32_t)out_info.video_frame_info.error_reason;
+            int err_mb = out_info.video_frame_info.err_mb_in_frame_display;
+            int total_mb = out_info.video_frame_info.total_mb_in_frame_display;
+            int disp_idx = out_info.video_frame_info.frame_display_index;
+            int deco_idx = out_info.video_frame_info.frame_decoded_index;
+
+            if (err_reason != 0 || err_mb > 0) {
+                struct timespec now_ts;
+                clock_gettime(CLOCK_MONOTONIC, &now_ts);
+                if (hctx->last_anomaly_sec > 0 && (now_ts.tv_sec - hctx->last_anomaly_sec) >= 10) {
+                    fprintf(stderr, "[HOBOT-VA][WATCHDOG] 10s clean period elapsed. Anomaly count reset from %d to 0.\n",
+                            hctx->watchdog_anomaly_count);
+                    hctx->watchdog_anomaly_count = 0;
+                }
+                hctx->last_anomaly_sec = now_ts.tv_sec;
+                hctx->watchdog_anomaly_count++;
+
+                hctx->watchdog_trace_countdown = 20;
+                fprintf(stderr, "\n[HOBOT-VA][WATCHDOG] >>> VPU ANOMALY DETECTED (#%d/3) <<<\n"
+                                "[HOBOT-VA][WATCHDOG] target_surf=%u disp_idx=%d deco_idx=%d\n"
+                                "[HOBOT-VA][WATCHDOG] error_reason=0x%08x warn_info=0x%08x\n"
+                                "[HOBOT-VA][WATCHDOG] err_mb=%d total_mb=%d (%.1f%% corrupted)\n"
+                                "[HOBOT-VA][WATCHDOG] phy=[0x%llx, 0x%llx] fd=%d stride=%d size=%u (%dx%d)\n\n",
+                        hctx->watchdog_anomaly_count,
+                        target, disp_idx, deco_idx,
+                        err_reason, (uint32_t)out_info.video_frame_info.warn_info,
+                        err_mb, total_mb,
+                        total_mb > 0 ? ((double)err_mb * 100.0 / total_mb) : 0.0,
+                        (unsigned long long)out_buf.vframe_buf.phy_ptr[0],
+                        (unsigned long long)out_buf.vframe_buf.phy_ptr[1],
+                        out_buf.vframe_buf.fd[0],
+                        out_buf.vframe_buf.stride,
+                        out_buf.vframe_buf.size,
+                        out_buf.vframe_buf.width,
+                        out_buf.vframe_buf.height);
+
+                FILE *wfp = fopen("/dev/shm/hobot_va_watchdog", "w");
+                if (wfp) {
+                    fprintf(wfp, "%d %d %ld %d %d\n", (int)getpid(), hctx->watchdog_anomaly_count, (long)time(NULL), err_mb, total_mb);
+                    fclose(wfp);
+                }
+            } else if (hctx->watchdog_anomaly_count > 0) {
+                struct timespec now_ts;
+                clock_gettime(CLOCK_MONOTONIC, &now_ts);
+                if (hctx->last_anomaly_sec > 0 && (now_ts.tv_sec - hctx->last_anomaly_sec) >= 10) {
+                    fprintf(stderr, "[HOBOT-VA][WATCHDOG] 10s clean playback elapsed. Resetting anomaly count (%d -> 0).\n",
+                            hctx->watchdog_anomaly_count);
+                    hctx->watchdog_anomaly_count = 0;
+                    unlink("/dev/shm/hobot_va_watchdog");
+                }
+            } else if (hctx->watchdog_trace_countdown > 0) {
+                hctx->watchdog_trace_countdown--;
+                fprintf(stderr, "[HOBOT-VA][POST-WD #%02d] target_surf=%u disp_idx=%d deco_idx=%d err_reason=0x%08x err_mb=%d/%d phy=[0x%llx, 0x%llx] fd=%d size=%u\n",
+                        20 - hctx->watchdog_trace_countdown,
+                        target, disp_idx, deco_idx,
+                        err_reason, err_mb, total_mb,
+                        (unsigned long long)out_buf.vframe_buf.phy_ptr[0],
+                        (unsigned long long)out_buf.vframe_buf.phy_ptr[1],
+                        out_buf.vframe_buf.fd[0],
+                        out_buf.vframe_buf.size);
+            }
+
+            /* Phase A: Frame Drop Experiment (Discard corrupted frames) */
+            if (err_mb > 0 || (err_reason & 0x00020000)) {
+                fprintf(stderr, "[HOBOT-VA][DROP] Dropping corrupted frame (err_mb=%d/%d, err_reason=0x%08x) for target=%u (anomaly=%d/3)\n",
+                        err_mb, total_mb, err_reason, target, hctx->watchdog_anomaly_count);
+                hb_mm_mc_queue_output_buffer(mctx, &out_buf, 50);
+                continue;
+            }
+
             if (target > 0 && target < MAX_SURFACES && drv->surfaces[target].allocated) {
                 HobotSurface *tsurf = &drv->surfaces[target];
                 if (tsurf->has_decoded_frame) {

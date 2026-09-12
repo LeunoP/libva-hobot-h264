@@ -4,6 +4,7 @@
 [![Platform](https://img.shields.io/badge/Platform-D--Robotics%20RDK--X5-green.svg)]()
 [![Architecture](https://img.shields.io/badge/Arch-ARM64%20(aarch64)-orange.svg)]()
 [![Codec](https://img.shields.io/badge/Codec-H.264%20%7C%20JPEG-red.svg)]()
+[![Branch: watchdog-fallback](https://img.shields.io/badge/Branch-watchdog--fallback-brightgreen.svg)]()
 
 [English](README.md) | [한국어](README.ko.md)
 
@@ -21,9 +22,12 @@ It delivers hardware-accelerated **1080p 60fps H.264 decoding and encoding** wit
 
 - **Standard VA-API Implementation**: Full compatibility with `libva` 1.14+ / 2.x API.
 - **Flawless H.264 B-Frame Pacing**: Solves the Wave521 VPU B-frame jitter issue by disabling internal VPU reordering (`reorder_enable = 0`) and managing presentation order via a dedicated 128-entry FIFO queue (`submitted_surfaces`). Verified **0 dropped frames** on 1080p 60fps high-bitrate video.
+- **VPU Output Integrity & Corrupted Frame Drop**: Inspects `err_mb_in_frame_display` directly at the driver boundary. Automatically drops severely corrupted frames (`err_mb > 0`) back to the VPU buffer pool, eliminating visual screen tearing on non-compliant or high-level video streams.
+- **Hobot-VA WatchDog Real-Time IPC**: Telemetry subsystem broadcasting anomaly events to `/dev/shm/hobot_va_watchdog` with PID and timestamp validation to coordinate zero-latency player fallbacks without false positives.
 - **Multi-Slice Frame Assembly**: Aggregates multi-slice pictures (e.g. from broadcast encoders or streaming servers) into single VPU frames per the `MC_FEEDING_MODE_FRAME_SIZE` specification.
 - **DMA-BUF Pre-allocation & DRM PRIME 2 Export**: Pre-allocates hardware graphics buffers upon surface creation (`vaCreateSurfaces2`) using Hobot memory management (`hb_mem_alloc_graph_buf`), allowing clients to immediately export valid DRM PRIME 2 DMA-BUF handles (`vaExportSurfaceHandle`) with `dup(fd)` lifecycle safety.
 - **Row-by-Row Pitch Alignment**: Handles VPU 8-line vertical padding (`vstride = (height + 7) & ~7`) and horizontal stride discrepancies cleanly during surface copies and export.
+- **Two-Stage MPV Playback Automation (`misc/mpv_scripts/`)**: Includes production-ready companion scripts for automated 5-second probing and seamless in-place software fallback.
 
 ---
 
@@ -34,8 +38,11 @@ It delivers hardware-accelerated **1080p 60fps H.264 decoding and encoding** wit
 | **H.264 (AVC)** | Constrained Baseline | ✅ | ✅ |
 | **H.264 (AVC)** | Main | ✅ | ✅ |
 | **H.264 (AVC)** | High (up to Level 5.1) | ✅ | ✅ |
+| **H.264 (AVC)** | High (Level 5.2 / Multi-Ref DPB Overrun) | 🛡️ Auto-Dropped → SW Fallback | ❌ |
 | **JPEG** | Baseline | ✅ | ✅ |
 | **HEVC (H.265)** | Main / Main 10 | ❌ Disabled | ❌ Disabled |
+
+> **Note on Level 5.2 / High DPB Streams**: When an H.264 bitstream exceeds the hardware VPU's DPB (Decoded Picture Buffer) or Level specifications (e.g. certain high-profile YouTube 1080p60 streams with 16 reference frames), the VPU produces corrupt macroblocks (`err_mb > 0`). The driver safely drops these frames and signals the companion script to fall back to CPU software decoding.
 
 > **Note on HEVC**: Hardware HEVC decoding on the RDK-X5 VPU firmware currently produces severe rainbow color artifacts. It is intentionally excluded from supported VA-API profiles so that players (mpv, ffmpeg) cleanly fall back to software decoding.
 
@@ -69,8 +76,7 @@ make -j$(nproc)
 
 ### 3. Install
 ```bash
-sudo make install
-# Installs hobot_drv_video.so to /usr/lib/aarch64-linux-gnu/dri/
+sudo cp -f hobot_drv_video.so /usr/lib/aarch64-linux-gnu/dri/hobot_drv_video.so
 ```
 
 ### 4. Configure Environment
@@ -86,28 +92,6 @@ Run `vainfo` to ensure the driver initializes correctly:
 ```bash
 vainfo
 ```
-
-Expected output:
-```text
-libva info: VA-API version 1.14.0
-libva info: User environment variable requested driver 'hobot'
-libva info: Trying to open /usr/lib/aarch64-linux-gnu/dri/hobot_drv_video.so
-libva info: Found init function __vaDriverInit_1_0
-libva info: va_openDriver() returns 0
-vainfo: VA-API version: 1.14 (libva 2.12.0)
-vainfo: Driver version: D-Robotics RDK-X5 VPU VA-API Driver 0.4.0 (Decode + Encode)
-vainfo: Supported profile and entrypoints
-      VAProfileH264ConstrainedBaseline:	VAEntrypointVLD
-      VAProfileH264ConstrainedBaseline:	VAEntrypointEncSlice
-      VAProfileH264Main               :	VAEntrypointVLD
-      VAProfileH264Main               :	VAEntrypointEncSlice
-      VAProfileH264High               :	VAEntrypointVLD
-      VAProfileH264High               :	VAEntrypointEncSlice
-      VAProfileJPEGBaseline           :	VAEntrypointVLD
-      VAProfileJPEGBaseline           :	VAEntrypointEncPicture
-```
-
----
 
 ---
 
@@ -152,40 +136,65 @@ libva-hobot-h264
 
 ---
 
-## Recommended MPV Playback Modes
+## VPU Output Integrity & WatchDog Subsystem
 
-### Mode 1: Optimal Zero-Copy Playback (Standalone DRM/KMS) — Recommended
-Requires an mpv build with the DirectVIV interop module (`hwdec_vaapi_directviv.c`).
-Ensure display managers (e.g. LightDM/Xorg) are stopped or do not hold DRM Master on `/dev/dri/card0`:
-
-```bash
-# Set Vivante library path and run mpv in DRM mode
-LD_LIBRARY_PATH=/usr/hobot/lib mpv --gpu-context=drm --vo=gpu --hwdec=vaapi /path/to/video.mp4
+### The Problem: Vendor Error Masking
+When playing certain out-of-spec H.264 streams (e.g., Level 5.2 with DPB > 16), the vendor multimedia library (`libmultimedia.so`) reports `error_reason = 0x00000000` (success), masking severe internal VPU failures:
+```text
+warn_info = 0x01200000 (Level / DPB requirement exceeded)
+err_mb = 7800 ~ 8160 / 8160 (95% ~ 100% macroblock corruption)
 ```
+Passing these corrupted surfaces directly to the display results in violent rainbow pixel tearing.
 
-**Verified Performance:**
-- **Framerate**: 1080p 60.000 fps sustained
-- **Dropped Frames**: 0 frames dropped during steady playback
-- **Audio-Video Sync**: `A-V: 0.000s`
-- **CPU Usage**: ~35% on a single core (<5% total system load)
+### The Solution: Output-Integrity Drop & Real-Time Telemetry
+1. **Corrupted Frame Drop**:
+   `libva-hobot` inspects `out_info.video_frame_info.err_mb_in_frame_display`. If `err_mb > 0`, the surface is immediately recycled back to the VPU queue:
+   ```c
+   if (err_mb > 0 || (err_reason & 0x00020000)) {
+       fprintf(stderr, "[HOBOT-VA][DROP] Dropping corrupted frame (err_mb=%d/%d)\n", err_mb, total_mb);
+       hb_mm_mc_queue_output_buffer(mctx, &out_buf, 50);
+       continue;
+   }
+   ```
+2. **WatchDog IPC Telemetry**:
+   The driver records anomalies and publishes real-time telemetry to `/dev/shm/hobot_va_watchdog`:
+   ```text
+   <pid> <anomaly_count> <epoch_timestamp> <err_mb> <total_mb>
+   ```
+   A 10-second clean playback window automatically resets the anomaly counter to prevent false alarms over long sessions. The IPC file is automatically unlinked on context creation and destruction.
 
-### Mode 2: Desktop X11 Playback (Software Copy Fallback)
-For desktop X11 sessions where Xorg owns DRM Master:
+---
 
-**Configuration (`~/.config/mpv/mpv.conf`):**
-```ini
-# Hardware decoding with CPU frame readback
-hwdec=vaapi-copy
-vo=x11
+## MPV Companion Scripts (`misc/mpv_scripts/`)
 
-# Software Scaler Optimization
-sws-allow-zimg=no
-sws-scaler=fast-bilinear
-sws-fast=yes
+The repository includes a suite of helper scripts in [`misc/mpv_scripts/`](misc/mpv_scripts/) designed to orchestrate seamless hardware verification and software fallback.
 
-# Audio Buffer (Prevents PulseAudio jitter)
-audio-buffer=1
-fs=yes
+### 1. `fallback-restart.lua` (Automated Probing & Fallback)
+
+| Playback Stage | Condition | Player Action | OSD Notification |
+| :--- | :--- | :--- | :--- |
+| **Initial Probing (First 5s)** | 3 anomalies accumulated OR hardware decode error | Rewinds to `00:00:00`, switches to SW decoder (`hwdec=no`), reveals screen & unmutes | **Top-left small notice (1.5s)**:<br>`SW 디코더` |
+| **Initial Probing (First 5s)** | Clean playback (0 anomalies) | Rewinds to `00:00:00`, reveals screen & unmutes, keeps HW DirectVIV | *(None — seamless reveal)* |
+| **Post-Probing (Mid-Playback)** | 3 anomalies accumulated OR decode failure | **Does NOT rewind** (keeps current playback position), switches to SW in-place | **Top-left small notice (1.5s)**:<br>`SW 디코더` |
+
+### 2. `mpv.conf` (Optimized RDK-X5 Profile)
+Pre-configured for DRM/GBM DirectVIV zero-copy (`vo=gpu`, `gpu-context=drm`, `hwdec=vaapi`, `vd-lavc-software-fallback=1`), YouTube 1080p AVC preference, and automatic HLS/live stream CPU decoding.
+
+### 3. `mpv-launcher-wrapper.sh` (Production Launcher)
+Handles environment variables (`LIBVA_DRIVER_NAME=hobot`, `LD_LIBRARY_PATH=/usr/hobot/lib`) and automatically manages LightDM / DRM Master release and restoration.
+
+### Quick Deployment
+```bash
+# 1. Install Lua script
+mkdir -p ~/.config/mpv/scripts
+cp misc/mpv_scripts/fallback-restart.lua ~/.config/mpv/scripts/
+
+# 2. Install MPV configuration
+cp misc/mpv_scripts/mpv.conf ~/.config/mpv/mpv.conf
+
+# 3. Install production launcher
+sudo cp misc/mpv_scripts/mpv-launcher-wrapper.sh /usr/local/bin/mpv
+sudo chmod +x /usr/local/bin/mpv
 ```
 
 ---
@@ -224,11 +233,28 @@ The repository includes comprehensive standalone verification tools in `tools/`:
 
 ---
 
+## Known Issues & Status
+
+| Issue | Status | Resolution |
+|---|:---:|---|
+| **H.264 Level 5.2 / DPB Overrun (e.g. YouTube)** | ✅ Solved | VPU Output Integrity drop + WatchDog SW fallback |
+| **H.264 60fps B-Frame Pacing / Jitter** | ✅ Solved | VPU Reorder disabled (`reorder_enable=0`) + FIFO surface queue |
+| **Audio Underrun Visual Stutter** | ✅ Solved | `audio-buffer=1` configuration in `mpv.conf` |
+| **HEVC (H.265) Rainbow Color Distortion** | ⚠️ Bypassed | Excluded from VA-API profile list; smoothly decoded via CPU SW |
+| **X11 Desktop DRI2 Failure** | ⚠️ Bypassed | Use DRM/GBM standalone mode; fallback to `hwdec=vaapi-copy` in X11 |
+
+---
+
 ## Diagnostics & Monitoring
 
 Monitor VPU hardware interrupt activity during playback:
 ```bash
 watch -n 1 "cat /proc/interrupts | grep 3b000000.vpu"
+```
+
+Monitor WatchDog telemetry:
+```bash
+cat /dev/shm/hobot_va_watchdog
 ```
 
 Monitor board temperatures:
