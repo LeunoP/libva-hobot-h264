@@ -161,7 +161,9 @@ static int generate_h264_sps(VAPictureParameterBufferH264 *pic, uint8_t *out, in
     return 1 + add_emulation_prevention(rbsp, rbsp_len, out + 1, max_len - 1);
 }
 
-static int generate_h264_pps(VAPictureParameterBufferH264 *pic, uint8_t *out, int max_len) {
+static int generate_h264_pps(VAPictureParameterBufferH264 *pic,
+                             unsigned int default_l0_active_minus1,
+                             uint8_t *out, int max_len) {
     uint8_t rbsp[256] = {0};
     BitWriter bw = {rbsp, 0};
 
@@ -170,7 +172,7 @@ static int generate_h264_pps(VAPictureParameterBufferH264 *pic, uint8_t *out, in
     bw_put_bits(&bw, pic->pic_fields.bits.entropy_coding_mode_flag, 1);
     bw_put_bits(&bw, pic->pic_fields.bits.pic_order_present_flag, 1);
     bw_put_ue(&bw, 0);         // num_slice_groups_minus1
-    bw_put_ue(&bw, 0);         // num_ref_idx_l0_default_active_minus1
+    bw_put_ue(&bw, default_l0_active_minus1); // VA-API omits the PPS default
     bw_put_ue(&bw, 0);         // num_ref_idx_l1_default_active_minus1
     bw_put_bits(&bw, pic->pic_fields.bits.weighted_pred_flag, 1);
     bw_put_bits(&bw, pic->pic_fields.bits.weighted_bipred_idc, 2);
@@ -1343,7 +1345,14 @@ static VAStatus hobot_vaRenderPicture(
                     if (b->size >= sizeof(VAPictureParameterBufferH264)) {
                         VAPictureParameterBufferH264 *pic = (VAPictureParameterBufferH264 *)b->data;
                         hctx->cached_sps_len = generate_h264_sps(pic, hctx->cached_sps, sizeof(hctx->cached_sps));
-                        hctx->cached_pps_len = generate_h264_pps(pic, hctx->cached_pps, sizeof(hctx->cached_pps));
+                        /* VA-API does not expose the PPS default reference count.
+                         * Wave521 needs a non-zero default for the multi-reference
+                         * 1080p streams that otherwise fail with error 0x3006. */
+                        unsigned int default_l0_active_minus1 =
+                            (pic->num_ref_frames >= 3) ? 2 : 0;
+                        hctx->cached_pps_len = generate_h264_pps(
+                            pic, default_l0_active_minus1,
+                            hctx->cached_pps, sizeof(hctx->cached_pps));
                     }
                 }
             }
