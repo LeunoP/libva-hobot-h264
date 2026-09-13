@@ -1,5 +1,5 @@
 CC ?= gcc
-CFLAGS ?= -O2 -Wall -fPIC -I/usr/include
+CFLAGS ?= -O2 -Wall -fPIC -pthread -I/usr/include
 LDFLAGS ?= -shared -L/usr/hobot/lib -lva -lva-drm -lmultimedia -lhbmem -Wl,-rpath=/usr/hobot/lib
 
 TARGET = hobot_drv_video.so

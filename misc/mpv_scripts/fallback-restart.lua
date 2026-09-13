@@ -3,8 +3,8 @@
 -- Features:
 -- 1. Silent Probing (first 5 seconds):
 --    Keeps screen black and mutes audio behind the scenes to validate hardware acceleration.
--- 2. Probing Failure (3 anomalies accumulated):
---    - When 3 anomalies accumulate during the probe:
+-- 2. Probing Failure (1 anomaly detected):
+--    - When an anomaly is detected during the probe:
 --        Switches decoder to software mode (hwdec=no),
 --        Rewinds to beginning (00:00:00),
 --        Reveals screen, restores audio, and displays top-left OSD notice:
@@ -26,6 +26,7 @@ local my_pid = mp.get_property_number("pid")
 local file_start_epoch = os.time()
 local is_switching = false
 local last_ipc_count = 0
+local anomaly_threshold = 1
 
 local black_ov = mp.create_osd_overlay("ass-events")
 black_ov.res_x = 1920
@@ -102,18 +103,18 @@ local function handle_anomaly(reason, count)
     if mp.get_property("hwdec") == "no" or is_switching then return end
 
     if probing then
-        -- 검증 단계: 어노말리 3개 누적 시 바로 SW로 전환하고 처음으로 복귀
-        if count >= 3 then
+        -- 검증 단계: 어노말리 1개 감지 시 바로 SW로 전환하고 처음으로 복귀
+        if count >= anomaly_threshold then
             switch_to_sw_probe(reason)
         else
-            mp.msg.info(string.format("[fallback-restart] [PROBE] WatchDog anomaly detected (%d/3): %s", count, reason))
+            mp.msg.info(string.format("[fallback-restart] [PROBE] WatchDog anomaly detected (%d/%d): %s", count, anomaly_threshold, reason))
         end
     else
         -- 이후 재생 중: 오류 발생 시 처음으로 보내지 않고, 왼쪽 위에 "SW디코더 전환" 작게 띄우고 재생 유지
-        if count >= 3 then
+        if count >= anomaly_threshold then
             switch_to_sw_playback(reason)
         else
-            mp.msg.info(string.format("[fallback-restart] [PLAYBACK] WatchDog anomaly detected (%d/3): %s", count, reason))
+            mp.msg.info(string.format("[fallback-restart] [PLAYBACK] WatchDog anomaly detected (%d/%d): %s", count, anomaly_threshold, reason))
         end
     end
 end
