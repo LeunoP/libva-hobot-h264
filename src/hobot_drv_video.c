@@ -16,6 +16,7 @@
 #include <fcntl.h>
 #include <sys/ioctl.h>
 #include <time.h>
+#include <libdrm/drm_fourcc.h>
 #include <va/va.h>
 #include <va/va_backend.h>
 #include <va/va_drmcommon.h>
@@ -1960,14 +1961,21 @@ static VAStatus hobot_vaExportSurfaceHandle(
         va_trace("vaExportSurfaceHandle: surface=%u NOT ALLOCATED", surface_id);
         return VA_STATUS_ERROR_INVALID_SURFACE;
     }
-    int needs_sync = !drv->surfaces[surface_id].has_decoded_frame;
+    int has_decoded_frame = drv->surfaces[surface_id].has_decoded_frame;
+    int has_preallocated = drv->surfaces[surface_id].has_preallocated;
     pthread_mutex_unlock(&drv->mutex);
 
-    if (needs_sync) {
+    if (has_decoded_frame) {
         va_trace("vaExportSurfaceHandle: surface=%u syncing for decoded frame...", surface_id);
         VAStatus sync_status = hobot_vaSyncSurface(ctx, surface_id);
         if (sync_status != VA_STATUS_SUCCESS) {
             return sync_status;
+        }
+    } else if (!has_preallocated) {
+        struct hobot_surface_info info;
+        VAStatus prepare_status = hobot_fill_surface_info(ctx, surface_id, &info);
+        if (prepare_status != VA_STATUS_SUCCESS) {
+            return prepare_status;
         }
     }
 
@@ -1977,9 +1985,9 @@ static VAStatus hobot_vaExportSurfaceHandle(
         return VA_STATUS_ERROR_INVALID_SURFACE;
     }
     HobotSurface *surf = &drv->surfaces[surface_id];
-    if (!surf->has_decoded_frame || surf->dma_fd < 0) {
-        va_trace("vaExportSurfaceHandle: surface=%u dma_fd < 0 (has_frame=%d) -> FAIL",
-                 surface_id, surf->has_decoded_frame);
+    if ((!surf->has_decoded_frame && !surf->has_preallocated) || surf->dma_fd < 0) {
+        va_trace("vaExportSurfaceHandle: surface=%u dma_fd < 0 (has_frame=%d, preallocated=%d) -> FAIL",
+                 surface_id, surf->has_decoded_frame, surf->has_preallocated);
         pthread_mutex_unlock(&drv->mutex);
         return VA_STATUS_ERROR_INVALID_SURFACE;
     }
@@ -2027,16 +2035,33 @@ static VAStatus hobot_vaExportSurfaceHandle(
     desc->objects[0].size = buf_size;
     desc->objects[0].drm_format_modifier = 0; /* DRM_FORMAT_MOD_LINEAR */
 
-    desc->num_layers = 1;
-    desc->layers[0].drm_format = VA_FOURCC_NV12;
-    desc->layers[0].num_planes = 2;
-    desc->layers[0].object_index[0] = 0;
-    desc->layers[0].offset[0] = 0;
-    desc->layers[0].pitch[0] = pitch;
+    if (flags & VA_EXPORT_SURFACE_SEPARATE_LAYERS) {
+        /* Kodi's EGL importer consumes one single-plane layer per texture. */
+        desc->num_layers = 2;
 
-    desc->layers[0].object_index[1] = 0;
-    desc->layers[0].offset[1] = uv_offset;
-    desc->layers[0].pitch[1] = pitch;
+        desc->layers[0].drm_format = DRM_FORMAT_R8;
+        desc->layers[0].num_planes = 1;
+        desc->layers[0].object_index[0] = 0;
+        desc->layers[0].offset[0] = 0;
+        desc->layers[0].pitch[0] = pitch;
+
+        desc->layers[1].drm_format = DRM_FORMAT_GR88;
+        desc->layers[1].num_planes = 1;
+        desc->layers[1].object_index[0] = 0;
+        desc->layers[1].offset[0] = uv_offset;
+        desc->layers[1].pitch[0] = pitch;
+    } else {
+        desc->num_layers = 1;
+        desc->layers[0].drm_format = VA_FOURCC_NV12;
+        desc->layers[0].num_planes = 2;
+        desc->layers[0].object_index[0] = 0;
+        desc->layers[0].offset[0] = 0;
+        desc->layers[0].pitch[0] = pitch;
+
+        desc->layers[0].object_index[1] = 0;
+        desc->layers[0].offset[1] = uv_offset;
+        desc->layers[0].pitch[1] = pitch;
+    }
 
     va_trace("vaExportSurfaceHandle -> success: surf=%u, dma_fd=%d, exp_fd=%d, phys=0x%lx, %ux%u",
              surface_id, surf->dma_fd, exp_fd, (unsigned long)phys_addr, desc->width, desc->height);
