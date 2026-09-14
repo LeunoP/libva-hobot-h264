@@ -13,7 +13,7 @@
 It delivers hardware-accelerated **1080p 60fps H.264 decoding and encoding** with rock-solid frame pacing, 0 dropped frames, and low CPU utilization, providing a compliant VA-API implementation for standard Linux media applications (mpv, ffmpeg, Chromium).
 
 > [!NOTE]
-> **Notice**: This codebase and driver architecture were researched, developed, and optimized by AI (Google DeepMind Antigravity / Gemini) in collaboration with LeunoP.
+> **Notice**: This codebase and driver architecture were researched, developed, and optimized by AI (Google DeepMind Antigravity / Gemini and OpenAI Codex) in collaboration with LeunoP.
 > *(해당 코드는 AI가 작성 및 최적화했습니다.)*
 
 ---
@@ -22,10 +22,12 @@ It delivers hardware-accelerated **1080p 60fps H.264 decoding and encoding** wit
 
 - **Standard VA-API Implementation**: Full compatibility with `libva` 1.14+ / 2.x API.
 - **Flawless H.264 B-Frame Pacing**: Solves the Wave521 VPU B-frame jitter issue by disabling internal VPU reordering (`reorder_enable = 0`) and managing presentation order via a dedicated 128-entry FIFO queue (`submitted_surfaces`). Verified **0 dropped frames** on 1080p 60fps high-bitrate video.
+- **H.264 Parameter-Set Refresh**: Detects changed synthesized SPS/PPS data and re-injects the parameter sets before the next picture, keeping decoder state aligned across stream renegotiation.
 - **VPU Output Integrity & Corrupted Frame Drop**: Inspects `err_mb_in_frame_display` directly at the driver boundary. Automatically drops severely corrupted frames (`err_mb > 0`) back to the VPU buffer pool, eliminating visual screen tearing on non-compliant or high-level video streams.
-- **Hobot-VA WatchDog Real-Time IPC**: Telemetry subsystem broadcasting anomaly events to `/dev/shm/hobot_va_watchdog` with PID and timestamp validation to coordinate zero-latency player fallbacks without false positives.
+- **VPU Hollow-Buffer Guard**: Rejects and recycles empty output buffers emitted during decoder startup or resolution renegotiation before they can reach image mapping or DRM export paths.
+- **Hobot-VA WatchDog Real-Time IPC**: Telemetry subsystem broadcasting anomaly events to `/dev/shm/hobot_va_watchdog` with PID and timestamp validation. The file is published atomically so polling players never consume a partial record.
 - **Multi-Slice Frame Assembly**: Aggregates multi-slice pictures (e.g. from broadcast encoders or streaming servers) into single VPU frames per the `MC_FEEDING_MODE_FRAME_SIZE` specification.
-- **DMA-BUF Pre-allocation & DRM PRIME 2 Export**: Pre-allocates hardware graphics buffers upon surface creation (`vaCreateSurfaces2`) using Hobot memory management (`hb_mem_alloc_graph_buf`), allowing clients to immediately export valid DRM PRIME 2 DMA-BUF handles (`vaExportSurfaceHandle`) with `dup(fd)` lifecycle safety.
+- **DMA-BUF & DRM PRIME 2 Export**: Exports decoded VPU DMA-BUFs with `dup(fd)` lifecycle safety. A Hobot graphics buffer is allocated lazily only for the vendor surface-info fallback path when no decoded output is available.
 - **Row-by-Row Pitch Alignment**: Handles VPU 8-line vertical padding (`vstride = (height + 7) & ~7`) and horizontal stride discrepancies cleanly during surface copies and export.
 - **Two-Stage MPV Playback Automation (`misc/mpv_scripts/`)**: Includes production-ready companion scripts for automated 5-second probing and seamless in-place software fallback.
 
@@ -161,7 +163,7 @@ Passing these corrupted surfaces directly to the display results in violent rain
    ```text
    <pid> <anomaly_count> <epoch_timestamp> <err_mb> <total_mb>
    ```
-   A 10-second clean playback window automatically resets the anomaly counter to prevent false alarms over long sessions. The IPC file is automatically unlinked on context creation and destruction.
+   A 10-second clean playback window automatically resets the anomaly counter to prevent false alarms over long sessions. The player fallback threshold is **one anomaly**. The IPC file is written through a temporary file and atomic rename, then automatically unlinked on context creation and destruction.
 
 ---
 
@@ -173,9 +175,9 @@ The repository includes a suite of helper scripts in [`misc/mpv_scripts/`](misc/
 
 | Playback Stage | Condition | Player Action | OSD Notification |
 | :--- | :--- | :--- | :--- |
-| **Initial Probing (First 5s)** | 3 anomalies accumulated OR hardware decode error | Rewinds to `00:00:00`, switches to SW decoder (`hwdec=no`), reveals screen & unmutes | **Top-left small notice (1.5s)**:<br>`SW 디코더` |
+| **Initial Probing (First 5s)** | 1 anomaly OR hardware decode error | Rewinds to `00:00:00`, switches to SW decoder (`hwdec=no`), reveals screen & unmutes | **Top-left small notice (1.5s)**:<br>`SW 디코더` |
 | **Initial Probing (First 5s)** | Clean playback (0 anomalies) | Rewinds to `00:00:00`, reveals screen & unmutes, keeps HW DirectVIV | *(None — seamless reveal)* |
-| **Post-Probing (Mid-Playback)** | 3 anomalies accumulated OR decode failure | **Does NOT rewind** (keeps current playback position), switches to SW in-place | **Top-left small notice (1.5s)**:<br>`SW 디코더` |
+| **Post-Probing (Mid-Playback)** | 1 anomaly OR decode failure | **Does NOT rewind** (keeps current playback position), switches to SW in-place | **Top-left small notice (1.5s)**:<br>`SW 디코더` |
 
 ### 2. `mpv.conf` (Optimized RDK-X5 Profile)
 Pre-configured for DRM/GBM DirectVIV zero-copy (`vo=gpu`, `gpu-context=drm`, `hwdec=vaapi`, `vd-lavc-software-fallback=1`), YouTube 1080p AVC preference, and automatic HLS/live stream CPU decoding.
@@ -230,6 +232,7 @@ The repository includes comprehensive standalone verification tools in `tools/`:
 - **`test_render_directviv.c`**: Validates off-screen GLES shader rendering with hardware NV12 texture sampling.
 - **`test_nv12_overlay.c`**: Tests hardware DRM KMS plane overlay capabilities.
 - **`test_va_directviv_bench.c`**: End-to-end multi-thousand frame benchmark streaming real H.264 VPU decoding into DirectVIV GLES rendering (sustains **>127 FPS** on 1080p60 content).
+- **`test_va_config.c`**: Exercises VA configuration creation/query/destruction, verifies the driver mutex lifecycle, and checks NV12 CPU mapping through `vaLockSurface`/`vaUnlockSurface`.
 
 ---
 
@@ -239,6 +242,10 @@ The repository includes comprehensive standalone verification tools in `tools/`:
 |---|:---:|---|
 | **H.264 Level 5.2 / DPB Overrun (e.g. YouTube)** | ✅ Solved | VPU Output Integrity drop + WatchDog SW fallback |
 | **H.264 60fps B-Frame Pacing / Jitter** | ✅ Solved | VPU Reorder disabled (`reorder_enable=0`) + FIFO surface queue |
+| **H.264 multi-reference PPS failure** | ✅ Solved | Synthesize a non-zero PPS L0 reference default when required by Wave521 |
+| **Empty VPU output during startup/renegotiation** | ✅ Solved | Validate physical address, payload size, and virtual pointer before retaining or recycling buffers |
+| **VA config-query deadlock** | ✅ Solved | Unlock the driver mutex before returning config attributes |
+| **CPU surface mapping unavailable** | ✅ Solved | Expose NV12 stride, offsets, DMA-BUF name, and CPU pointer through `vaLockSurface` |
 | **Audio Underrun Visual Stutter** | ✅ Solved | `audio-buffer=1` configuration in `mpv.conf` |
 | **HEVC (H.265) Rainbow Color Distortion** | ⚠️ Bypassed | Excluded from VA-API profile list; smoothly decoded via CPU SW |
 | **X11 Desktop DRI2 Failure** | ⚠️ Bypassed | Use DRM/GBM standalone mode; fallback to `hwdec=vaapi-copy` in X11 |

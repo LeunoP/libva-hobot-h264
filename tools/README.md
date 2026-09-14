@@ -18,3 +18,9 @@ Full end-to-end benchmark pipeline:
 3. Exports each decoded surface's contiguous physical address via `vaExportSurfaceHandle`.
 4. Maps physical addresses directly into Vivante GLES 2D textures using `glTexDirectVIVMap`.
 5. Renders textured quads at up to 180+ FPS with zero CPU copying and zero frame drops.
+
+### 5. `test_va_config.c`
+Creates an H.264 VLD configuration and calls `vaQueryConfigAttributes`, then creates an NV12
+surface and verifies CPU mapping through `vaLockSurface`/`vaUnlockSurface` before destroying
+the configuration and VA display. This covers the driver's config mutex, surface mapping, and
+configuration validation paths.

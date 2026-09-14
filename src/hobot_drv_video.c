@@ -55,6 +55,8 @@ static inline void va_trace(const char *fmt, ...) {
 #define MAX_CONTEXTS 16
 #define MAX_CONFIGS  64
 #define MAX_IMAGES   512
+#define HOBOT_WATCHDOG_FALLBACK_THRESHOLD 1
+#define HOBOT_WATCHDOG_CLEAN_RESET_SEC 10
 
 static VAProfile supported_profiles[] = {
     VAProfileH264ConstrainedBaseline,
@@ -65,6 +67,13 @@ static VAProfile supported_profiles[] = {
 };
 
 #define NUM_SUPPORTED_PROFILES (sizeof(supported_profiles) / sizeof(supported_profiles[0]))
+
+static int hobot_profile_supported(VAProfile profile) {
+    for (size_t i = 0; i < NUM_SUPPORTED_PROFILES; i++) {
+        if (supported_profiles[i] == profile) return 1;
+    }
+    return 0;
+}
 
 /* H.264 Bitstream Synthesizer (for Decoder SPS/PPS synthesis) */
 typedef struct {
@@ -427,6 +436,30 @@ typedef struct {
     pthread_mutex_t mutex;
 } HobotDriverData;
 
+static void hobot_publish_watchdog_state(int anomaly_count, int err_mb, int total_mb) {
+    char tmp_path[128];
+    int pid = (int)getpid();
+    snprintf(tmp_path, sizeof(tmp_path), "/dev/shm/hobot_va_watchdog.%d.tmp", pid);
+
+    FILE *wfp = fopen(tmp_path, "w");
+    if (!wfp) return;
+
+    fprintf(wfp, "%d %d %ld %d %d\n", pid, anomaly_count,
+            (long)time(NULL), err_mb, total_mb);
+    if (fclose(wfp) == 0) {
+        rename(tmp_path, "/dev/shm/hobot_va_watchdog");
+    } else {
+        unlink(tmp_path);
+    }
+}
+
+static int hobot_header_changed(const uint8_t *old_data, int old_len,
+                                const uint8_t *new_data, int new_len) {
+    if (old_len != new_len) return 1;
+    if (new_len <= 0) return 0;
+    return memcmp(old_data, new_data, (size_t)new_len) != 0;
+}
+
 static VAStatus hobot_vaTerminate(VADriverContextP ctx) {
     if (!ctx) return VA_STATUS_ERROR_INVALID_CONTEXT;
     if (ctx->pDriverData) {
@@ -523,14 +556,7 @@ static VAStatus hobot_vaQueryConfigEntrypoints(
     va_trace("vaQueryConfigEntrypoints: profile=%d, list=%p, num=%p", profile, entrypoint_list, num_entrypoints);
     if (!num_entrypoints) return VA_STATUS_ERROR_INVALID_PARAMETER;
     
-    int valid = 0;
-    for (size_t i = 0; i < NUM_SUPPORTED_PROFILES; i++) {
-        if (supported_profiles[i] == profile) {
-            valid = 1;
-            break;
-        }
-    }
-    if (!valid) {
+    if (!hobot_profile_supported(profile)) {
         *num_entrypoints = 0;
         return VA_STATUS_ERROR_UNSUPPORTED_PROFILE;
     }
@@ -623,7 +649,14 @@ static VAStatus hobot_vaCreateConfig(
 
     int is_vld = (entrypoint == VAEntrypointVLD);
     int is_enc = (entrypoint == VAEntrypointEncSlice || entrypoint == VAEntrypointEncPicture);
-    if (!is_vld && !is_enc) {
+    if (!hobot_profile_supported(profile) || (!is_vld && !is_enc)) {
+        return VA_STATUS_ERROR_UNSUPPORTED_ENTRYPOINT;
+    }
+    if (profile == VAProfileJPEGBaseline && entrypoint != VAEntrypointVLD &&
+        entrypoint != VAEntrypointEncPicture) {
+        return VA_STATUS_ERROR_UNSUPPORTED_ENTRYPOINT;
+    }
+    if (profile != VAProfileJPEGBaseline && entrypoint == VAEntrypointEncPicture) {
         return VA_STATUS_ERROR_UNSUPPORTED_ENTRYPOINT;
     }
 
@@ -675,15 +708,23 @@ static VAStatus hobot_vaQueryConfigAttributes(
     int *num_attribs
 ) {
     HobotDriverData *drv = (HobotDriverData *)ctx->pDriverData;
+    VAProfile cfg_profile;
+    VAEntrypoint cfg_entrypoint;
+
+    pthread_mutex_lock(&drv->mutex);
     if (config_id <= 0 || config_id >= MAX_CONFIGS || !drv->configs[config_id].allocated) {
+        pthread_mutex_unlock(&drv->mutex);
         return VA_STATUS_ERROR_INVALID_CONFIG;
     }
-    HobotConfig *cfg = &drv->configs[config_id];
-    pthread_mutex_lock(&drv->mutex);
-    if (profile) *profile = cfg->profile;
-    if (entrypoint) *entrypoint = cfg->entrypoint;
+    cfg_profile = drv->configs[config_id].profile;
+    cfg_entrypoint = drv->configs[config_id].entrypoint;
+    if (profile) *profile = cfg_profile;
+    if (entrypoint) *entrypoint = cfg_entrypoint;
+    pthread_mutex_unlock(&drv->mutex);
+
     if (attrib_list && num_attribs && *num_attribs > 0) {
-        return hobot_vaGetConfigAttributes(ctx, cfg->profile, cfg->entrypoint, attrib_list, *num_attribs);
+        return hobot_vaGetConfigAttributes(ctx, cfg_profile, cfg_entrypoint,
+                                           attrib_list, *num_attribs);
     }
     return VA_STATUS_SUCCESS;
 }
@@ -700,6 +741,10 @@ static VAStatus hobot_vaQuerySurfaceAttributes(
     if (!attrib_list) {
         *num_attribs = 6;
         return VA_STATUS_SUCCESS;
+    }
+    if (*num_attribs < 6) {
+        *num_attribs = 6;
+        return VA_STATUS_ERROR_MAX_NUM_EXCEEDED;
     }
 
     int idx = 0;
@@ -764,8 +809,8 @@ static VAStatus hobot_vaCreateSurfaces2(
         int found = 0;
         for (int s = 1; s < MAX_SURFACES; s++) {
             if (!drv->surfaces[s].allocated) {
-                unsigned int aligned_w = (width + 63) & ~63;
-                unsigned int aligned_h = (height + 63) & ~63;
+                unsigned int aligned_w = (width + 63u) & ~63u;
+                unsigned int aligned_h = (height + 63u) & ~63u;
                 drv->surfaces[s].allocated = 1;
                 drv->surfaces[s].id = (VASurfaceID)s;
                 drv->surfaces[s].width = width;
@@ -1337,22 +1382,57 @@ static VAStatus hobot_vaRenderPicture(
                     if (b->size >= sizeof(VAPictureParameterBufferHEVC)) {
                         VAPictureParameterBufferHEVC *pic = (VAPictureParameterBufferHEVC *)b->data;
                         int prof_idc = (hctx->profile == VAProfileHEVCMain10) ? 2 : 1;
-                        hctx->cached_vps_len = generate_hevc_vps(prof_idc, hctx->cached_vps, sizeof(hctx->cached_vps));
-                        hctx->cached_sps_len = generate_hevc_sps(pic, prof_idc, hctx->cached_sps, sizeof(hctx->cached_sps));
-                        hctx->cached_pps_len = generate_hevc_pps(pic, hctx->cached_pps, sizeof(hctx->cached_pps));
+                        uint8_t new_vps[sizeof(hctx->cached_vps)];
+                        uint8_t new_sps[sizeof(hctx->cached_sps)];
+                        uint8_t new_pps[sizeof(hctx->cached_pps)];
+                        int new_vps_len = generate_hevc_vps(prof_idc, new_vps, sizeof(new_vps));
+                        int new_sps_len = generate_hevc_sps(pic, prof_idc, new_sps, sizeof(new_sps));
+                        int new_pps_len = generate_hevc_pps(pic, new_pps, sizeof(new_pps));
+                        int sequence_changed =
+                            hobot_header_changed(hctx->cached_vps, hctx->cached_vps_len,
+                                                 new_vps, new_vps_len) ||
+                            hobot_header_changed(hctx->cached_sps, hctx->cached_sps_len,
+                                                 new_sps, new_sps_len) ||
+                            hobot_header_changed(hctx->cached_pps, hctx->cached_pps_len,
+                                                 new_pps, new_pps_len);
+                        if (sequence_changed && hctx->headers_sent) {
+                            hctx->headers_sent = 0;
+                            va_trace("vaRenderPicture: HEVC sequence changed; re-injecting parameter sets");
+                        }
+                        memcpy(hctx->cached_vps, new_vps, (size_t)new_vps_len);
+                        memcpy(hctx->cached_sps, new_sps, (size_t)new_sps_len);
+                        memcpy(hctx->cached_pps, new_pps, (size_t)new_pps_len);
+                        hctx->cached_vps_len = new_vps_len;
+                        hctx->cached_sps_len = new_sps_len;
+                        hctx->cached_pps_len = new_pps_len;
                     }
                 } else if (hctx->profile != VAProfileJPEGBaseline) {
                     if (b->size >= sizeof(VAPictureParameterBufferH264)) {
                         VAPictureParameterBufferH264 *pic = (VAPictureParameterBufferH264 *)b->data;
-                        hctx->cached_sps_len = generate_h264_sps(pic, hctx->cached_sps, sizeof(hctx->cached_sps));
                         /* VA-API does not expose the PPS default reference count.
                          * Wave521 needs a non-zero default for the multi-reference
                          * 1080p streams that otherwise fail with error 0x3006. */
                         unsigned int default_l0_active_minus1 =
                             (pic->num_ref_frames >= 3) ? 2 : 0;
-                        hctx->cached_pps_len = generate_h264_pps(
+                        uint8_t new_sps[sizeof(hctx->cached_sps)];
+                        uint8_t new_pps[sizeof(hctx->cached_pps)];
+                        int new_sps_len = generate_h264_sps(pic, new_sps, sizeof(new_sps));
+                        int new_pps_len = generate_h264_pps(
                             pic, default_l0_active_minus1,
-                            hctx->cached_pps, sizeof(hctx->cached_pps));
+                            new_pps, sizeof(new_pps));
+                        int sequence_changed =
+                            hobot_header_changed(hctx->cached_sps, hctx->cached_sps_len,
+                                                 new_sps, new_sps_len) ||
+                            hobot_header_changed(hctx->cached_pps, hctx->cached_pps_len,
+                                                 new_pps, new_pps_len);
+                        if (sequence_changed && hctx->headers_sent) {
+                            hctx->headers_sent = 0;
+                            va_trace("vaRenderPicture: H.264 sequence changed; re-injecting parameter sets");
+                        }
+                        memcpy(hctx->cached_sps, new_sps, (size_t)new_sps_len);
+                        memcpy(hctx->cached_pps, new_pps, (size_t)new_pps_len);
+                        hctx->cached_sps_len = new_sps_len;
+                        hctx->cached_pps_len = new_pps_len;
                     }
                 }
             }
@@ -1478,6 +1558,15 @@ static VAStatus hobot_vaEndPicture(VADriverContextP ctx, VAContextID context) {
             pthread_mutex_unlock(&drv->mutex);
             return VA_STATUS_ERROR_OPERATION_FAILED;
         }
+        if (!in_buf.vframe_buf.vir_ptr[0] || !in_buf.vframe_buf.vir_ptr[1]) {
+            fprintf(stderr, "[HOBOT-VA] dequeue_in returned an invalid NV12 buffer\n");
+            int recycle_ret = hb_mm_mc_queue_input_buffer(&hctx->vpu_ctx, &in_buf, 1000);
+            if (recycle_ret != 0) {
+                fprintf(stderr, "[HOBOT-VA] invalid input buffer recycle failed: ret=%d\n", recycle_ret);
+            }
+            pthread_mutex_unlock(&drv->mutex);
+            return VA_STATUS_ERROR_OPERATION_FAILED;
+        }
 
         int enc_w = hctx->vpu_ctx.video_enc_params.width;
         int enc_h = hctx->vpu_ctx.video_enc_params.height;
@@ -1533,7 +1622,17 @@ static VAStatus hobot_vaEndPicture(VADriverContextP ctx, VAContextID context) {
         memset(&info, 0, sizeof(info));
 
         ret = hb_mm_mc_dequeue_output_buffer(&hctx->vpu_ctx, &out_buf, &info, 2000);
-        if (ret == 0 && out_buf.vstream_buf.size > 0) {
+        if (ret == 0) {
+            if (out_buf.vstream_buf.size == 0 || !out_buf.vstream_buf.vir_ptr) {
+                fprintf(stderr, "[HOBOT-VA] dequeue_out returned an empty encoded buffer\n");
+                int recycle_ret = hb_mm_mc_queue_output_buffer(&hctx->vpu_ctx, &out_buf, 1000);
+                if (recycle_ret != 0) {
+                    fprintf(stderr, "[HOBOT-VA] empty output buffer recycle failed: ret=%d\n", recycle_ret);
+                }
+                pthread_mutex_unlock(&drv->mutex);
+                return VA_STATUS_ERROR_OPERATION_FAILED;
+            }
+
             int copy_size = out_buf.vstream_buf.size;
             if (copy_size > (int)coded->size) copy_size = coded->size;
             memcpy(coded->data, out_buf.vstream_buf.vir_ptr, copy_size);
@@ -1544,7 +1643,12 @@ static VAStatus hobot_vaEndPicture(VADriverContextP ctx, VAContextID context) {
             coded->coded_segment.next = NULL;
             va_trace("vaEndPicture: frame %lu encoded successfully (%u bytes)",
                      (unsigned long)current_frame, (unsigned int)copy_size);
-            hb_mm_mc_queue_output_buffer(&hctx->vpu_ctx, &out_buf, 1000);
+            int recycle_ret = hb_mm_mc_queue_output_buffer(&hctx->vpu_ctx, &out_buf, 1000);
+            if (recycle_ret != 0) {
+                fprintf(stderr, "[HOBOT-VA] encoded output buffer recycle failed: ret=%d\n", recycle_ret);
+                pthread_mutex_unlock(&drv->mutex);
+                return VA_STATUS_ERROR_OPERATION_FAILED;
+            }
         } else {
             fprintf(stderr, "[HOBOT-VA] vaEndPicture: dequeue_output failed frame %lu ret=%d size=%d\n",
                     (unsigned long)current_frame, ret, out_buf.vstream_buf.size);
@@ -1634,7 +1738,8 @@ static VAStatus hobot_vaSyncSurface(VADriverContextP ctx, VASurfaceID render_tar
             if (err_reason != 0 || err_mb > 0) {
                 struct timespec now_ts;
                 clock_gettime(CLOCK_MONOTONIC, &now_ts);
-                if (hctx->last_anomaly_sec > 0 && (now_ts.tv_sec - hctx->last_anomaly_sec) >= 10) {
+                if (hctx->last_anomaly_sec > 0 &&
+                    (now_ts.tv_sec - hctx->last_anomaly_sec) >= HOBOT_WATCHDOG_CLEAN_RESET_SEC) {
                     fprintf(stderr, "[HOBOT-VA][WATCHDOG] 10s clean period elapsed. Anomaly count reset from %d to 0.\n",
                             hctx->watchdog_anomaly_count);
                     hctx->watchdog_anomaly_count = 0;
@@ -1643,12 +1748,12 @@ static VAStatus hobot_vaSyncSurface(VADriverContextP ctx, VASurfaceID render_tar
                 hctx->watchdog_anomaly_count++;
 
                 hctx->watchdog_trace_countdown = 20;
-                fprintf(stderr, "\n[HOBOT-VA][WATCHDOG] >>> VPU ANOMALY DETECTED (#%d/3) <<<\n"
+                fprintf(stderr, "\n[HOBOT-VA][WATCHDOG] >>> VPU ANOMALY DETECTED (#%d/%d) <<<\n"
                                 "[HOBOT-VA][WATCHDOG] target_surf=%u disp_idx=%d deco_idx=%d\n"
                                 "[HOBOT-VA][WATCHDOG] error_reason=0x%08x warn_info=0x%08x\n"
                                 "[HOBOT-VA][WATCHDOG] err_mb=%d total_mb=%d (%.1f%% corrupted)\n"
                                 "[HOBOT-VA][WATCHDOG] phy=[0x%llx, 0x%llx] fd=%d stride=%d size=%u (%dx%d)\n\n",
-                        hctx->watchdog_anomaly_count,
+                        hctx->watchdog_anomaly_count, HOBOT_WATCHDOG_FALLBACK_THRESHOLD,
                         target, disp_idx, deco_idx,
                         err_reason, (uint32_t)out_info.video_frame_info.warn_info,
                         err_mb, total_mb,
@@ -1661,15 +1766,12 @@ static VAStatus hobot_vaSyncSurface(VADriverContextP ctx, VASurfaceID render_tar
                         out_buf.vframe_buf.width,
                         out_buf.vframe_buf.height);
 
-                FILE *wfp = fopen("/dev/shm/hobot_va_watchdog", "w");
-                if (wfp) {
-                    fprintf(wfp, "%d %d %ld %d %d\n", (int)getpid(), hctx->watchdog_anomaly_count, (long)time(NULL), err_mb, total_mb);
-                    fclose(wfp);
-                }
+                hobot_publish_watchdog_state(hctx->watchdog_anomaly_count, err_mb, total_mb);
             } else if (hctx->watchdog_anomaly_count > 0) {
                 struct timespec now_ts;
                 clock_gettime(CLOCK_MONOTONIC, &now_ts);
-                if (hctx->last_anomaly_sec > 0 && (now_ts.tv_sec - hctx->last_anomaly_sec) >= 10) {
+                if (hctx->last_anomaly_sec > 0 &&
+                    (now_ts.tv_sec - hctx->last_anomaly_sec) >= HOBOT_WATCHDOG_CLEAN_RESET_SEC) {
                     fprintf(stderr, "[HOBOT-VA][WATCHDOG] 10s clean playback elapsed. Resetting anomaly count (%d -> 0).\n",
                             hctx->watchdog_anomaly_count);
                     hctx->watchdog_anomaly_count = 0;
@@ -1689,8 +1791,9 @@ static VAStatus hobot_vaSyncSurface(VADriverContextP ctx, VASurfaceID render_tar
 
             /* Phase A: Frame Drop Experiment (Discard corrupted frames) */
             if (err_mb > 0 || (err_reason & 0x00020000)) {
-                fprintf(stderr, "[HOBOT-VA][DROP] Dropping corrupted frame (err_mb=%d/%d, err_reason=0x%08x) for target=%u (anomaly=%d/3)\n",
-                        err_mb, total_mb, err_reason, target, hctx->watchdog_anomaly_count);
+                fprintf(stderr, "[HOBOT-VA][DROP] Dropping corrupted frame (err_mb=%d/%d, err_reason=0x%08x) for target=%u (anomaly=%d/%d)\n",
+                        err_mb, total_mb, err_reason, target, hctx->watchdog_anomaly_count,
+                        HOBOT_WATCHDOG_FALLBACK_THRESHOLD);
                 hb_mm_mc_queue_output_buffer(mctx, &out_buf, 50);
                 continue;
             }
@@ -1730,38 +1833,50 @@ static VAStatus hobot_fill_surface_info(
     VASurfaceID surface,
     struct hobot_surface_info *info
 ) {
-    if (!info) return VA_STATUS_ERROR_INVALID_PARAMETER;
+    if (!ctx || !ctx->pDriverData || !info) return VA_STATUS_ERROR_INVALID_PARAMETER;
     HobotDriverData *drv = (HobotDriverData *)ctx->pDriverData;
 
+    pthread_mutex_lock(&drv->mutex);
     if (surface <= 0 || surface >= MAX_SURFACES || !drv->surfaces[surface].allocated) {
+        pthread_mutex_unlock(&drv->mutex);
         return VA_STATUS_ERROR_INVALID_SURFACE;
     }
-
-    HobotSurface *surf = &drv->surfaces[surface];
+    int needs_sync = !drv->surfaces[surface].has_decoded_frame;
+    pthread_mutex_unlock(&drv->mutex);
 
     /* Ensure decoded frame is ready and synced */
     VAStatus sync_status = VA_STATUS_SUCCESS;
-    if (!surf->has_decoded_frame) {
+    if (needs_sync) {
         sync_status = hobot_vaSyncSurface(ctx, surface);
     }
 
+    pthread_mutex_lock(&drv->mutex);
+    if (surface <= 0 || surface >= MAX_SURFACES || !drv->surfaces[surface].allocated) {
+        pthread_mutex_unlock(&drv->mutex);
+        return VA_STATUS_ERROR_INVALID_SURFACE;
+    }
+    HobotSurface *surf = &drv->surfaces[surface];
+
     if (!surf->has_decoded_frame && !surf->has_preallocated) {
         if (sync_status == VA_STATUS_SUCCESS) {
+            pthread_mutex_unlock(&drv->mutex);
             return VA_STATUS_ERROR_OPERATION_FAILED;
         }
 
-        unsigned int aligned_w = (surf->width + 63) & ~63;
-        unsigned int aligned_h = (surf->height + 63) & ~63;
+        unsigned int aligned_w = (surf->width + 63u) & ~63u;
+        unsigned int aligned_h = (surf->height + 63u) & ~63u;
         int64_t mflags = HB_MEM_USAGE_CPU_READ_OFTEN |
                          HB_MEM_USAGE_CPU_WRITE_OFTEN |
                          HB_MEM_USAGE_HW_VIDEO_CODEC;
         hb_mem_graphic_buf_t gbuf;
         memset(&gbuf, 0, sizeof(gbuf));
-        int gret = hb_mem_alloc_graph_buf(surf->width, surf->height, MEM_PIX_FMT_NV12,
-                                          mflags, aligned_w, aligned_h, &gbuf);
+        int gret = hb_mem_alloc_graph_buf((int32_t)surf->width, (int32_t)surf->height,
+                                          MEM_PIX_FMT_NV12, mflags,
+                                          (int32_t)aligned_w, (int32_t)aligned_h, &gbuf);
         if (gret != 0 || gbuf.fd[0] < 0) {
             va_trace("hobot_fill_surface_info: lazy graph buffer allocation failed surf=%u ret=%d",
                      surface, gret);
+            pthread_mutex_unlock(&drv->mutex);
             return sync_status;
         }
         surf->dma_fd = gbuf.fd[0];
@@ -1812,6 +1927,7 @@ static VAStatus hobot_fill_surface_info(
              (unsigned long)info->phys_addr[0], (unsigned long)info->phys_addr[1],
              info->virt_addr[0], info->virt_addr[1], info->dma_fd);
 
+    pthread_mutex_unlock(&drv->mutex);
     return VA_STATUS_SUCCESS;
 }
 
@@ -1835,36 +1951,49 @@ static VAStatus hobot_vaExportSurfaceHandle(
         return VA_STATUS_ERROR_UNSUPPORTED_MEMORY_TYPE;
     }
 
+    if (!ctx || !ctx->pDriverData) return VA_STATUS_ERROR_INVALID_CONTEXT;
     HobotDriverData *drv = (HobotDriverData *)ctx->pDriverData;
 
+    pthread_mutex_lock(&drv->mutex);
     if (surface_id <= 0 || surface_id >= MAX_SURFACES || !drv->surfaces[surface_id].allocated) {
+        pthread_mutex_unlock(&drv->mutex);
         va_trace("vaExportSurfaceHandle: surface=%u NOT ALLOCATED", surface_id);
         return VA_STATUS_ERROR_INVALID_SURFACE;
     }
+    int needs_sync = !drv->surfaces[surface_id].has_decoded_frame;
+    pthread_mutex_unlock(&drv->mutex);
 
-    HobotSurface *surf = &drv->surfaces[surface_id];
-    if (!surf->has_decoded_frame) {
+    if (needs_sync) {
         va_trace("vaExportSurfaceHandle: surface=%u syncing for decoded frame...", surface_id);
         VAStatus sync_status = hobot_vaSyncSurface(ctx, surface_id);
         if (sync_status != VA_STATUS_SUCCESS) {
             return sync_status;
         }
     }
+
+    pthread_mutex_lock(&drv->mutex);
+    if (surface_id <= 0 || surface_id >= MAX_SURFACES || !drv->surfaces[surface_id].allocated) {
+        pthread_mutex_unlock(&drv->mutex);
+        return VA_STATUS_ERROR_INVALID_SURFACE;
+    }
+    HobotSurface *surf = &drv->surfaces[surface_id];
     if (!surf->has_decoded_frame || surf->dma_fd < 0) {
         va_trace("vaExportSurfaceHandle: surface=%u dma_fd < 0 (has_frame=%d) -> FAIL",
                  surface_id, surf->has_decoded_frame);
+        pthread_mutex_unlock(&drv->mutex);
         return VA_STATUS_ERROR_INVALID_SURFACE;
     }
 
     int exp_fd = dup(surf->dma_fd);
     if (exp_fd < 0) {
         va_trace("vaExportSurfaceHandle: dup(dma_fd=%d) failed", surf->dma_fd);
+        pthread_mutex_unlock(&drv->mutex);
         return VA_STATUS_ERROR_OPERATION_FAILED;
     }
 
-    uint32_t pitch = surf->stride > 0 ? surf->stride : surf->width;
+    uint32_t pitch = surf->stride > 0 ? (uint32_t)surf->stride : surf->width;
     uint32_t vstride = (surf->has_decoded_frame && surf->vpu_out_buf.vframe_buf.vstride > 0) ?
-                       surf->vpu_out_buf.vframe_buf.vstride : ((surf->height + 7) & ~7);
+                       (uint32_t)surf->vpu_out_buf.vframe_buf.vstride : ((surf->height + 7u) & ~7u);
     uint32_t buf_size = 0;
     if (surf->has_decoded_frame && surf->vpu_out_buf.vframe_buf.size > 0) {
         buf_size = surf->vpu_out_buf.vframe_buf.size;
@@ -1889,6 +2018,7 @@ static VAStatus hobot_vaExportSurfaceHandle(
     }
 
     VADRMPRIMESurfaceDescriptor *desc = (VADRMPRIMESurfaceDescriptor *)descriptor;
+    memset(desc, 0, sizeof(*desc));
     desc->fourcc = VA_FOURCC_NV12;
     desc->width = surf->width;
     desc->height = surf->height;
@@ -1910,6 +2040,7 @@ static VAStatus hobot_vaExportSurfaceHandle(
 
     va_trace("vaExportSurfaceHandle -> success: surf=%u, dma_fd=%d, exp_fd=%d, phys=0x%lx, %ux%u",
              surface_id, surf->dma_fd, exp_fd, (unsigned long)phys_addr, desc->width, desc->height);
+    pthread_mutex_unlock(&drv->mutex);
     return VA_STATUS_SUCCESS;
 }
 
@@ -1921,11 +2052,16 @@ static VAStatus hobot_vaCreateImage(
     VAImage *image
 ) {
     va_trace("vaCreateImage: %dx%d, format=0x%x", width, height, (format ? format->fourcc : 0));
-    if (!format || !image) return VA_STATUS_ERROR_INVALID_PARAMETER;
+    if (!ctx || !ctx->pDriverData || !format || !image || width <= 0 || height <= 0 ||
+        format->fourcc != VA_FOURCC_NV12) {
+        return VA_STATUS_ERROR_INVALID_PARAMETER;
+    }
     HobotDriverData *drv = (HobotDriverData *)ctx->pDriverData;
+    pthread_mutex_lock(&drv->mutex);
 
     for (int i = 1; i < MAX_IMAGES; i++) {
         if (!drv->images[i].allocated) {
+            memset(&drv->images[i], 0, sizeof(drv->images[i]));
             drv->images[i].allocated = 1;
             drv->images[i].id = (VAImageID)i;
 
@@ -1936,6 +2072,7 @@ static VAStatus hobot_vaCreateImage(
             VAStatus st = hobot_vaCreateBuffer(ctx, 0, VAImageBufferType, data_size, 1, NULL, &buf_id);
             if (st != VA_STATUS_SUCCESS) {
                 drv->images[i].allocated = 0;
+                pthread_mutex_unlock(&drv->mutex);
                 return st;
             }
 
@@ -1955,19 +2092,24 @@ static VAStatus hobot_vaCreateImage(
 
             *image = drv->images[i].image;
             va_trace("vaCreateImage -> id=%u, buf_id=%u", (unsigned int)i, (unsigned int)buf_id);
+            pthread_mutex_unlock(&drv->mutex);
             return VA_STATUS_SUCCESS;
         }
     }
+    pthread_mutex_unlock(&drv->mutex);
     return VA_STATUS_ERROR_ALLOCATION_FAILED;
 }
 
 static VAStatus hobot_vaDestroyImage(VADriverContextP ctx, VAImageID image) {
     va_trace("vaDestroyImage: id=%u", (unsigned int)image);
+    if (!ctx || !ctx->pDriverData) return VA_STATUS_ERROR_INVALID_CONTEXT;
     HobotDriverData *drv = (HobotDriverData *)ctx->pDriverData;
+    pthread_mutex_lock(&drv->mutex);
     if (image > 0 && image < MAX_IMAGES && drv->images[image].allocated) {
         hobot_vaDestroyBuffer(ctx, drv->images[image].buf_id);
         drv->images[image].allocated = 0;
     }
+    pthread_mutex_unlock(&drv->mutex);
     return VA_STATUS_SUCCESS;
 }
 
@@ -1981,29 +2123,61 @@ static VAStatus hobot_vaGetImage(
     VAImageID image
 ) {
     va_trace("vaGetImage: surf=%u, image=%u, %ux%u", surface, image, width, height);
+    if (!ctx || !ctx->pDriverData || x < 0 || y < 0 || width == 0 || height == 0) {
+        return VA_STATUS_ERROR_INVALID_PARAMETER;
+    }
     HobotDriverData *drv = (HobotDriverData *)ctx->pDriverData;
+
+    pthread_mutex_lock(&drv->mutex);
     if (surface <= 0 || surface >= MAX_SURFACES || !drv->surfaces[surface].allocated) {
+        pthread_mutex_unlock(&drv->mutex);
         return VA_STATUS_ERROR_INVALID_SURFACE;
     }
     if (image <= 0 || image >= MAX_IMAGES || !drv->images[image].allocated) {
+        pthread_mutex_unlock(&drv->mutex);
         return VA_STATUS_ERROR_INVALID_IMAGE;
     }
 
     HobotSurface *s = &drv->surfaces[surface];
     HobotImage *img = &drv->images[image];
-    void *dst_data = drv->buffers[img->buf_id].data;
+    int needs_sync = !s->has_decoded_frame;
+    pthread_mutex_unlock(&drv->mutex);
 
-    if (!s->has_decoded_frame) {
+    if (needs_sync) {
         VAStatus sync_status = hobot_vaSyncSurface(ctx, surface);
         if (sync_status != VA_STATUS_SUCCESS) {
             return sync_status;
         }
     }
 
+    pthread_mutex_lock(&drv->mutex);
+    if (surface <= 0 || surface >= MAX_SURFACES || !drv->surfaces[surface].allocated) {
+        pthread_mutex_unlock(&drv->mutex);
+        return VA_STATUS_ERROR_INVALID_SURFACE;
+    }
+    if (image <= 0 || image >= MAX_IMAGES || !drv->images[image].allocated) {
+        pthread_mutex_unlock(&drv->mutex);
+        return VA_STATUS_ERROR_INVALID_IMAGE;
+    }
+
+    s = &drv->surfaces[surface];
+    img = &drv->images[image];
+    if ((x & 1) != 0 || (y & 1) != 0 || (width & 1) != 0 || (height & 1) != 0 ||
+        (unsigned int)x + width > s->width || (unsigned int)y + height > s->height ||
+        width > img->image.width || height > img->image.height ||
+        img->buf_id <= 0 || img->buf_id >= MAX_BUFFERS ||
+        !drv->buffers[img->buf_id].allocated) {
+        pthread_mutex_unlock(&drv->mutex);
+        return VA_STATUS_ERROR_INVALID_PARAMETER;
+    }
+
+    void *dst_data = drv->buffers[img->buf_id].data;
     if (!s->has_decoded_frame) {
+        pthread_mutex_unlock(&drv->mutex);
         return VA_STATUS_ERROR_OPERATION_FAILED;
     }
     if (!s->vpu_out_buf.vframe_buf.vir_ptr[0] || !dst_data) {
+        pthread_mutex_unlock(&drv->mutex);
         return VA_STATUS_ERROR_OPERATION_FAILED;
     }
 
@@ -2011,28 +2185,27 @@ static VAStatus hobot_vaGetImage(
         unsigned char *y_src = s->vpu_out_buf.vframe_buf.vir_ptr[0];
         unsigned char *uv_src = s->vpu_out_buf.vframe_buf.vir_ptr[1];
         unsigned char *dst = (unsigned char *)dst_data;
-        uint32_t src_stride = s->stride > 0 ? s->stride : s->width;
-        uint32_t src_vstride = s->vpu_out_buf.vframe_buf.vstride > 0 ? s->vpu_out_buf.vframe_buf.vstride : s->height;
+        uint32_t src_stride = s->stride > 0 ? (uint32_t)s->stride : s->width;
+        uint32_t src_vstride = s->vpu_out_buf.vframe_buf.vstride > 0 ?
+                               (uint32_t)s->vpu_out_buf.vframe_buf.vstride : s->height;
         uint32_t dst_stride = img->image.pitches[0];
 
         unsigned char *dst_uv = dst + img->image.offsets[1];
         if (!uv_src) {
             uv_src = y_src + src_stride * src_vstride;
         }
-        unsigned int copy_height = height < (unsigned int)s->height ? height : (unsigned int)s->height;
-        unsigned int copy_width = width < src_stride ? width : src_stride;
-        if (copy_width == src_stride && copy_width == dst_stride) {
-            memcpy(dst, y_src, copy_width * copy_height);
-            memcpy(dst_uv, uv_src, copy_width * (copy_height / 2));
-        } else {
-            for (unsigned int r = 0; r < copy_height; r++) {
-                memcpy(dst + r * dst_stride, y_src + r * src_stride, copy_width);
-            }
-            for (unsigned int r = 0; r < (copy_height / 2); r++) {
-                memcpy(dst_uv + r * dst_stride, uv_src + r * src_stride, copy_width);
-            }
+        for (unsigned int r = 0; r < height; r++) {
+            memcpy(dst + r * dst_stride,
+                   y_src + ((unsigned int)y + r) * src_stride + (unsigned int)x,
+                   width);
+        }
+        for (unsigned int r = 0; r < (height / 2); r++) {
+            memcpy(dst_uv + r * dst_stride,
+                   uv_src + ((unsigned int)y / 2 + r) * src_stride + (unsigned int)x,
+                   width);
         }
     }
+    pthread_mutex_unlock(&drv->mutex);
     return VA_STATUS_SUCCESS;
 }
 
@@ -2042,26 +2215,43 @@ static VAStatus hobot_vaDeriveImage(
     VAImage *image
 ) {
     va_trace("vaDeriveImage: surf=%u", surface);
-    if (!image) return VA_STATUS_ERROR_INVALID_PARAMETER;
+    if (!ctx || !ctx->pDriverData || !image) return VA_STATUS_ERROR_INVALID_PARAMETER;
     HobotDriverData *drv = (HobotDriverData *)ctx->pDriverData;
+    memset(image, 0, sizeof(*image));
+    pthread_mutex_lock(&drv->mutex);
     if (surface <= 0 || surface >= MAX_SURFACES || !drv->surfaces[surface].allocated) {
+        pthread_mutex_unlock(&drv->mutex);
         return VA_STATUS_ERROR_INVALID_SURFACE;
     }
+    int needs_sync = !drv->surfaces[surface].has_decoded_frame;
+    pthread_mutex_unlock(&drv->mutex);
 
-    HobotSurface *s = &drv->surfaces[surface];
-    if (!s->has_decoded_frame) {
+    if (needs_sync) {
         VAStatus sync_status = hobot_vaSyncSurface(ctx, surface);
         if (sync_status != VA_STATUS_SUCCESS) {
             return sync_status;
         }
     }
+
+    pthread_mutex_lock(&drv->mutex);
+    if (surface <= 0 || surface >= MAX_SURFACES || !drv->surfaces[surface].allocated) {
+        pthread_mutex_unlock(&drv->mutex);
+        return VA_STATUS_ERROR_INVALID_SURFACE;
+    }
+    HobotSurface *s = &drv->surfaces[surface];
     if (!s->has_decoded_frame) {
+        pthread_mutex_unlock(&drv->mutex);
+        return VA_STATUS_ERROR_OPERATION_FAILED;
+    }
+    if (!s->vpu_out_buf.vframe_buf.vir_ptr[0]) {
+        pthread_mutex_unlock(&drv->mutex);
         return VA_STATUS_ERROR_OPERATION_FAILED;
     }
 
     if (!s->raw_data) {
         s->raw_data = calloc(1, s->raw_data_size);
         if (!s->raw_data) {
+            pthread_mutex_unlock(&drv->mutex);
             return VA_STATUS_ERROR_ALLOCATION_FAILED;
         }
     }
@@ -2073,7 +2263,10 @@ static VAStatus hobot_vaDeriveImage(
             break;
         }
     }
-    if (img_idx < 0) return VA_STATUS_ERROR_ALLOCATION_FAILED;
+    if (img_idx < 0) {
+        pthread_mutex_unlock(&drv->mutex);
+        return VA_STATUS_ERROR_ALLOCATION_FAILED;
+    }
 
     int buf_idx = -1;
     for (int i = 1; i < MAX_BUFFERS; i++) {
@@ -2082,7 +2275,10 @@ static VAStatus hobot_vaDeriveImage(
             break;
         }
     }
-    if (buf_idx < 0) return VA_STATUS_ERROR_ALLOCATION_FAILED;
+    if (buf_idx < 0) {
+        pthread_mutex_unlock(&drv->mutex);
+        return VA_STATUS_ERROR_ALLOCATION_FAILED;
+    }
 
     drv->buffers[buf_idx].allocated = 1;
     drv->buffers[buf_idx].is_derived = 1;
@@ -2112,23 +2308,27 @@ static VAStatus hobot_vaDeriveImage(
     drv->images[img_idx].surface_id = surface;
 
     if (s->has_decoded_frame && s->vpu_out_buf.vframe_buf.vir_ptr[0] && s->raw_data) {
-        int vpu_stride = s->vpu_out_buf.vframe_buf.stride > 0 ? s->vpu_out_buf.vframe_buf.stride : s->width;
+        int vpu_stride = s->vpu_out_buf.vframe_buf.stride > 0 ?
+                         s->vpu_out_buf.vframe_buf.stride : (int)s->width;
         if (vpu_stride == s->width) {
-            memcpy(s->raw_data, s->vpu_out_buf.vframe_buf.vir_ptr[0], s->width * s->height);
+            memcpy(s->raw_data, s->vpu_out_buf.vframe_buf.vir_ptr[0],
+                   (size_t)s->width * s->height);
             if (s->vpu_out_buf.vframe_buf.vir_ptr[1]) {
-                memcpy((char *)s->raw_data + s->width * s->height, s->vpu_out_buf.vframe_buf.vir_ptr[1], s->width * s->height / 2);
+                memcpy((char *)s->raw_data + (size_t)s->width * s->height,
+                       s->vpu_out_buf.vframe_buf.vir_ptr[1],
+                       (size_t)s->width * s->height / 2);
             }
         } else {
-            for (int r = 0; r < s->height; r++) {
-                memcpy((char *)s->raw_data + r * s->width,
+            for (unsigned int r = 0; r < s->height; r++) {
+                memcpy((char *)s->raw_data + (size_t)r * s->width,
                        (char *)s->vpu_out_buf.vframe_buf.vir_ptr[0] + r * vpu_stride,
                        s->width);
             }
             if (s->vpu_out_buf.vframe_buf.vir_ptr[1]) {
-                char *dst_uv = (char *)s->raw_data + s->width * s->height;
+                char *dst_uv = (char *)s->raw_data + (size_t)s->width * s->height;
                 char *src_uv = (char *)s->vpu_out_buf.vframe_buf.vir_ptr[1];
-                for (int r = 0; r < s->height / 2; r++) {
-                    memcpy(dst_uv + r * s->width,
+                for (unsigned int r = 0; r < s->height / 2; r++) {
+                    memcpy(dst_uv + (size_t)r * s->width,
                            src_uv + r * vpu_stride,
                            s->width);
                 }
@@ -2136,6 +2336,7 @@ static VAStatus hobot_vaDeriveImage(
         }
     }
 
+    pthread_mutex_unlock(&drv->mutex);
     return VA_STATUS_SUCCESS;
 }
 
@@ -2262,7 +2463,34 @@ static VAStatus hobot_vaLockSurface(
     unsigned int *buffer_name,
     void **buffer
 ) {
-    return VA_STATUS_ERROR_UNIMPLEMENTED;
+    if (!ctx || !ctx->pDriverData || surface <= 0 ||
+        (!fourcc && !luma_stride && !chroma_u_stride && !chroma_v_stride &&
+         !luma_offset && !chroma_u_offset && !chroma_v_offset &&
+         !buffer_name && !buffer)) {
+        return VA_STATUS_ERROR_INVALID_PARAMETER;
+    }
+
+    struct hobot_surface_info info;
+    VAStatus status = hobot_fill_surface_info(ctx, surface, &info);
+    if (status != VA_STATUS_SUCCESS) return status;
+    if (!info.virt_addr[0] || info.stride == 0 || info.vstride == 0) {
+        return VA_STATUS_ERROR_OPERATION_FAILED;
+    }
+
+    if (fourcc) *fourcc = VA_FOURCC_NV12;
+    if (luma_stride) *luma_stride = info.stride;
+    if (chroma_u_stride) *chroma_u_stride = info.stride;
+    if (chroma_v_stride) *chroma_v_stride = info.stride;
+    if (luma_offset) *luma_offset = 0;
+    if (chroma_u_offset) *chroma_u_offset = info.stride * info.vstride;
+    if (chroma_v_offset) *chroma_v_offset = info.stride * info.vstride;
+    if (buffer_name) {
+        *buffer_name = info.dma_fd >= 0 ? (unsigned int)info.dma_fd : 0;
+    }
+    if (buffer) *buffer = info.virt_addr[0];
+    va_trace("vaLockSurface -> success: surf=%u, %ux%u, stride=%u, vstride=%u, fd=%d",
+             surface, info.width, info.height, info.stride, info.vstride, info.dma_fd);
+    return VA_STATUS_SUCCESS;
 }
 
 static VAStatus hobot_vaUnlockSurface(VADriverContextP ctx, VASurfaceID surface) {
@@ -2286,27 +2514,67 @@ static VAStatus hobot_vaPutImage(
     unsigned int dest_width,
     unsigned int dest_height
 ) {
+    if (!ctx || !ctx->pDriverData || src_x < 0 || src_y < 0 || dest_x < 0 || dest_y < 0 ||
+        src_width == 0 || src_height == 0 || (src_x & 1) != 0 || (src_y & 1) != 0 ||
+        (src_width & 1) != 0 || (src_height & 1) != 0 || (dest_x & 1) != 0 ||
+        (dest_y & 1) != 0 || (dest_width != src_width) || (dest_height != src_height)) {
+        return VA_STATUS_ERROR_INVALID_PARAMETER;
+    }
     HobotDriverData *drv = (HobotDriverData *)ctx->pDriverData;
+    pthread_mutex_lock(&drv->mutex);
     if (surface <= 0 || surface >= MAX_SURFACES || !drv->surfaces[surface].allocated) {
+        pthread_mutex_unlock(&drv->mutex);
         return VA_STATUS_ERROR_INVALID_SURFACE;
     }
     if (image <= 0 || image >= MAX_IMAGES || !drv->images[image].allocated) {
+        pthread_mutex_unlock(&drv->mutex);
         return VA_STATUS_ERROR_INVALID_IMAGE;
     }
     HobotSurface *s = &drv->surfaces[surface];
     HobotImage *img = &drv->images[image];
+    if ((unsigned int)src_x + src_width > img->image.width ||
+        (unsigned int)src_y + src_height > img->image.height ||
+        (unsigned int)dest_x + dest_width > s->width ||
+        (unsigned int)dest_y + dest_height > s->height ||
+        img->buf_id <= 0 || img->buf_id >= MAX_BUFFERS ||
+        !drv->buffers[img->buf_id].allocated) {
+        pthread_mutex_unlock(&drv->mutex);
+        return VA_STATUS_ERROR_INVALID_PARAMETER;
+    }
     void *src_data = drv->buffers[img->buf_id].data;
 
     if (!src_data) {
+        pthread_mutex_unlock(&drv->mutex);
         return VA_STATUS_ERROR_INVALID_BUFFER;
     }
     if (!s->raw_data) {
         s->raw_data = calloc(1, s->raw_data_size);
         if (!s->raw_data) {
+            pthread_mutex_unlock(&drv->mutex);
             return VA_STATUS_ERROR_ALLOCATION_FAILED;
         }
     }
-    memcpy(s->raw_data, src_data, s->raw_data_size);
+    unsigned int dst_stride = s->stride > 0 ? (unsigned int)s->stride : s->width;
+    unsigned int src_stride = img->image.pitches[0];
+    unsigned char *src_y_plane = (unsigned char *)src_data + img->image.offsets[0] +
+                                  (size_t)src_y * src_stride + (unsigned int)src_x;
+    unsigned char *dst_y_plane = (unsigned char *)s->raw_data +
+                                 (size_t)dest_y * dst_stride + (unsigned int)dest_x;
+    for (unsigned int row = 0; row < src_height; row++) {
+        memcpy(dst_y_plane + (size_t)row * dst_stride,
+               src_y_plane + (size_t)row * src_stride, src_width);
+    }
+
+    unsigned char *src_uv_plane = (unsigned char *)src_data + img->image.offsets[1] +
+                                  (size_t)(src_y / 2) * src_stride + (unsigned int)src_x;
+    unsigned char *dst_uv_plane = (unsigned char *)s->raw_data +
+                                  (size_t)dst_stride * s->height +
+                                  (size_t)(dest_y / 2) * dst_stride + (unsigned int)dest_x;
+    for (unsigned int row = 0; row < src_height / 2; row++) {
+        memcpy(dst_uv_plane + (size_t)row * dst_stride,
+               src_uv_plane + (size_t)row * src_stride, src_width);
+    }
+    pthread_mutex_unlock(&drv->mutex);
     return VA_STATUS_SUCCESS;
 }
 
