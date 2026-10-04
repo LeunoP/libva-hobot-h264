@@ -1306,6 +1306,140 @@ static int test_hevc_rps_slice_validation(void)
     }
     free(rewritten_nal);
 
+    uint8_t second_slice_rbsp[128] = {0};
+    BitWriter second_slice_writer = {second_slice_rbsp, 0};
+    bw_put_bit(&second_slice_writer, 0);      /* not the first slice */
+    bw_put_ue(&second_slice_writer, 0);       /* PPS id */
+    bw_put_bits(&second_slice_writer, 30, 6); /* CTB address in a 60-CTB picture */
+    bw_put_ue(&second_slice_writer, 1);       /* P slice */
+    bw_put_bits(&second_slice_writer, 1, 8);  /* POC LSB */
+    bw_put_bit(&second_slice_writer, 1);      /* select the single SPS RPS */
+    bw_put_bit(&second_slice_writer, 0);      /* no active-reference override */
+    bw_put_ue(&second_slice_writer, 0);       /* five_minus_max_num_merge_cand */
+    bw_put_se(&second_slice_writer, 0);       /* slice_qp_delta */
+    bw_put_bit(&second_slice_writer, 1);      /* byte_alignment() */
+    while (second_slice_writer.bit_pos % 8u)
+        bw_put_bit(&second_slice_writer, 0);
+    size_t second_slice_header_size = second_slice_writer.bit_pos / 8u;
+    if (second_slice_header_size != 3u ||
+        second_slice_header_size + sizeof(payload) > sizeof(second_slice_rbsp)) {
+        fprintf(stderr, "second-slice header layout is unexpected\n");
+        return 0;
+    }
+    memcpy(second_slice_rbsp + second_slice_header_size, payload, sizeof(payload));
+
+    uint8_t second_slice_ebsp[256];
+    size_t second_slice_ebsp_size = 0;
+    if (!hobot_hevc_escape_rbsp(second_slice_rbsp,
+                                second_slice_header_size + sizeof(payload),
+                                second_slice_ebsp, sizeof(second_slice_ebsp),
+                                &second_slice_ebsp_size)) {
+        fprintf(stderr, "second-slice test source escaping failed\n");
+        return 0;
+    }
+    uint8_t second_slice_nal[258] = {0x02, 0x01};
+    memcpy(second_slice_nal + 2, second_slice_ebsp, second_slice_ebsp_size);
+
+    picture.pic_width_in_luma_samples = 640;
+    picture.pic_height_in_luma_samples = 360;
+    picture.log2_min_luma_coding_block_size_minus3 = 0;
+    picture.log2_diff_max_min_luma_coding_block_size = 3;
+    sequence.picture_ctb_count = 60;
+    slice.slice_segment_address = 30;
+    slice.slice_data_offset = 0;
+    slice.slice_data_size = (uint32_t)(2u + second_slice_ebsp_size);
+    slice.slice_data_byte_offset = (uint32_t)(2u + second_slice_header_size);
+    size_t second_insert_bit = 0;
+    int second_sps_rps_selected = 0;
+    if (!hobot_hevc_validated_rps_slice_supported_internal(
+            &picture, &slice, second_slice_nal, slice.slice_data_size,
+            &sequence, &second_insert_bit, &second_sps_rps_selected) ||
+        !second_sps_rps_selected || second_insert_bit != 20u) {
+        fprintf(stderr, "independent second slice did not select SPS RPS at bit 20\n");
+        return 0;
+    }
+
+    rewritten_nal = NULL;
+    rewritten_nal_size = 0;
+    if (hobot_hevc_rewrite_single_rps_slice(
+            &picture, &slice, second_slice_nal, slice.slice_data_size,
+            &rewritten_nal, &rewritten_nal_size) != 1 ||
+        !rewritten_nal || rewritten_nal_size < 3u) {
+        fprintf(stderr, "independent second-slice SPS-RPS rewrite failed\n");
+        free(rewritten_nal);
+        return 0;
+    }
+
+    uint8_t second_rewritten_rbsp[256];
+    size_t second_rewritten_rbsp_size = 0;
+    if (!hobot_hevc_unescape_rbsp(rewritten_nal + 2,
+                                  rewritten_nal_size - 2u,
+                                  second_rewritten_rbsp,
+                                  sizeof(second_rewritten_rbsp),
+                                  &second_rewritten_rbsp_size) ||
+        rewritten_nal[0] != second_slice_nal[0] ||
+        rewritten_nal[1] != second_slice_nal[1]) {
+        fprintf(stderr, "independent second-slice rewritten RBSP is invalid\n");
+        free(rewritten_nal);
+        return 0;
+    }
+
+    BitReader second_rewritten_reader = {
+        second_rewritten_rbsp, second_rewritten_rbsp_size * 8u, 0
+    };
+    uint32_t second_value, second_address, second_first_flag, second_poc_lsb;
+    int32_t second_qp_delta;
+    if (!br_read_bits(&second_rewritten_reader, 1, &second_first_flag) ||
+        second_first_flag != 0 ||
+        !br_read_ue(&second_rewritten_reader, &second_value, NULL, NULL) ||
+        second_value != 0 ||
+        !br_read_bits(&second_rewritten_reader, 6, &second_address) ||
+        second_address != 30 ||
+        !br_read_ue(&second_rewritten_reader, &second_value, NULL, NULL) ||
+        second_value != 1 ||
+        !br_read_bits(&second_rewritten_reader, 8, &second_poc_lsb) ||
+        second_poc_lsb != 1 ||
+        !br_read_bits(&second_rewritten_reader, 1, &second_value) ||
+        second_value != 1 ||
+        !br_read_bits(&second_rewritten_reader, 1, &second_value) ||
+        second_value != 0 ||
+        !br_read_bits(&second_rewritten_reader, 1, &second_value) ||
+        second_value != 0 ||
+        !br_read_ue(&second_rewritten_reader, &second_value, NULL, NULL) ||
+        second_value != 0 ||
+        !br_read_se(&second_rewritten_reader, &second_qp_delta) ||
+        second_qp_delta != 0) {
+        fprintf(stderr, "independent second-slice header fields were corrupted\n");
+        free(rewritten_nal);
+        return 0;
+    }
+
+    if (!br_read_bits(&second_rewritten_reader, 1, &second_value) ||
+        second_value != 1u) {
+        fprintf(stderr, "independent second-slice alignment marker changed\n");
+        free(rewritten_nal);
+        return 0;
+    }
+    while (second_rewritten_reader.bit_pos % 8u) {
+        if (!br_read_bits(&second_rewritten_reader, 1, &second_value) ||
+            second_value != 0u) {
+            fprintf(stderr, "independent second-slice alignment padding changed\n");
+            free(rewritten_nal);
+            return 0;
+        }
+    }
+    size_t second_rewritten_header_size = second_rewritten_reader.bit_pos / 8u;
+    if (second_rewritten_header_size != 4u ||
+        second_rewritten_header_size > second_rewritten_rbsp_size ||
+        second_rewritten_rbsp_size - second_rewritten_header_size != sizeof(payload) ||
+        memcmp(second_rewritten_rbsp + second_rewritten_header_size,
+               payload, sizeof(payload)) != 0) {
+        fprintf(stderr, "independent second-slice payload/alignment changed during rewrite\n");
+        free(rewritten_nal);
+        return 0;
+    }
+    free(rewritten_nal);
+
     picture.CurrPic.pic_order_cnt = 5;
     picture.slice_parsing_fields.bits.cabac_init_present_flag = 1;
     picture.slice_parsing_fields.bits.sample_adaptive_offset_enabled_flag = 1;
