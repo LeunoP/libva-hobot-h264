@@ -61,6 +61,7 @@ static inline void va_trace(const char *fmt, ...) {
 #define MAX_BUFFERS  4096
 #define MAX_CONTEXTS 16
 #define MAX_CONFIGS  64
+#define MAX_CONFIG_ATTRIBUTES 16
 #define MAX_IMAGES   512
 #define HOBOT_WATCHDOG_FALLBACK_THRESHOLD 1
 #define HOBOT_WATCHDOG_CLEAN_RESET_SEC 10
@@ -2716,6 +2717,8 @@ typedef struct {
     VAEntrypoint entrypoint;
     unsigned int rate_control;
     unsigned int rt_format;
+    int num_attribs;
+    VAConfigAttrib attribs[MAX_CONFIG_ATTRIBUTES];
 } HobotConfig;
 
 /* Internal Surface Object */
@@ -4520,7 +4523,8 @@ static VAStatus hobot_vaCreateConfig(
 ) {
     va_trace("vaCreateConfig: profile=%d, entrypoint=%d, num_attribs=%d", profile, entrypoint, num_attribs);
     if (!ctx || !ctx->pDriverData) return VA_STATUS_ERROR_INVALID_CONTEXT;
-    if (!config_id || num_attribs < 0 || (num_attribs > 0 && !attrib_list))
+    if (!config_id || num_attribs < 0 || num_attribs > MAX_CONFIG_ATTRIBUTES ||
+        (num_attribs > 0 && !attrib_list))
         return VA_STATUS_ERROR_INVALID_PARAMETER;
     HobotDriverData *drv = (HobotDriverData *)ctx->pDriverData;
 
@@ -4589,8 +4593,11 @@ static VAStatus hobot_vaCreateConfig(
             drv->configs[i].entrypoint = entrypoint;
             drv->configs[i].rate_control = expected_rate_control;
             drv->configs[i].rt_format = VA_RT_FORMAT_YUV420;
+            drv->configs[i].num_attribs = num_attribs;
 
             if (attrib_list) {
+                memcpy(drv->configs[i].attribs, attrib_list,
+                       (size_t)num_attribs * sizeof(attrib_list[0]));
                 for (int a = 0; a < num_attribs; a++) {
                     if (attrib_list[a].type == VAConfigAttribRateControl) {
                         drv->configs[i].rate_control = attrib_list[a].value;
@@ -4635,25 +4642,25 @@ static VAStatus hobot_vaQueryConfigAttributes(
     int *num_attribs
 ) {
     if (!ctx || !ctx->pDriverData) return VA_STATUS_ERROR_INVALID_CONTEXT;
+    if (!num_attribs) return VA_STATUS_ERROR_INVALID_PARAMETER;
     HobotDriverData *drv = (HobotDriverData *)ctx->pDriverData;
-    VAProfile cfg_profile;
-    VAEntrypoint cfg_entrypoint;
 
     pthread_mutex_lock(&drv->mutex);
     if (config_id <= 0 || config_id >= MAX_CONFIGS || !drv->configs[config_id].allocated) {
         pthread_mutex_unlock(&drv->mutex);
         return VA_STATUS_ERROR_INVALID_CONFIG;
     }
-    cfg_profile = drv->configs[config_id].profile;
-    cfg_entrypoint = drv->configs[config_id].entrypoint;
-    if (profile) *profile = cfg_profile;
-    if (entrypoint) *entrypoint = cfg_entrypoint;
+    HobotConfig config = drv->configs[config_id];
     pthread_mutex_unlock(&drv->mutex);
 
-    if (attrib_list && num_attribs && *num_attribs > 0) {
-        return hobot_vaGetConfigAttributes(ctx, cfg_profile, cfg_entrypoint,
-                                           attrib_list, *num_attribs);
-    }
+    if (config.num_attribs > 0 && !attrib_list)
+        return VA_STATUS_ERROR_INVALID_PARAMETER;
+    if (profile) *profile = config.profile;
+    if (entrypoint) *entrypoint = config.entrypoint;
+    if (config.num_attribs > 0)
+        memcpy(attrib_list, config.attribs,
+               (size_t)config.num_attribs * sizeof(config.attribs[0]));
+    *num_attribs = config.num_attribs;
     return VA_STATUS_SUCCESS;
 }
 
@@ -4671,6 +4678,8 @@ static VAStatus hobot_vaQuerySurfaceAttributes(
     pthread_mutex_lock(&drv->mutex);
     int valid_config = config_id > 0 && config_id < MAX_CONFIGS &&
                        drv->configs[config_id].allocated;
+    VAProfile config_profile = valid_config ? drv->configs[config_id].profile :
+                                              VAProfileNone;
     pthread_mutex_unlock(&drv->mutex);
     if (!valid_config) return VA_STATUS_ERROR_INVALID_CONFIG;
     if (!attrib_list) {
@@ -4710,13 +4719,15 @@ static VAStatus hobot_vaQuerySurfaceAttributes(
     attrib_list[idx].type = VASurfaceAttribMaxWidth;
     attrib_list[idx].flags = VA_SURFACE_ATTRIB_GETTABLE;
     attrib_list[idx].value.type = VAGenericValueTypeInteger;
-    attrib_list[idx].value.value.i = 4096;
+    attrib_list[idx].value.value.i = config_profile == VAProfileHEVCMain ?
+                                     HOBOT_HEVC_MAX_WIDTH : 4096;
     idx++;
 
     attrib_list[idx].type = VASurfaceAttribMaxHeight;
     attrib_list[idx].flags = VA_SURFACE_ATTRIB_GETTABLE;
     attrib_list[idx].value.type = VAGenericValueTypeInteger;
-    attrib_list[idx].value.value.i = 4096;
+    attrib_list[idx].value.value.i = config_profile == VAProfileHEVCMain ?
+                                     HOBOT_HEVC_MAX_HEIGHT : 4096;
     idx++;
 
     *num_attribs = idx;
@@ -9543,7 +9554,7 @@ static VAStatus hobot_init_driver(VADriverContextP ctx) {
     ctx->version_minor = 14;
     ctx->max_profiles = NUM_SUPPORTED_PROFILES;
     ctx->max_entrypoints = 2;
-    ctx->max_attributes = 16;
+    ctx->max_attributes = MAX_CONFIG_ATTRIBUTES;
     ctx->max_image_formats = 1;
     /* libva rejects zero initialization maxima; the query still reports no formats. */
     ctx->max_subpic_formats = 1;

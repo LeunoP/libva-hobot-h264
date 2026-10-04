@@ -1,5 +1,6 @@
 #include <fcntl.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <unistd.h>
 
 #include <va/va.h>
@@ -45,6 +46,69 @@ int main(void) {
         return 1;
     }
 
+    int max_profiles = vaMaxNumProfiles(dpy);
+    VAProfile *profiles = max_profiles > 0 ?
+        calloc((size_t)max_profiles, sizeof(*profiles)) : NULL;
+    int profile_count = 0;
+    int has_h264_high = 0;
+    st = profiles ? vaQueryConfigProfiles(dpy, profiles, &profile_count) :
+                    VA_STATUS_ERROR_ALLOCATION_FAILED;
+    int profile_count_valid = profile_count >= 0 &&
+                              profile_count <= max_profiles;
+    for (int i = 0; st == VA_STATUS_SUCCESS && profile_count_valid &&
+                    i < profile_count; i++)
+        has_h264_high |= profiles[i] == VAProfileH264High;
+    free(profiles);
+    if (st != VA_STATUS_SUCCESS || !profile_count_valid || !has_h264_high) {
+        fprintf(stderr, "vaQueryConfigProfiles failed or omitted H.264 High: %s\n",
+                vaErrorStr(st));
+        vaTerminate(dpy);
+        close(fd);
+        return 1;
+    }
+
+    int max_entrypoints = vaMaxNumEntrypoints(dpy);
+    VAEntrypoint *entrypoints = max_entrypoints > 0 ?
+        calloc((size_t)max_entrypoints, sizeof(*entrypoints)) : NULL;
+    int entrypoint_count = 0;
+    int has_h264_vld = 0;
+    st = entrypoints ? vaQueryConfigEntrypoints(dpy, VAProfileH264High,
+                                                 entrypoints,
+                                                 &entrypoint_count) :
+                       VA_STATUS_ERROR_ALLOCATION_FAILED;
+    int entrypoint_count_valid = entrypoint_count >= 0 &&
+                                 entrypoint_count <= max_entrypoints;
+    for (int i = 0; st == VA_STATUS_SUCCESS && entrypoint_count_valid &&
+                    i < entrypoint_count; i++)
+        has_h264_vld |= entrypoints[i] == VAEntrypointVLD;
+    free(entrypoints);
+    if (st != VA_STATUS_SUCCESS || !entrypoint_count_valid || !has_h264_vld) {
+        fprintf(stderr, "vaQueryConfigEntrypoints failed or omitted H.264 VLD: %s\n",
+                vaErrorStr(st));
+        vaTerminate(dpy);
+        close(fd);
+        return 1;
+    }
+
+    VAConfigAttrib capabilities[] = {
+        { .type = VAConfigAttribRTFormat },
+        { .type = VAConfigAttribMaxPictureWidth },
+        { .type = VAConfigAttribMaxPictureHeight }
+    };
+    st = vaGetConfigAttributes(dpy, VAProfileH264High, VAEntrypointVLD,
+                               capabilities,
+                               sizeof(capabilities) / sizeof(capabilities[0]));
+    if (st != VA_STATUS_SUCCESS ||
+        capabilities[0].value != VA_RT_FORMAT_YUV420 ||
+        capabilities[1].value != 4096 || capabilities[2].value != 4096) {
+        fprintf(stderr, "vaGetConfigAttributes returned unexpected H.264 VLD capabilities: status=%s rt=%u max=%ux%u\n",
+                vaErrorStr(st), capabilities[0].value,
+                capabilities[1].value, capabilities[2].value);
+        vaTerminate(dpy);
+        close(fd);
+        return 1;
+    }
+
     VAConfigAttrib attr = {
         .type = VAConfigAttribRTFormat,
         .value = VA_RT_FORMAT_YUV420
@@ -60,10 +124,64 @@ int main(void) {
 
     VAProfile profile = VAProfileNone;
     VAEntrypoint entrypoint = VAEntrypointVLD;
-    int num_attribs = 1;
-    st = vaQueryConfigAttributes(dpy, config, &profile, &entrypoint, &attr, &num_attribs);
+    int max_config_attributes = vaMaxNumConfigAttributes(dpy);
+    VAConfigAttrib *queried_attrs = max_config_attributes > 0 ?
+        calloc((size_t)max_config_attributes, sizeof(*queried_attrs)) : NULL;
+    int num_attribs = 0;
+    st = queried_attrs ? vaQueryConfigAttributes(dpy, config, &profile,
+                                                 &entrypoint, queried_attrs,
+                                                 &num_attribs) :
+                         VA_STATUS_ERROR_ALLOCATION_FAILED;
+    int config_query_valid = st == VA_STATUS_SUCCESS &&
+        profile == VAProfileH264High && entrypoint == VAEntrypointVLD &&
+        num_attribs == 1 && queried_attrs[0].type == VAConfigAttribRTFormat &&
+        queried_attrs[0].value == VA_RT_FORMAT_YUV420;
     printf("vaQueryConfigAttributes: %s, profile=%d, entrypoint=%d, attrs=%d\n",
            vaErrorStr(st), profile, entrypoint, num_attribs);
+    free(queried_attrs);
+    if (!config_query_valid) {
+        fprintf(stderr, "vaQueryConfigAttributes returned inconsistent config data\n");
+        vaDestroyConfig(dpy, config);
+        vaTerminate(dpy);
+        close(fd);
+        return 1;
+    }
+
+    unsigned int num_surface_attrs = 0;
+    st = vaQuerySurfaceAttributes(dpy, config, NULL, &num_surface_attrs);
+    VASurfaceAttrib *surface_attrs = st == VA_STATUS_SUCCESS && num_surface_attrs > 0 ?
+        calloc(num_surface_attrs, sizeof(*surface_attrs)) : NULL;
+    if (st != VA_STATUS_SUCCESS || !surface_attrs) {
+        fprintf(stderr, "vaQuerySurfaceAttributes sizing query failed: %s count=%u\n",
+                vaErrorStr(st), num_surface_attrs);
+        free(surface_attrs);
+        vaDestroyConfig(dpy, config);
+        vaTerminate(dpy);
+        close(fd);
+        return 1;
+    }
+    st = vaQuerySurfaceAttributes(dpy, config, surface_attrs,
+                                  &num_surface_attrs);
+    unsigned int max_surface_width = 0;
+    unsigned int max_surface_height = 0;
+    for (unsigned int i = 0; st == VA_STATUS_SUCCESS && i < num_surface_attrs; i++) {
+        if (surface_attrs[i].type == VASurfaceAttribMaxWidth)
+            max_surface_width = (unsigned int)surface_attrs[i].value.value.i;
+        else if (surface_attrs[i].type == VASurfaceAttribMaxHeight)
+            max_surface_height = (unsigned int)surface_attrs[i].value.value.i;
+    }
+    free(surface_attrs);
+    if (st != VA_STATUS_SUCCESS || max_surface_width != 4096 ||
+        max_surface_height != 4096) {
+        fprintf(stderr, "vaQuerySurfaceAttributes returned unexpected limits: status=%s max=%ux%u\n",
+                vaErrorStr(st), max_surface_width, max_surface_height);
+        vaDestroyConfig(dpy, config);
+        vaTerminate(dpy);
+        close(fd);
+        return 1;
+    }
+    printf("vaQuerySurfaceAttributes: max=%ux%u, attrs=%u\n",
+           max_surface_width, max_surface_height, num_surface_attrs);
 
     VASurfaceID surface = VA_INVALID_SURFACE;
     unsigned int fourcc = 0;

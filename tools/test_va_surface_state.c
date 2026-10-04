@@ -7334,6 +7334,78 @@ static int test_config_capabilities_match_encoder(void)
         return 0;
     }
 
+    VAConfigAttrib hevc_vld_create_attrs[] = {
+        { .type = VAConfigAttribRTFormat, .value = VA_RT_FORMAT_YUV420 }
+    };
+    VAConfigID hevc_vld_config = VA_INVALID_ID;
+    if (hobot_vaCreateConfig(&va_ctx, VAProfileHEVCMain, VAEntrypointVLD,
+                             hevc_vld_create_attrs, 1, &hevc_vld_config) !=
+            VA_STATUS_SUCCESS) {
+        fprintf(stderr, "HEVC Main VLD config could not be created for surface query\n");
+        pthread_mutex_destroy(&drv.mutex);
+        return 0;
+    }
+    VASurfaceAttrib hevc_surface_attrs[6] = {0};
+    unsigned int hevc_surface_attr_count =
+        sizeof(hevc_surface_attrs) / sizeof(hevc_surface_attrs[0]);
+    status = hobot_vaQuerySurfaceAttributes(&va_ctx, hevc_vld_config,
+                                             hevc_surface_attrs,
+                                             &hevc_surface_attr_count);
+    unsigned int hevc_surface_max_width = 0;
+    unsigned int hevc_surface_max_height = 0;
+    for (unsigned int i = 0; i < hevc_surface_attr_count; i++) {
+        if (hevc_surface_attrs[i].type == VASurfaceAttribMaxWidth)
+            hevc_surface_max_width = hevc_surface_attrs[i].value.value.i;
+        else if (hevc_surface_attrs[i].type == VASurfaceAttribMaxHeight)
+            hevc_surface_max_height = hevc_surface_attrs[i].value.value.i;
+    }
+    VAStatus hevc_vld_destroy_status =
+        hobot_vaDestroyConfig(&va_ctx, hevc_vld_config);
+    if (status != VA_STATUS_SUCCESS || hevc_surface_max_width != 3840 ||
+        hevc_surface_max_height != 2160 ||
+        hevc_vld_destroy_status != VA_STATUS_SUCCESS) {
+        fprintf(stderr, "HEVC surface-size capabilities mismatch: status=%d width=%u height=%u\n",
+                status, hevc_surface_max_width, hevc_surface_max_height);
+        pthread_mutex_destroy(&drv.mutex);
+        return 0;
+    }
+
+    VAConfigAttrib h264_vld_create_attrs[] = {
+        { .type = VAConfigAttribRTFormat, .value = VA_RT_FORMAT_YUV420 }
+    };
+    VAConfigID h264_vld_config = VA_INVALID_ID;
+    if (hobot_vaCreateConfig(&va_ctx, VAProfileH264High, VAEntrypointVLD,
+                             h264_vld_create_attrs, 1, &h264_vld_config) !=
+            VA_STATUS_SUCCESS) {
+        fprintf(stderr, "H.264 VLD config could not be created for surface query\n");
+        pthread_mutex_destroy(&drv.mutex);
+        return 0;
+    }
+    VASurfaceAttrib h264_surface_attrs[6] = {0};
+    unsigned int h264_surface_attr_count =
+        sizeof(h264_surface_attrs) / sizeof(h264_surface_attrs[0]);
+    status = hobot_vaQuerySurfaceAttributes(&va_ctx, h264_vld_config,
+                                             h264_surface_attrs,
+                                             &h264_surface_attr_count);
+    unsigned int h264_surface_max_width = 0;
+    unsigned int h264_surface_max_height = 0;
+    for (unsigned int i = 0; i < h264_surface_attr_count; i++) {
+        if (h264_surface_attrs[i].type == VASurfaceAttribMaxWidth)
+            h264_surface_max_width = h264_surface_attrs[i].value.value.i;
+        else if (h264_surface_attrs[i].type == VASurfaceAttribMaxHeight)
+            h264_surface_max_height = h264_surface_attrs[i].value.value.i;
+    }
+    VAStatus h264_vld_destroy_status =
+        hobot_vaDestroyConfig(&va_ctx, h264_vld_config);
+    if (status != VA_STATUS_SUCCESS || h264_surface_max_width != 4096 ||
+        h264_surface_max_height != 4096 ||
+        h264_vld_destroy_status != VA_STATUS_SUCCESS) {
+        fprintf(stderr, "H.264 surface-size capabilities mismatch: status=%d width=%u height=%u\n",
+                status, h264_surface_max_width, h264_surface_max_height);
+        pthread_mutex_destroy(&drv.mutex);
+        return 0;
+    }
+
     int hevc_entrypoint_count = 0;
     VAEntrypoint hevc_entrypoints[2] = {VAEntrypointEncPicture, VAEntrypointVLD};
     status = hobot_vaQueryConfigEntrypoints(&va_ctx, VAProfileHEVCMain,
@@ -7369,15 +7441,53 @@ static int test_config_capabilities_match_encoder(void)
         { .type = VAConfigAttribRTFormat, .value = VA_RT_FORMAT_YUV420 },
         { .type = VAConfigAttribRateControl, .value = VA_RC_CBR }
     };
+    VAConfigAttrib oversized_config_attrs[MAX_CONFIG_ATTRIBUTES + 1] = {0};
+    VAConfigID oversized_config = VA_INVALID_ID;
+    if (hobot_vaCreateConfig(&va_ctx, VAProfileHEVCMain,
+                             VAEntrypointEncSlice,
+                             oversized_config_attrs,
+                             MAX_CONFIG_ATTRIBUTES + 1,
+                             &oversized_config) !=
+            VA_STATUS_ERROR_INVALID_PARAMETER ||
+        oversized_config != VA_INVALID_ID) {
+        fprintf(stderr, "oversized config attribute list was not rejected\n");
+        pthread_mutex_destroy(&drv.mutex);
+        return 0;
+    }
     VAConfigID hevc_config = VA_INVALID_ID;
     if (hobot_vaCreateConfig(&va_ctx, VAProfileHEVCMain, VAEntrypointEncSlice,
                              hevc_create_attrs, 2, &hevc_config) !=
             VA_STATUS_SUCCESS || hevc_config == VA_INVALID_ID ||
         !drv.configs[hevc_config].allocated ||
         drv.configs[hevc_config].profile != VAProfileHEVCMain ||
-        drv.configs[hevc_config].entrypoint != VAEntrypointEncSlice ||
-        hobot_vaDestroyConfig(&va_ctx, hevc_config) != VA_STATUS_SUCCESS) {
+        drv.configs[hevc_config].entrypoint != VAEntrypointEncSlice) {
         fprintf(stderr, "HEVC Main CBR encode config was rejected\n");
+        pthread_mutex_destroy(&drv.mutex);
+        return 0;
+    }
+    VAProfile queried_config_profile = VAProfileNone;
+    VAEntrypoint queried_config_entrypoint = VAEntrypointVLD;
+    VAConfigAttrib queried_config_attrs[MAX_CONFIG_ATTRIBUTES] = {0};
+    int queried_config_attr_count = MAX_CONFIG_ATTRIBUTES;
+    status = hobot_vaQueryConfigAttributes(&va_ctx, hevc_config,
+                                            &queried_config_profile,
+                                            &queried_config_entrypoint,
+                                            queried_config_attrs,
+                                            &queried_config_attr_count);
+    VAStatus hevc_config_destroy_status =
+        hobot_vaDestroyConfig(&va_ctx, hevc_config);
+    if (status != VA_STATUS_SUCCESS ||
+        queried_config_profile != VAProfileHEVCMain ||
+        queried_config_entrypoint != VAEntrypointEncSlice ||
+        queried_config_attr_count != 2 ||
+        queried_config_attrs[0].type != VAConfigAttribRTFormat ||
+        queried_config_attrs[0].value != VA_RT_FORMAT_YUV420 ||
+        queried_config_attrs[1].type != VAConfigAttribRateControl ||
+        queried_config_attrs[1].value != VA_RC_CBR ||
+        hevc_config_destroy_status != VA_STATUS_SUCCESS) {
+        fprintf(stderr, "HEVC config query did not return its stored attributes: status=%d profile=%d entrypoint=%d count=%d\n",
+                status, queried_config_profile, queried_config_entrypoint,
+                queried_config_attr_count);
         pthread_mutex_destroy(&drv.mutex);
         return 0;
     }

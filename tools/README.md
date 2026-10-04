@@ -20,10 +20,12 @@ Full end-to-end benchmark pipeline:
 5. Renders textured quads at up to 180+ FPS with zero CPU copying and zero frame drops.
 
 ### 5. `test_va_config.c`
-Creates an H.264 VLD configuration and calls `vaQueryConfigAttributes`, then creates an NV12
-surface and verifies CPU mapping through `vaLockSurface`/`vaUnlockSurface` before destroying
-the configuration and VA display. This covers the driver's config mutex, surface mapping, and
-configuration validation paths.
+Checks H.264 profile and VLD entrypoint enumeration, queried decode capabilities, and a config
+attribute round trip using an output array sized by `vaMaxNumConfigAttributes()`. It performs
+the two-call `vaQuerySurfaceAttributes()` count/data query and verifies the reported 4096x4096
+H.264 surface limit, then creates an NV12 surface and validates CPU mapping plus both separate-
+layer and two-plane DRM PRIME 2 exports. Run with `LIBVA_DRIVERS_PATH` to test a candidate
+without replacing the installed driver.
 
 ### 6. `test_va_surface_export.c`
 Decodes the complete input stream through VA-API. It synchronizes every decoded VPU surface and
