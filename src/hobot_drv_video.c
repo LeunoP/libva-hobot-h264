@@ -5045,7 +5045,7 @@ static VAStatus hobot_vaCreateContext(
             memset(mctx, 0, sizeof(*mctx));
 
             media_codec_id_t cid = MEDIA_CODEC_ID_H264;
-            if (cfg->profile == VAProfileHEVCMain || cfg->profile == VAProfileHEVCMain10) {
+            if (cfg->profile == VAProfileHEVCMain) {
                 cid = MEDIA_CODEC_ID_H265;
             } else if (cfg->profile == VAProfileJPEGBaseline) {
                 cid = MEDIA_CODEC_ID_JPEG;
@@ -5883,8 +5883,7 @@ retry_surface_sync:
         surf->decode_pending = 1;
         surf->decode_error = 0;
         hctx->decode_slice_fragment_open = 0;
-        if (hctx->profile == VAProfileHEVCMain ||
-            hctx->profile == VAProfileHEVCMain10) {
+        if (hctx->profile == VAProfileHEVCMain) {
             hctx->hevc_decode_picture_valid = 0;
             memset(&hctx->hevc_decode_picture, 0,
                    sizeof(hctx->hevc_decode_picture));
@@ -6009,7 +6008,7 @@ static VAStatus hobot_vaRenderPicture(
         if (hctx->is_encoder) {
             size_t required_size = 0;
             if (buffer->type == VAEncPictureParameterBufferType) {
-                if (hctx->profile == VAProfileHEVCMain || hctx->profile == VAProfileHEVCMain10)
+                if (hctx->profile == VAProfileHEVCMain)
                     required_size = sizeof(VAEncPictureParameterBufferHEVC);
                 else if (hctx->profile == VAProfileJPEGBaseline)
                     required_size = sizeof(VAEncPictureParameterBufferJPEG);
@@ -6040,7 +6039,7 @@ static VAStatus hobot_vaRenderPicture(
                 }
 
                 VABufferID coded_id;
-                if (hctx->profile == VAProfileHEVCMain || hctx->profile == VAProfileHEVCMain10)
+                if (hctx->profile == VAProfileHEVCMain)
                     coded_id = ((VAEncPictureParameterBufferHEVC *)buffer->data)->coded_buf;
                 else if (hctx->profile == VAProfileJPEGBaseline) {
                     VAEncPictureParameterBufferJPEG *picture =
@@ -6091,7 +6090,7 @@ static VAStatus hobot_vaRenderPicture(
                     }
                     sequence_parameter_seen = 1;
                 }
-                if (hctx->profile == VAProfileHEVCMain || hctx->profile == VAProfileHEVCMain10)
+                if (hctx->profile == VAProfileHEVCMain)
                     required_size = sizeof(VAEncSequenceParameterBufferHEVC);
                 else if (hctx->profile != VAProfileJPEGBaseline)
                     required_size = sizeof(VAEncSequenceParameterBufferH264);
@@ -6327,7 +6326,7 @@ static VAStatus hobot_vaRenderPicture(
         } else {
             if (buffer->type == VAPictureParameterBufferType) {
                 size_t required_size = 0;
-                if (hctx->profile == VAProfileHEVCMain || hctx->profile == VAProfileHEVCMain10)
+                if (hctx->profile == VAProfileHEVCMain)
                     required_size = sizeof(VAPictureParameterBufferHEVC);
                 else if (hctx->profile == VAProfileJPEGBaseline)
                     required_size = sizeof(VAPictureParameterBufferJPEGBaseline);
@@ -6337,8 +6336,7 @@ static VAStatus hobot_vaRenderPicture(
                     pthread_mutex_unlock(&drv->mutex);
                     return VA_STATUS_ERROR_INVALID_PARAMETER;
                 }
-                if (hctx->profile == VAProfileHEVCMain ||
-                    hctx->profile == VAProfileHEVCMain10) {
+                if (hctx->profile == VAProfileHEVCMain) {
                     if (hevc_decode_picture) {
                         pthread_mutex_unlock(&drv->mutex);
                         return VA_STATUS_ERROR_INVALID_PARAMETER;
@@ -6356,7 +6354,6 @@ static VAStatus hobot_vaRenderPicture(
                         (VAPictureParameterBufferJPEGBaseline *)buffer->data;
                 }
                 if (hctx->profile != VAProfileHEVCMain &&
-                    hctx->profile != VAProfileHEVCMain10 &&
                     hctx->profile != VAProfileJPEGBaseline &&
                     !hobot_h264_picture_parameters_supported(
                         (VAPictureParameterBufferH264 *)buffer->data,
@@ -6778,7 +6775,7 @@ static VAStatus hobot_vaRenderPicture(
 
             if (b->type == VAEncPictureParameterBufferType) {
                 size_t required_size;
-                if (hctx->profile == VAProfileHEVCMain || hctx->profile == VAProfileHEVCMain10) {
+                if (hctx->profile == VAProfileHEVCMain) {
                     required_size = sizeof(VAEncPictureParameterBufferHEVC);
                 } else if (hctx->profile == VAProfileJPEGBaseline) {
                     required_size = sizeof(VAEncPictureParameterBufferJPEG);
@@ -6789,7 +6786,7 @@ static VAStatus hobot_vaRenderPicture(
                     pthread_mutex_unlock(&drv->mutex);
                     return VA_STATUS_ERROR_INVALID_PARAMETER;
                 }
-                if (hctx->profile == VAProfileHEVCMain || hctx->profile == VAProfileHEVCMain10) {
+                if (hctx->profile == VAProfileHEVCMain) {
                     VAEncPictureParameterBufferHEVC *pic = (VAEncPictureParameterBufferHEVC *)b->data;
                     if (pic->pic_fields.bits.idr_pic_flag && hctx->vpu_running) {
                         int ret = hb_mm_mc_request_idr_frame(&hctx->vpu_ctx);
@@ -6801,10 +6798,8 @@ static VAStatus hobot_vaRenderPicture(
                         }
                     }
                     hctx->enc_coded_buf = pic->coded_buf;
-                    if (hctx->profile == VAProfileHEVCMain) {
-                        hctx->hevc_encode_picture = *pic;
-                        hctx->hevc_encode_picture_valid = 1;
-                    }
+                    hctx->hevc_encode_picture = *pic;
+                    hctx->hevc_encode_picture_valid = 1;
                 } else if (hctx->profile == VAProfileJPEGBaseline) {
                     VAEncPictureParameterBufferJPEG *pic = (VAEncPictureParameterBufferJPEG *)b->data;
                     hctx->enc_coded_buf = pic->coded_buf;
@@ -6826,18 +6821,17 @@ static VAStatus hobot_vaRenderPicture(
                     hctx->vpu_ctx.video_enc_params.rc_params;
                 mc_rate_control_params_t pending_rc = previous_rc;
                 VAEncSequenceParameterBufferH264 *pending_h264_sequence = NULL;
-                if (hctx->profile == VAProfileHEVCMain || hctx->profile == VAProfileHEVCMain10) {
+                if (hctx->profile == VAProfileHEVCMain) {
                     if (!b->data || b->size < sizeof(VAEncSequenceParameterBufferHEVC)) {
                         pthread_mutex_unlock(&drv->mutex);
                         return VA_STATUS_ERROR_INVALID_PARAMETER;
                     }
                     VAEncSequenceParameterBufferHEVC *seq = (VAEncSequenceParameterBufferHEVC *)b->data;
-                    if (hctx->profile == VAProfileHEVCMain &&
-                        (!hobot_hevc_encode_sequence_supported(
+                    if (!hobot_hevc_encode_sequence_supported(
                              seq, hctx->width, hctx->height) ||
                          (hctx->hevc_encode_sequence_valid &&
                           !hobot_hevc_encode_sequence_static_equal(
-                              &hctx->hevc_encode_sequence, seq)))) {
+                              &hctx->hevc_encode_sequence, seq))) {
                         pthread_mutex_unlock(&drv->mutex);
                         return VA_STATUS_ERROR_ATTR_NOT_SUPPORTED;
                     }
@@ -6847,8 +6841,7 @@ static VAStatus hobot_vaRenderPicture(
                     if (seq->bits_per_second > 0) {
                         pending_rc.h265_cbr_params.bit_rate = seq->bits_per_second / 1000u;
                     }
-                    if (hctx->profile == VAProfileHEVCMain &&
-                        seq->vui_parameters_present_flag &&
+                    if (seq->vui_parameters_present_flag &&
                         seq->vui_fields.bits.vui_timing_info_present_flag) {
                         uint64_t fps =
                             ((uint64_t)seq->vui_time_scale +
@@ -7057,22 +7050,20 @@ static VAStatus hobot_vaRenderPicture(
         if (b->type != VAPictureParameterBufferType)
             continue;
 
-        if (hctx->profile == VAProfileHEVCMain || hctx->profile == VAProfileHEVCMain10) {
+        if (hctx->profile == VAProfileHEVCMain) {
             VAPictureParameterBufferHEVC *pic = (VAPictureParameterBufferHEVC *)b->data;
-            if (hctx->profile != VAProfileHEVCMain ||
-                !hobot_hevc_picture_parameters_supported(
+            if (!hobot_hevc_picture_parameters_supported(
                     pic, hctx->width, hctx->height)) {
                 pthread_mutex_unlock(&drv->mutex);
                 return VA_STATUS_ERROR_ATTR_NOT_SUPPORTED;
             }
             hctx->hevc_decode_picture = *pic;
             hctx->hevc_decode_picture_valid = 1;
-            int prof_idc = (hctx->profile == VAProfileHEVCMain10) ? 2 : 1;
             uint8_t new_vps[sizeof(hctx->cached_vps)];
             uint8_t new_sps[sizeof(hctx->cached_sps)];
             uint8_t new_pps[sizeof(hctx->cached_pps)];
-            int new_vps_len = generate_hevc_vps(pic, prof_idc, new_vps, sizeof(new_vps));
-            int new_sps_len = generate_hevc_sps(pic, prof_idc, new_sps, sizeof(new_sps));
+            int new_vps_len = generate_hevc_vps(pic, 1, new_vps, sizeof(new_vps));
+            int new_sps_len = generate_hevc_sps(pic, 1, new_sps, sizeof(new_sps));
             int new_pps_len = generate_hevc_pps(pic, new_pps, sizeof(new_pps));
             int sequence_changed =
                 hobot_header_changed(hctx->cached_vps, hctx->cached_vps_len,
