@@ -23,6 +23,39 @@ VAStatus vaLockSurface(
 );
 VAStatus vaUnlockSurface(VADisplay dpy, VASurfaceID surface);
 
+static VAStatus query_surface_limits(VADisplay dpy, VAConfigID config,
+                                     unsigned int *max_width,
+                                     unsigned int *max_height,
+                                     unsigned int *attr_count)
+{
+    if (!max_width || !max_height || !attr_count)
+        return VA_STATUS_ERROR_INVALID_PARAMETER;
+
+    unsigned int count = 0;
+    VAStatus st = vaQuerySurfaceAttributes(dpy, config, NULL, &count);
+    if (st != VA_STATUS_SUCCESS || count == 0)
+        return st != VA_STATUS_SUCCESS ? st : VA_STATUS_ERROR_OPERATION_FAILED;
+
+    VASurfaceAttrib *attrs = calloc(count, sizeof(*attrs));
+    if (!attrs)
+        return VA_STATUS_ERROR_ALLOCATION_FAILED;
+
+    st = vaQuerySurfaceAttributes(dpy, config, attrs, &count);
+    *max_width = 0;
+    *max_height = 0;
+    if (st == VA_STATUS_SUCCESS) {
+        for (unsigned int i = 0; i < count; i++) {
+            if (attrs[i].type == VASurfaceAttribMaxWidth)
+                *max_width = (unsigned int)attrs[i].value.value.i;
+            else if (attrs[i].type == VASurfaceAttribMaxHeight)
+                *max_height = (unsigned int)attrs[i].value.value.i;
+        }
+    }
+    *attr_count = count;
+    free(attrs);
+    return st;
+}
+
 int main(void) {
     int fd = open("/dev/dri/card0", O_RDWR | O_CLOEXEC);
     if (fd < 0) {
@@ -51,16 +84,20 @@ int main(void) {
         calloc((size_t)max_profiles, sizeof(*profiles)) : NULL;
     int profile_count = 0;
     int has_h264_high = 0;
+    int has_hevc_main = 0;
     st = profiles ? vaQueryConfigProfiles(dpy, profiles, &profile_count) :
                     VA_STATUS_ERROR_ALLOCATION_FAILED;
     int profile_count_valid = profile_count >= 0 &&
                               profile_count <= max_profiles;
     for (int i = 0; st == VA_STATUS_SUCCESS && profile_count_valid &&
-                    i < profile_count; i++)
+                    i < profile_count; i++) {
         has_h264_high |= profiles[i] == VAProfileH264High;
+        has_hevc_main |= profiles[i] == VAProfileHEVCMain;
+    }
     free(profiles);
-    if (st != VA_STATUS_SUCCESS || !profile_count_valid || !has_h264_high) {
-        fprintf(stderr, "vaQueryConfigProfiles failed or omitted H.264 High: %s\n",
+    if (st != VA_STATUS_SUCCESS || !profile_count_valid || !has_h264_high ||
+        !has_hevc_main) {
+        fprintf(stderr, "vaQueryConfigProfiles failed or omitted H.264 High/HEVC Main: %s\n",
                 vaErrorStr(st));
         vaTerminate(dpy);
         close(fd);
@@ -90,6 +127,28 @@ int main(void) {
         return 1;
     }
 
+    VAEntrypoint *hevc_entrypoints = max_entrypoints > 0 ?
+        calloc((size_t)max_entrypoints, sizeof(*hevc_entrypoints)) : NULL;
+    int hevc_entrypoint_count = 0;
+    int has_hevc_vld = 0;
+    st = hevc_entrypoints ? vaQueryConfigEntrypoints(
+        dpy, VAProfileHEVCMain, hevc_entrypoints, &hevc_entrypoint_count) :
+        VA_STATUS_ERROR_ALLOCATION_FAILED;
+    int hevc_entrypoint_count_valid = hevc_entrypoint_count >= 0 &&
+                                     hevc_entrypoint_count <= max_entrypoints;
+    for (int i = 0; st == VA_STATUS_SUCCESS && hevc_entrypoint_count_valid &&
+                    i < hevc_entrypoint_count; i++)
+        has_hevc_vld |= hevc_entrypoints[i] == VAEntrypointVLD;
+    free(hevc_entrypoints);
+    if (st != VA_STATUS_SUCCESS || !hevc_entrypoint_count_valid ||
+        !has_hevc_vld) {
+        fprintf(stderr, "vaQueryConfigEntrypoints failed or omitted HEVC Main VLD: %s\n",
+                vaErrorStr(st));
+        vaTerminate(dpy);
+        close(fd);
+        return 1;
+    }
+
     VAConfigAttrib capabilities[] = {
         { .type = VAConfigAttribRTFormat },
         { .type = VAConfigAttribMaxPictureWidth },
@@ -108,6 +167,63 @@ int main(void) {
         close(fd);
         return 1;
     }
+
+    VAConfigAttrib hevc_capabilities[] = {
+        { .type = VAConfigAttribRTFormat },
+        { .type = VAConfigAttribMaxPictureWidth },
+        { .type = VAConfigAttribMaxPictureHeight }
+    };
+    st = vaGetConfigAttributes(dpy, VAProfileHEVCMain, VAEntrypointVLD,
+                               hevc_capabilities,
+                               sizeof(hevc_capabilities) /
+                                   sizeof(hevc_capabilities[0]));
+    if (st != VA_STATUS_SUCCESS ||
+        hevc_capabilities[0].value != VA_RT_FORMAT_YUV420 ||
+        hevc_capabilities[1].value != 3840 ||
+        hevc_capabilities[2].value != 2160) {
+        fprintf(stderr, "vaGetConfigAttributes returned unexpected HEVC Main VLD capabilities: status=%s rt=%u max=%ux%u\n",
+                vaErrorStr(st), hevc_capabilities[0].value,
+                hevc_capabilities[1].value, hevc_capabilities[2].value);
+        vaTerminate(dpy);
+        close(fd);
+        return 1;
+    }
+
+    VAConfigAttrib hevc_attr = {
+        .type = VAConfigAttribRTFormat,
+        .value = VA_RT_FORMAT_YUV420
+    };
+    VAConfigID hevc_config = VA_INVALID_ID;
+    st = vaCreateConfig(dpy, VAProfileHEVCMain, VAEntrypointVLD,
+                        &hevc_attr, 1, &hevc_config);
+    if (st != VA_STATUS_SUCCESS) {
+        fprintf(stderr, "HEVC Main VLD vaCreateConfig failed: %s\n",
+                vaErrorStr(st));
+        vaTerminate(dpy);
+        close(fd);
+        return 1;
+    }
+    unsigned int hevc_surface_width = 0;
+    unsigned int hevc_surface_height = 0;
+    unsigned int hevc_surface_attr_count = 0;
+    st = query_surface_limits(dpy, hevc_config, &hevc_surface_width,
+                              &hevc_surface_height,
+                              &hevc_surface_attr_count);
+    VAStatus hevc_destroy_status = vaDestroyConfig(dpy, hevc_config);
+    if (st != VA_STATUS_SUCCESS || hevc_surface_width != 3840 ||
+        hevc_surface_height != 2160 ||
+        hevc_destroy_status != VA_STATUS_SUCCESS) {
+        fprintf(stderr, "HEVC Main surface limits mismatch: status=%s max=%ux%u attrs=%u\n",
+                vaErrorStr(st), hevc_surface_width, hevc_surface_height,
+                hevc_surface_attr_count);
+        vaTerminate(dpy);
+        close(fd);
+        return 1;
+    }
+    printf("HEVC Main VLD: config max=%ux%u, surface max=%ux%u, attrs=%u\n",
+           hevc_capabilities[1].value, hevc_capabilities[2].value,
+           hevc_surface_width, hevc_surface_height,
+           hevc_surface_attr_count);
 
     VAConfigAttrib profile_check_attr = {
         .type = VAConfigAttribRTFormat,
@@ -173,30 +289,11 @@ int main(void) {
         return 1;
     }
 
-    unsigned int num_surface_attrs = 0;
-    st = vaQuerySurfaceAttributes(dpy, config, NULL, &num_surface_attrs);
-    VASurfaceAttrib *surface_attrs = st == VA_STATUS_SUCCESS && num_surface_attrs > 0 ?
-        calloc(num_surface_attrs, sizeof(*surface_attrs)) : NULL;
-    if (st != VA_STATUS_SUCCESS || !surface_attrs) {
-        fprintf(stderr, "vaQuerySurfaceAttributes sizing query failed: %s count=%u\n",
-                vaErrorStr(st), num_surface_attrs);
-        free(surface_attrs);
-        vaDestroyConfig(dpy, config);
-        vaTerminate(dpy);
-        close(fd);
-        return 1;
-    }
-    st = vaQuerySurfaceAttributes(dpy, config, surface_attrs,
-                                  &num_surface_attrs);
     unsigned int max_surface_width = 0;
     unsigned int max_surface_height = 0;
-    for (unsigned int i = 0; st == VA_STATUS_SUCCESS && i < num_surface_attrs; i++) {
-        if (surface_attrs[i].type == VASurfaceAttribMaxWidth)
-            max_surface_width = (unsigned int)surface_attrs[i].value.value.i;
-        else if (surface_attrs[i].type == VASurfaceAttribMaxHeight)
-            max_surface_height = (unsigned int)surface_attrs[i].value.value.i;
-    }
-    free(surface_attrs);
+    unsigned int num_surface_attrs = 0;
+    st = query_surface_limits(dpy, config, &max_surface_width,
+                              &max_surface_height, &num_surface_attrs);
     if (st != VA_STATUS_SUCCESS || max_surface_width != 4096 ||
         max_surface_height != 4096) {
         fprintf(stderr, "vaQuerySurfaceAttributes returned unexpected limits: status=%s max=%ux%u\n",

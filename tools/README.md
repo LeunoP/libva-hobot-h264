@@ -20,13 +20,13 @@ Full end-to-end benchmark pipeline:
 5. Renders textured quads at up to 180+ FPS with zero CPU copying and zero frame drops.
 
 ### 5. `test_va_config.c`
-Checks H.264 profile and VLD entrypoint enumeration, queried decode capabilities, and a config
-attribute round trip using an output array sized by `vaMaxNumConfigAttributes()`. It distinguishes
-unsupported-profile from unsupported-entrypoint errors. It performs
-the two-call `vaQuerySurfaceAttributes()` count/data query and verifies the reported 4096x4096
-H.264 surface limit, then creates an NV12 surface and validates CPU mapping plus both separate-
-layer and two-plane DRM PRIME 2 exports. Run with `LIBVA_DRIVERS_PATH` to test a candidate
-without replacing the installed driver.
+Checks H.264 High and HEVC Main profile/VLD entrypoint enumeration and queried decode
+capabilities. It verifies config attribute round trips using an output array sized by
+`vaMaxNumConfigAttributes()`, distinguishes unsupported-profile from unsupported-entrypoint
+errors, and uses the two-call `vaQuerySurfaceAttributes()` query to check H.264's 4096x4096 and
+HEVC Main's 3840x2160 limits. It then creates an NV12 surface and validates CPU mapping plus
+separate-layer and two-plane DRM PRIME 2 exports. Run with `LIBVA_DRIVERS_PATH` to test a
+candidate without replacing the installed driver.
 
 ### 6. `test_va_surface_export.c`
 Decodes the complete input stream through VA-API. It synchronizes every decoded VPU surface and
