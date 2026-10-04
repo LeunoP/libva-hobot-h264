@@ -21,7 +21,8 @@ Full end-to-end benchmark pipeline:
 
 ### 5. `test_va_config.c`
 Checks H.264 profile and VLD entrypoint enumeration, queried decode capabilities, and a config
-attribute round trip using an output array sized by `vaMaxNumConfigAttributes()`. It performs
+attribute round trip using an output array sized by `vaMaxNumConfigAttributes()`. It distinguishes
+unsupported-profile from unsupported-entrypoint errors. It performs
 the two-call `vaQuerySurfaceAttributes()` count/data query and verifies the reported 4096x4096
 H.264 surface limit, then creates an NV12 surface and validates CPU mapping plus both separate-
 layer and two-plane DRM PRIME 2 exports. Run with `LIBVA_DRIVERS_PATH` to test a candidate

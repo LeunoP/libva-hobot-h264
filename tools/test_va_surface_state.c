@@ -7503,6 +7503,31 @@ static int test_config_capabilities_match_encoder(void)
         return 0;
     }
 
+    VAConfigAttrib profile_check_attr = {
+        .type = VAConfigAttribRTFormat,
+        .value = VA_RT_FORMAT_YUV420
+    };
+    VAConfigID unsupported_profile_config = VA_INVALID_ID;
+    if (hobot_vaCreateConfig(&va_ctx, VAProfileHEVCMain10, VAEntrypointVLD,
+                             &profile_check_attr, 1,
+                             &unsupported_profile_config) !=
+            VA_STATUS_ERROR_UNSUPPORTED_PROFILE ||
+        unsupported_profile_config != VA_INVALID_ID) {
+        fprintf(stderr, "unsupported profile returned the wrong config error\n");
+        pthread_mutex_destroy(&drv.mutex);
+        return 0;
+    }
+    VAConfigID unsupported_entrypoint_config = VA_INVALID_ID;
+    if (hobot_vaCreateConfig(&va_ctx, VAProfileH264High,
+                             VAEntrypointEncPicture, &profile_check_attr, 1,
+                             &unsupported_entrypoint_config) !=
+            VA_STATUS_ERROR_UNSUPPORTED_ENTRYPOINT ||
+        unsupported_entrypoint_config != VA_INVALID_ID) {
+        fprintf(stderr, "unsupported entrypoint returned the wrong config error\n");
+        pthread_mutex_destroy(&drv.mutex);
+        return 0;
+    }
+
     int cb_entrypoint_count = 0;
     VAEntrypoint cb_entrypoints[2] = {VAEntrypointEncPicture, VAEntrypointEncPicture};
     status = hobot_vaQueryConfigEntrypoints(&va_ctx,

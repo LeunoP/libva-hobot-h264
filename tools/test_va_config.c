@@ -109,6 +109,32 @@ int main(void) {
         return 1;
     }
 
+    VAConfigAttrib profile_check_attr = {
+        .type = VAConfigAttribRTFormat,
+        .value = VA_RT_FORMAT_YUV420
+    };
+    VAConfigID rejected_config = VA_INVALID_ID;
+    st = vaCreateConfig(dpy, VAProfileHEVCMain10, VAEntrypointVLD,
+                        &profile_check_attr, 1, &rejected_config);
+    if (st != VA_STATUS_ERROR_UNSUPPORTED_PROFILE ||
+        rejected_config != VA_INVALID_ID) {
+        fprintf(stderr, "unsupported profile returned unexpected result: %s id=%u\n",
+                vaErrorStr(st), rejected_config);
+        vaTerminate(dpy);
+        close(fd);
+        return 1;
+    }
+    st = vaCreateConfig(dpy, VAProfileH264High, VAEntrypointEncPicture,
+                        &profile_check_attr, 1, &rejected_config);
+    if (st != VA_STATUS_ERROR_UNSUPPORTED_ENTRYPOINT ||
+        rejected_config != VA_INVALID_ID) {
+        fprintf(stderr, "unsupported entrypoint returned unexpected result: %s id=%u\n",
+                vaErrorStr(st), rejected_config);
+        vaTerminate(dpy);
+        close(fd);
+        return 1;
+    }
+
     VAConfigAttrib attr = {
         .type = VAConfigAttribRTFormat,
         .value = VA_RT_FORMAT_YUV420

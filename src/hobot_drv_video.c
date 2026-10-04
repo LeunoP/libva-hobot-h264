@@ -4530,7 +4530,9 @@ static VAStatus hobot_vaCreateConfig(
 
     int is_vld = (entrypoint == VAEntrypointVLD);
     int is_enc = (entrypoint == VAEntrypointEncSlice || entrypoint == VAEntrypointEncPicture);
-    if (!hobot_profile_supported(profile) || (!is_vld && !is_enc)) {
+    if (!hobot_profile_supported(profile))
+        return VA_STATUS_ERROR_UNSUPPORTED_PROFILE;
+    if (!is_vld && !is_enc) {
         return VA_STATUS_ERROR_UNSUPPORTED_ENTRYPOINT;
     }
     if (profile == VAProfileJPEGBaseline &&
