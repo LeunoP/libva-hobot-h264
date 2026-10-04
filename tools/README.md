@@ -219,7 +219,18 @@ sessions by default. Set `HOBOT_HEVC_SAO_RPS_CYCLES` to change the repetition co
 LIBVA_DRIVERS_PATH=/path/to/candidate bash tools/test_hevc_single_rps_sao_decode.sh
 ```
 
-### 21. `test_h264_multislice_decode.sh`
+### 21. `test_hevc_single_rps_multislice_decode.sh`
+Uses a checked-in 640x360 HM fixture with one IDR and three P pictures. Every picture has two
+independent slices at CTU addresses 0 and 30; each P slice selects the only SPS short-term RPS.
+FFmpeg header tracing checks the slice topology, independent-slice flags, and RPS selection, then
+candidate-driver output is compared bit-exactly with software. This covers the single-RPS slice
+header rewrite on a later independent slice, complementing the isolated rewrite unit test.
+
+```bash
+LIBVA_DRIVERS_PATH=/path/to/candidate bash tools/test_hevc_single_rps_multislice_decode.sh
+```
+
+### 22. `test_h264_multislice_decode.sh`
 Generates a 64-frame H.264 High 640x360 stream with six consecutive B-frames and two slices per
 picture. FFmpeg `trace_headers` checks all 128 slice starts (macroblocks 0 and 480), then the
 candidate-driver VPU output is compared frame-by-frame with software NV12 output.

@@ -44,3 +44,13 @@ The fixture is exercised by `../test_hevc_multislice_b_decode.sh`, which checks
 the slice layout with FFmpeg's `trace_headers` bitstream filter and compares
 candidate-driver VPU output with FFmpeg software-decoded NV12 frame hashes in
 fresh VPU sessions.
+
+`hevc_main_640x360_two_slices_single_sps_rps_p3.hevc` is a four-picture,
+640x360, 8-bit HEVC Main stream based on HM 16.20. It contains one IDR and
+three P pictures; each picture has two independent slices at CTU addresses 0
+and 30, and each P slice selects the single negative SPS short-term RPS. WPP,
+tiles, TMVP, and SAO are disabled. The test-only HM encoder change that emits
+independent slice segments and omits its unused trailing empty RPS is not part
+of the driver repository. Software decoding is bit-exact with HM reconstruction;
+`../test_hevc_single_rps_multislice_decode.sh` checks the syntax and compares
+candidate-driver VPU output with software.
