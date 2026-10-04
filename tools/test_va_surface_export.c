@@ -53,8 +53,13 @@ static int check_export(VADisplay display, VASurfaceID surface, int separate_lay
             uint64_t offset = descriptor.layers[layer].offset[plane_index];
             uint64_t pitch = descriptor.layers[layer].pitch[plane_index];
             uint64_t rows = plane == 0 ? descriptor.height : (descriptor.height + 1u) / 2u;
-            valid = object < descriptor.num_objects && pitch > 0 &&
-                    descriptor.objects[object].size >= offset + pitch * rows;
+            valid = object < descriptor.num_objects && pitch > 0 && rows > 0 &&
+                    pitch <= UINT64_MAX / rows;
+            if (valid) {
+                uint64_t extent = pitch * rows;
+                uint64_t object_size = descriptor.objects[object].size;
+                valid = offset <= object_size && extent <= object_size - offset;
+            }
         }
     }
 
@@ -68,13 +73,11 @@ static int check_export(VADisplay display, VASurfaceID surface, int separate_lay
         return -1;
     }
 
-    printf("decoded %ux%u %s PRIME export: objects=%u\n",
-           descriptor.width, descriptor.height,
-           separate_layers ? "separate-layer" : "NV12", descriptor.num_objects);
     return 0;
 }
 
-static int receive_frames(AVCodecContext *decoder, VADisplay display, int *done)
+static int receive_frames(AVCodecContext *decoder, VADisplay display,
+                          unsigned long long *decoded_frames)
 {
     AVFrame *frame = av_frame_alloc();
     if (!frame)
@@ -92,14 +95,30 @@ static int receive_frames(AVCodecContext *decoder, VADisplay display, int *done)
 
         VASurfaceID surface = (VASurfaceID)(uintptr_t)frame->data[3];
         status = vaSyncSurface(display, surface);
-        if (status != VA_STATUS_SUCCESS || check_export(display, surface, 1) != 0 ||
+        if (status != VA_STATUS_SUCCESS) {
+            result = AVERROR_EXTERNAL;
+            break;
+        }
+        if (*decoded_frames == 0) {
+            struct hobot_surface_info info = {0};
+            status = vaGetHobotSurfaceInfo(display, surface, &info);
+            if (status != VA_STATUS_SUCCESS) {
+                fprintf(stderr, "surface-info query failed: status=%d\n", status);
+                result = AVERROR_EXTERNAL;
+                break;
+            }
+            printf("first decoded surface metadata: %ux%u y_pitch=%u vertical_stride=%u uv_offset=%llu\n",
+                   info.width, info.height, info.stride, info.vstride,
+                   (unsigned long long)((uintptr_t)info.virt_addr[1] -
+                                        (uintptr_t)info.virt_addr[0]));
+        }
+        if (check_export(display, surface, 1) != 0 ||
             check_export(display, surface, 0) != 0) {
             result = AVERROR_EXTERNAL;
             break;
         }
-        *done = 1;
+        (*decoded_frames)++;
         av_frame_unref(frame);
-        break;
     }
 
     if (status < 0 && status != AVERROR(EAGAIN) && status != AVERROR_EOF && result == 0)
@@ -116,8 +135,9 @@ int main(int argc, char **argv)
     AVBufferRef *device = NULL;
     AVPacket *packet = NULL;
     int result = 1;
-    int done = 0;
+    unsigned long long decoded_frames = 0;
     int video_stream = -1;
+    int read_status;
 
     if (avformat_open_input(&format, path, NULL, NULL) < 0 ||
         avformat_find_stream_info(format, NULL) < 0) {
@@ -153,15 +173,17 @@ int main(int argc, char **argv)
         goto cleanup;
     }
 
-    while (!done && av_read_frame(format, packet) >= 0) {
+    while ((read_status = av_read_frame(format, packet)) >= 0) {
         if (packet->stream_index == video_stream) {
             int status = avcodec_send_packet(decoder, packet);
             if (status == AVERROR(EAGAIN)) {
-                if (receive_frames(decoder, vaapi_context->display, &done) < 0)
+                if (receive_frames(decoder, vaapi_context->display,
+                                   &decoded_frames) < 0)
                     goto cleanup;
-                status = done ? 0 : avcodec_send_packet(decoder, packet);
+                status = avcodec_send_packet(decoder, packet);
             }
-            if (status < 0 || receive_frames(decoder, vaapi_context->display, &done) < 0) {
+            if (status < 0 || receive_frames(decoder, vaapi_context->display,
+                                             &decoded_frames) < 0) {
                 fprintf(stderr, "hardware decode or PRIME validation failed\n");
                 goto cleanup;
             }
@@ -169,15 +191,31 @@ int main(int argc, char **argv)
         av_packet_unref(packet);
     }
 
-    if (!done) {
-        avcodec_send_packet(decoder, NULL);
-        if (receive_frames(decoder, vaapi_context->display, &done) < 0)
-            goto cleanup;
+    if (read_status != AVERROR_EOF) {
+        fprintf(stderr, "input read failed: %d\n", read_status);
+        goto cleanup;
     }
-    if (done)
+
+    int flush_status = avcodec_send_packet(decoder, NULL);
+    if (flush_status == AVERROR(EAGAIN)) {
+        if (receive_frames(decoder, vaapi_context->display, &decoded_frames) < 0)
+            goto cleanup;
+        flush_status = avcodec_send_packet(decoder, NULL);
+    }
+    if (flush_status < 0 && flush_status != AVERROR_EOF) {
+        fprintf(stderr, "decoder flush failed: %d\n", flush_status);
+        goto cleanup;
+    }
+    if (receive_frames(decoder, vaapi_context->display, &decoded_frames) < 0)
+        goto cleanup;
+
+    if (decoded_frames > 0) {
+        printf("validated %llu decoded %dx%d frames with NV12 and separate-layer PRIME export\n",
+               decoded_frames, decoder->width, decoder->height);
         result = 0;
-    else
+    } else {
         fprintf(stderr, "decoder produced no VAAPI frame\n");
+    }
 
 cleanup:
     av_packet_free(&packet);

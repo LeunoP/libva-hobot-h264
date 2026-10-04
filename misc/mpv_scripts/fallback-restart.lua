@@ -25,8 +25,32 @@ local probe_target_time = 5.0
 local my_pid = mp.get_property_number("pid")
 local file_start_epoch = os.time()
 local is_switching = false
-local last_ipc_count = 0
+local last_ipc_sequence = 0
 local anomaly_threshold = 1
+local watchdog_path = my_pid and string.format("/dev/shm/hobot_va_watchdog.%d", my_pid) or nil
+
+local function clear_watchdog_ipc()
+    if watchdog_path then pcall(os.remove, watchdog_path) end
+end
+
+local function read_existing_watchdog_sequence()
+    if not watchdog_path then return nil end
+    local f = io.open(watchdog_path, "r")
+    if not f then return nil end
+    local line = f:read("*line")
+    f:close()
+    if not line then return nil end
+
+    local fpid, sequence = line:match(
+        "^(%d+)%s+%d+%s+%d+%s+%d+%s+%d+%s+(%d+)")
+    if fpid and my_pid and tonumber(fpid) == my_pid then
+        return tonumber(sequence)
+    end
+    return nil
+end
+
+-- Ignore a record left by an abruptly terminated mpv process if its PID was reused.
+last_ipc_sequence = read_existing_watchdog_sequence() or last_ipc_sequence
 
 local black_ov = mp.create_osd_overlay("ass-events")
 black_ov.res_x = 1920
@@ -89,9 +113,6 @@ local function on_hw_success()
     mp.msg.info("[fallback-restart] Rewinding to beginning (00:00:00) and revealing screen...")
 
     mp.commandv("seek", 0, "absolute", "exact")
-    pcall(os.remove, "/dev/shm/hobot_va_watchdog")
-    last_ipc_count = 0
-
     mp.add_timeout(0.2, function()
         black_ov:remove()
         mp.set_property_bool("mute", prev_mute)
@@ -120,23 +141,27 @@ local function handle_anomaly(reason, count)
 end
 
 local function check_watchdog_ipc()
-    if mp.get_property("hwdec") == "no" or is_switching then return end
-    local f = io.open("/dev/shm/hobot_va_watchdog", "r")
+    if mp.get_property("hwdec") == "no" or is_switching or not watchdog_path then return end
+    local f = io.open(watchdog_path, "r")
     if not f then return end
     local line = f:read("*line")
     f:close()
     if not line then return end
 
-    local fpid, count, ts, err_mb, total_mb = line:match("(%d+)%s+(%d+)%s+(%d+)%s+(%d+)%s+(%d+)")
+    local fpid, count, ts, err_mb, total_mb, sequence =
+        line:match("(%d+)%s+(%d+)%s+(%d+)%s+(%d+)%s+(%d+)%s+(%d+)")
     fpid = tonumber(fpid)
     count = tonumber(count)
     ts = tonumber(ts)
     err_mb = tonumber(err_mb)
     total_mb = tonumber(total_mb)
+    sequence = tonumber(sequence)
 
-    if fpid and my_pid and fpid == my_pid and ts and ts >= (file_start_epoch - 1) then
-        if count and count > last_ipc_count then
-            last_ipc_count = count
+    if fpid and my_pid and fpid == my_pid and ts and
+       ts >= (file_start_epoch - 1) and sequence and
+       sequence > last_ipc_sequence then
+        last_ipc_sequence = sequence
+        if count then
             local reason = string.format("Hobot-VA WatchDog (#%d, err_mb=%d/%d)", count, err_mb or 0, total_mb or 0)
             handle_anomaly(reason, count)
         end
@@ -163,9 +188,7 @@ mp.register_event("file-loaded", function()
 
     probing = true
     is_switching = false
-    last_ipc_count = 0
     file_start_epoch = os.time()
-    pcall(os.remove, "/dev/shm/hobot_va_watchdog")
 
     prev_mute = mp.get_property_native("mute") or false
     mp.set_property_bool("mute", true)
@@ -174,7 +197,7 @@ mp.register_event("file-loaded", function()
 end)
 
 mp.register_event("shutdown", function()
-    pcall(os.remove, "/dev/shm/hobot_va_watchdog")
+    clear_watchdog_ipc()
 end)
 
 mp.observe_property("time-pos", "number", function(name, pos)
