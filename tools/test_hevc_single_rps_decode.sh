@@ -3,8 +3,9 @@ set -euo pipefail
 
 ffmpeg_bin=${FFMPEG:-ffmpeg}
 ffprobe_bin=${FFPROBE:-ffprobe}
-drm_device=${HOBOT_DRM_DEVICE:-/dev/dri/card0}
+drm_device=${HOBOT_DRM_DEVICE:-/dev/dri/renderD128}
 driver_name=${LIBVA_DRIVER_NAME:-hobot}
+cycles=${HOBOT_HEVC_SINGLE_RPS_CYCLES:-5}
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 fixture="$script_dir/testdata/hevc_main_640x360_single_sps_rps_p32.hevc"
 
@@ -28,6 +29,15 @@ command -v "$ffprobe_bin" >/dev/null 2>&1 || {
     printf 'DRM device does not exist: %s\n' "$drm_device" >&2
     exit 2
 }
+if [[ ! "$cycles" =~ ^[0-9]+$ ]]; then
+    printf 'HOBOT_HEVC_SINGLE_RPS_CYCLES must be between 1 and 20\n' >&2
+    exit 2
+fi
+cycles=$((10#$cycles))
+if ((cycles < 1 || cycles > 20)); then
+    printf 'HOBOT_HEVC_SINGLE_RPS_CYCLES must be between 1 and 20\n' >&2
+    exit 2
+fi
 if [[ $# -gt 1 ]]; then
     printf 'usage: %s [new-output-directory]\n' "$0" >&2
     exit 2
@@ -45,7 +55,6 @@ fi
 
 trace_log="$output_dir/trace_headers.log"
 software_hashes="$output_dir/software.framemd5"
-hardware_hashes="$output_dir/hardware.framemd5"
 driver_env=("LIBVA_DRIVER_NAME=$driver_name")
 if [[ -n "${LIBVA_DRIVERS_PATH:-}" ]]; then
     driver_env+=("LIBVA_DRIVERS_PATH=$LIBVA_DRIVERS_PATH")
@@ -79,16 +88,21 @@ fi
 
 "$ffmpeg_bin" -hide_banner -loglevel error -f hevc -i "$fixture" \
     -map 0:v:0 -vf format=nv12 -f framemd5 "$software_hashes"
-env "${driver_env[@]}" "$ffmpeg_bin" -hide_banner -loglevel error \
-    -vaapi_device "$drm_device" -hwaccel vaapi -hwaccel_output_format vaapi \
-    -f hevc -i "$fixture" -map 0:v:0 \
-    -vf 'hwdownload,format=nv12' -f framemd5 "$hardware_hashes"
+for ((cycle = 1; cycle <= cycles; cycle++)); do
+    hardware_hashes="$output_dir/hardware-cycle-$cycle.framemd5"
+    env "${driver_env[@]}" "$ffmpeg_bin" -hide_banner -loglevel error \
+        -vaapi_device "$drm_device" -hwaccel vaapi -hwaccel_output_format vaapi \
+        -f hevc -i "$fixture" -map 0:v:0 \
+        -vf 'hwdownload,format=nv12' -f framemd5 "$hardware_hashes"
 
-if ! cmp -s "$software_hashes" "$hardware_hashes"; then
-    diff -u "$software_hashes" "$hardware_hashes" || true
-    printf 'single-SPS-RPS hardware output differs from software; artifacts: %s\n' \
-        "$output_dir" >&2
-    exit 1
-fi
-printf 'PASS: HEVC single-SPS-RPS P stream (640x360, 32 frames), bit-exact to software; artifacts: %s\n' \
-    "$output_dir"
+    if ! cmp -s "$software_hashes" "$hardware_hashes"; then
+        diff -u "$software_hashes" "$hardware_hashes" || true
+        printf 'single-SPS-RPS hardware output differs in cycle %s; artifacts: %s\n' \
+            "$cycle" "$output_dir" >&2
+        exit 1
+    fi
+    printf 'PASS: HEVC single-SPS-RPS cycle %02d/%02d, bit-exact to software\n' \
+        "$cycle" "$cycles"
+done
+printf 'PASS: HEVC single-SPS-RPS P stream (640x360, 32 frames, %s fresh sessions); artifacts: %s\n' \
+    "$cycles" "$output_dir"

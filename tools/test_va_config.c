@@ -23,6 +23,144 @@ VAStatus vaLockSurface(
 );
 VAStatus vaUnlockSurface(VADisplay dpy, VASurfaceID surface);
 
+static int supports_entrypoint(VADisplay dpy, VAProfile profile,
+                               VAEntrypoint required)
+{
+    int max_entrypoints = vaMaxNumEntrypoints(dpy);
+    VAEntrypoint *entrypoints = max_entrypoints > 0 ?
+        calloc((size_t)max_entrypoints, sizeof(*entrypoints)) : NULL;
+    if (!entrypoints)
+        return 0;
+
+    int count = 0;
+    VAStatus st = vaQueryConfigEntrypoints(dpy, profile, entrypoints, &count);
+    int found = st == VA_STATUS_SUCCESS && count >= 0 &&
+                count <= max_entrypoints;
+    int matched = 0;
+    for (int i = 0; found && i < count; i++)
+        matched |= entrypoints[i] == required;
+    free(entrypoints);
+    return found && matched;
+}
+
+static int check_advertised_matrix(VADisplay dpy)
+{
+    static const struct {
+        VAProfile profile;
+        VAEntrypoint entrypoints[2];
+        const char *name;
+    } expected[] = {
+        {VAProfileH264ConstrainedBaseline,
+         {VAEntrypointVLD, VAEntrypointEncSlice}, "H.264 Constrained Baseline"},
+        {VAProfileH264Main,
+         {VAEntrypointVLD, VAEntrypointEncSlice}, "H.264 Main"},
+        {VAProfileH264High,
+         {VAEntrypointVLD, VAEntrypointEncSlice}, "H.264 High"},
+        {VAProfileHEVCMain,
+         {VAEntrypointVLD, VAEntrypointEncSlice}, "HEVC Main"},
+        {VAProfileJPEGBaseline,
+         {VAEntrypointVLD, VAEntrypointEncPicture}, "JPEG Baseline"},
+    };
+    const size_t expected_count = sizeof(expected) / sizeof(expected[0]);
+    int max_profiles = vaMaxNumProfiles(dpy);
+    VAProfile *profiles = max_profiles > 0 ?
+        calloc((size_t)max_profiles, sizeof(*profiles)) : NULL;
+    if (!profiles) {
+        fprintf(stderr, "could not allocate advertised-profile list\n");
+        return 0;
+    }
+
+    int profile_count = 0;
+    VAStatus status = vaQueryConfigProfiles(dpy, profiles, &profile_count);
+    if (status != VA_STATUS_SUCCESS || profile_count < 0 ||
+        profile_count > max_profiles || (size_t)profile_count != expected_count) {
+        fprintf(stderr, "profile enumeration mismatch: status=%s count=%d expected=%zu\n",
+                vaErrorStr(status), profile_count, expected_count);
+        free(profiles);
+        return 0;
+    }
+
+    int profile_seen[5] = {0};
+    for (int i = 0; i < profile_count; i++) {
+        size_t matched = expected_count;
+        for (size_t j = 0; j < expected_count; j++) {
+            if (profiles[i] == expected[j].profile) {
+                matched = j;
+                break;
+            }
+        }
+        if (matched == expected_count || profile_seen[matched]++) {
+            fprintf(stderr, "unexpected or duplicate VA profile: %d\n", profiles[i]);
+            free(profiles);
+            return 0;
+        }
+    }
+    free(profiles);
+
+    int max_entrypoints = vaMaxNumEntrypoints(dpy);
+    VAEntrypoint *entrypoints = max_entrypoints > 0 ?
+        calloc((size_t)max_entrypoints, sizeof(*entrypoints)) : NULL;
+    if (!entrypoints) {
+        fprintf(stderr, "could not allocate advertised-entrypoint list\n");
+        return 0;
+    }
+    for (size_t i = 0; i < expected_count; i++) {
+        int count = 0;
+        status = vaQueryConfigEntrypoints(dpy, expected[i].profile,
+                                          entrypoints, &count);
+        if (status != VA_STATUS_SUCCESS || count != 2 || count > max_entrypoints) {
+            fprintf(stderr, "%s entrypoint enumeration mismatch: status=%s count=%d expected=2\n",
+                    expected[i].name, vaErrorStr(status), count);
+            free(entrypoints);
+            return 0;
+        }
+
+        int entrypoint_seen[2] = {0};
+        for (int j = 0; j < count; j++) {
+            int matched = -1;
+            for (int k = 0; k < 2; k++) {
+                if (entrypoints[j] == expected[i].entrypoints[k]) {
+                    matched = k;
+                    break;
+                }
+            }
+            if (matched < 0 || entrypoint_seen[matched]++) {
+                fprintf(stderr, "%s advertises an unexpected or duplicate entrypoint: %d\n",
+                        expected[i].name, entrypoints[j]);
+                free(entrypoints);
+                return 0;
+            }
+        }
+    }
+    free(entrypoints);
+    printf("VA capability matrix verified: %zu profiles and %zu profile-entrypoint pairs\n",
+           expected_count, expected_count * 2u);
+    return 1;
+}
+
+static int check_encoder_attributes(VADisplay dpy, VAProfile profile,
+                                    VAEntrypoint entrypoint,
+                                    VAConfigAttrib *attrs,
+                                    const unsigned int *expected,
+                                    size_t count, const char *label)
+{
+    VAStatus st = vaGetConfigAttributes(dpy, profile, entrypoint, attrs,
+                                        (int)count);
+    if (st != VA_STATUS_SUCCESS) {
+        fprintf(stderr, "%s vaGetConfigAttributes failed: %s\n",
+                label, vaErrorStr(st));
+        return 0;
+    }
+    for (size_t i = 0; i < count; i++) {
+        if (attrs[i].value != expected[i]) {
+            fprintf(stderr, "%s attribute %d mismatch: got=%u expected=%u\n",
+                    label, attrs[i].type, attrs[i].value, expected[i]);
+            return 0;
+        }
+    }
+    return 1;
+}
+
 static VAStatus query_surface_limits(VADisplay dpy, VAConfigID config,
                                      unsigned int *max_width,
                                      unsigned int *max_height,
@@ -57,9 +195,12 @@ static VAStatus query_surface_limits(VADisplay dpy, VAConfigID config,
 }
 
 int main(void) {
-    int fd = open("/dev/dri/card0", O_RDWR | O_CLOEXEC);
+    const char *device = getenv("HOBOT_DRM_DEVICE");
+    if (!device || !*device)
+        device = "/dev/dri/renderD128";
+    int fd = open(device, O_RDWR | O_CLOEXEC);
     if (fd < 0) {
-        perror("open /dev/dri/card0");
+        perror(device);
         return 1;
     }
 
@@ -75,6 +216,11 @@ int main(void) {
     VAStatus st = vaInitialize(dpy, &major, &minor);
     if (st != VA_STATUS_SUCCESS) {
         fprintf(stderr, "vaInitialize failed: %s\n", vaErrorStr(st));
+        close(fd);
+        return 1;
+    }
+    if (!check_advertised_matrix(dpy)) {
+        vaTerminate(dpy);
         close(fd);
         return 1;
     }
@@ -149,6 +295,232 @@ int main(void) {
         return 1;
     }
 
+    static const struct {
+        VAProfile profile;
+        VAEntrypoint entrypoint;
+        const char *name;
+    } encoder_entrypoints[] = {
+        {VAProfileH264ConstrainedBaseline, VAEntrypointVLD, "H.264 Constrained Baseline VLD"},
+        {VAProfileH264ConstrainedBaseline, VAEntrypointEncSlice, "H.264 Constrained Baseline"},
+        {VAProfileH264Main, VAEntrypointVLD, "H.264 Main VLD"},
+        {VAProfileH264Main, VAEntrypointEncSlice, "H.264 Main"},
+        {VAProfileH264High, VAEntrypointEncSlice, "H.264 High"},
+        {VAProfileHEVCMain, VAEntrypointEncSlice, "HEVC Main"},
+        {VAProfileJPEGBaseline, VAEntrypointVLD, "JPEG Baseline VLD"},
+        {VAProfileJPEGBaseline, VAEntrypointEncPicture, "JPEG Baseline"},
+    };
+    for (size_t i = 0; i < sizeof(encoder_entrypoints) / sizeof(encoder_entrypoints[0]); i++) {
+        if (!supports_entrypoint(dpy, encoder_entrypoints[i].profile,
+                                 encoder_entrypoints[i].entrypoint)) {
+            fprintf(stderr, "%s encoder entrypoint is missing\n",
+                    encoder_entrypoints[i].name);
+            vaTerminate(dpy);
+            close(fd);
+            return 1;
+        }
+    }
+
+    VAConfigAttrib h264_encoder_attrs[] = {
+        {.type = VAConfigAttribRTFormat},
+        {.type = VAConfigAttribRateControl},
+        {.type = VAConfigAttribEncPackedHeaders},
+        {.type = VAConfigAttribEncMaxRefFrames},
+        {.type = VAConfigAttribPredictionDirection},
+        {.type = VAConfigAttribEncMaxSlices},
+        {.type = VAConfigAttribEncSliceStructure},
+        {.type = VAConfigAttribEncQualityRange},
+        {.type = VAConfigAttribEncInterlaced},
+        {.type = VAConfigAttribEncQuantization},
+        {.type = VAConfigAttribEncIntraRefresh},
+        {.type = VAConfigAttribMaxPictureWidth},
+        {.type = VAConfigAttribMaxPictureHeight},
+    };
+    const unsigned int h264_encoder_expected[] = {
+        VA_RT_FORMAT_YUV420, VA_RC_CBR | VA_RC_VBR | VA_RC_CQP,
+        VA_ENC_PACKED_HEADER_NONE, 1,
+        VA_PREDICTION_DIRECTION_PREVIOUS, 1, VA_ATTRIB_NOT_SUPPORTED,
+        VA_ATTRIB_NOT_SUPPORTED, VA_ENC_INTERLACED_NONE,
+        VA_ENC_QUANTIZATION_NONE, VA_ENC_INTRA_REFRESH_NONE, 4096, 4096,
+    };
+    static const VAProfile h264_encoder_profiles[] = {
+        VAProfileH264ConstrainedBaseline, VAProfileH264Main, VAProfileH264High
+    };
+    static const char *h264_encoder_names[] = {
+        "H.264 Constrained Baseline EncSlice", "H.264 Main EncSlice",
+        "H.264 High EncSlice"
+    };
+    for (size_t i = 0;
+         i < sizeof(h264_encoder_profiles) / sizeof(h264_encoder_profiles[0]); i++) {
+        if (!check_encoder_attributes(dpy, h264_encoder_profiles[i],
+                                      VAEntrypointEncSlice, h264_encoder_attrs,
+                                      h264_encoder_expected,
+                                      sizeof(h264_encoder_expected) /
+                                          sizeof(h264_encoder_expected[0]),
+                                      h264_encoder_names[i])) {
+            vaTerminate(dpy);
+            close(fd);
+            return 1;
+        }
+    }
+
+    VAConfigAttrib vbr_attributes[] = {
+        { .type = VAConfigAttribRTFormat, .value = VA_RT_FORMAT_YUV420 },
+        { .type = VAConfigAttribRateControl, .value = VA_RC_VBR },
+    };
+    for (size_t i = 0;
+         i < sizeof(h264_encoder_profiles) / sizeof(h264_encoder_profiles[0]); i++) {
+        VAConfigID vbr_config = VA_INVALID_ID;
+        st = vaCreateConfig(dpy, h264_encoder_profiles[i],
+                            VAEntrypointEncSlice, vbr_attributes,
+                            sizeof(vbr_attributes) / sizeof(vbr_attributes[0]),
+                            &vbr_config);
+        if (st != VA_STATUS_SUCCESS) {
+            fprintf(stderr, "%s VBR config creation failed: %s\n",
+                    h264_encoder_names[i], vaErrorStr(st));
+            vaTerminate(dpy);
+            close(fd);
+            return 1;
+        }
+        st = vaDestroyConfig(dpy, vbr_config);
+        if (st != VA_STATUS_SUCCESS) {
+            fprintf(stderr, "%s VBR config destruction failed: %s\n",
+                    h264_encoder_names[i], vaErrorStr(st));
+            vaTerminate(dpy);
+            close(fd);
+            return 1;
+        }
+    }
+
+    VAConfigAttrib cqp_attributes[] = {
+        { .type = VAConfigAttribRTFormat, .value = VA_RT_FORMAT_YUV420 },
+        { .type = VAConfigAttribRateControl, .value = VA_RC_CQP },
+    };
+    for (size_t i = 0;
+         i < sizeof(h264_encoder_profiles) / sizeof(h264_encoder_profiles[0]); i++) {
+        VAConfigID cqp_config = VA_INVALID_ID;
+        st = vaCreateConfig(dpy, h264_encoder_profiles[i], VAEntrypointEncSlice,
+                            cqp_attributes,
+                            sizeof(cqp_attributes) / sizeof(cqp_attributes[0]),
+                            &cqp_config);
+        if (st != VA_STATUS_SUCCESS) {
+            fprintf(stderr, "%s CQP config creation failed: %s\n",
+                    h264_encoder_names[i], vaErrorStr(st));
+            vaTerminate(dpy);
+            close(fd);
+            return 1;
+        }
+        st = vaDestroyConfig(dpy, cqp_config);
+        if (st != VA_STATUS_SUCCESS) {
+            fprintf(stderr, "%s CQP config destruction failed: %s\n",
+                    h264_encoder_names[i], vaErrorStr(st));
+            vaTerminate(dpy);
+            close(fd);
+            return 1;
+        }
+    }
+
+    VAConfigAttrib hevc_encoder_attrs[] = {
+        {.type = VAConfigAttribRTFormat},
+        {.type = VAConfigAttribRateControl},
+        {.type = VAConfigAttribEncPackedHeaders},
+        {.type = VAConfigAttribEncMaxRefFrames},
+        {.type = VAConfigAttribPredictionDirection},
+        {.type = VAConfigAttribEncMaxSlices},
+        {.type = VAConfigAttribEncSliceStructure},
+        {.type = VAConfigAttribEncQualityRange},
+        {.type = VAConfigAttribEncInterlaced},
+        {.type = VAConfigAttribEncQuantization},
+        {.type = VAConfigAttribEncIntraRefresh},
+        {.type = VAConfigAttribMaxPictureWidth},
+        {.type = VAConfigAttribMaxPictureHeight},
+    };
+    const unsigned int hevc_encoder_expected[] = {
+        VA_RT_FORMAT_YUV420, VA_RC_CBR | VA_RC_VBR | VA_RC_CQP,
+        VA_ENC_PACKED_HEADER_NONE, 1,
+        VA_PREDICTION_DIRECTION_PREVIOUS, 1, VA_ATTRIB_NOT_SUPPORTED,
+        VA_ATTRIB_NOT_SUPPORTED, VA_ENC_INTERLACED_NONE,
+        VA_ENC_QUANTIZATION_NONE, VA_ENC_INTRA_REFRESH_NONE, 3840, 2160,
+    };
+    if (!check_encoder_attributes(dpy, VAProfileHEVCMain,
+                                  VAEntrypointEncSlice, hevc_encoder_attrs,
+                                  hevc_encoder_expected,
+                                  sizeof(hevc_encoder_expected) /
+                                      sizeof(hevc_encoder_expected[0]),
+                                  "HEVC Main EncSlice")) {
+        vaTerminate(dpy);
+        close(fd);
+        return 1;
+    }
+    VAConfigID hevc_cqp_config = VA_INVALID_ID;
+    st = vaCreateConfig(dpy, VAProfileHEVCMain, VAEntrypointEncSlice,
+                        cqp_attributes,
+                        sizeof(cqp_attributes) / sizeof(cqp_attributes[0]),
+                        &hevc_cqp_config);
+    if (st != VA_STATUS_SUCCESS) {
+        fprintf(stderr, "HEVC Main CQP config creation failed: %s\n",
+                vaErrorStr(st));
+        vaTerminate(dpy);
+        close(fd);
+        return 1;
+    }
+    st = vaDestroyConfig(dpy, hevc_cqp_config);
+    if (st != VA_STATUS_SUCCESS) {
+        fprintf(stderr, "HEVC Main CQP config destruction failed: %s\n",
+                vaErrorStr(st));
+        vaTerminate(dpy);
+        close(fd);
+        return 1;
+    }
+    VAConfigID hevc_vbr_config = VA_INVALID_ID;
+    st = vaCreateConfig(dpy, VAProfileHEVCMain, VAEntrypointEncSlice,
+                        vbr_attributes,
+                        sizeof(vbr_attributes) / sizeof(vbr_attributes[0]),
+                        &hevc_vbr_config);
+    if (st != VA_STATUS_SUCCESS) {
+        fprintf(stderr, "HEVC Main VBR config creation failed: %s\n",
+                vaErrorStr(st));
+        vaTerminate(dpy);
+        close(fd);
+        return 1;
+    }
+    st = vaDestroyConfig(dpy, hevc_vbr_config);
+    if (st != VA_STATUS_SUCCESS) {
+        fprintf(stderr, "HEVC Main VBR config destruction failed: %s\n",
+                vaErrorStr(st));
+        vaTerminate(dpy);
+        close(fd);
+        return 1;
+    }
+
+    VAConfigAttrib jpeg_encoder_attrs[] = {
+        {.type = VAConfigAttribRTFormat},
+        {.type = VAConfigAttribRateControl},
+        {.type = VAConfigAttribEncPackedHeaders},
+        {.type = VAConfigAttribEncMaxRefFrames},
+        {.type = VAConfigAttribPredictionDirection},
+        {.type = VAConfigAttribEncMaxSlices},
+        {.type = VAConfigAttribEncInterlaced},
+        {.type = VAConfigAttribEncQuantization},
+        {.type = VAConfigAttribEncIntraRefresh},
+    };
+    const unsigned int jpeg_encoder_expected[] = {
+        VA_RT_FORMAT_YUV420, VA_RC_CQP, VA_ENC_PACKED_HEADER_NONE,
+        VA_ATTRIB_NOT_SUPPORTED, VA_ATTRIB_NOT_SUPPORTED,
+        VA_ATTRIB_NOT_SUPPORTED, VA_ENC_INTERLACED_NONE,
+        VA_ENC_QUANTIZATION_NONE, VA_ENC_INTRA_REFRESH_NONE,
+    };
+    if (!check_encoder_attributes(dpy, VAProfileJPEGBaseline,
+                                  VAEntrypointEncPicture, jpeg_encoder_attrs,
+                                  jpeg_encoder_expected,
+                                  sizeof(jpeg_encoder_expected) /
+                                      sizeof(jpeg_encoder_expected[0]),
+                                  "JPEG Baseline EncPicture")) {
+        vaTerminate(dpy);
+        close(fd);
+        return 1;
+    }
+    printf("Encoder capabilities: H.264 Constrained Baseline/Main/High CBR/VBR/CQP, HEVC Main CBR/VBR/CQP, and JPEG Baseline verified\n");
+
     VAConfigAttrib capabilities[] = {
         { .type = VAConfigAttribRTFormat },
         { .type = VAConfigAttribMaxPictureWidth },
@@ -179,8 +551,8 @@ int main(void) {
                                    sizeof(hevc_capabilities[0]));
     if (st != VA_STATUS_SUCCESS ||
         hevc_capabilities[0].value != VA_RT_FORMAT_YUV420 ||
-        hevc_capabilities[1].value != 3840 ||
-        hevc_capabilities[2].value != 2160) {
+        hevc_capabilities[1].value != 8192 ||
+        hevc_capabilities[2].value != 4096) {
         fprintf(stderr, "vaGetConfigAttributes returned unexpected HEVC Main VLD capabilities: status=%s rt=%u max=%ux%u\n",
                 vaErrorStr(st), hevc_capabilities[0].value,
                 hevc_capabilities[1].value, hevc_capabilities[2].value);
@@ -210,8 +582,8 @@ int main(void) {
                               &hevc_surface_height,
                               &hevc_surface_attr_count);
     VAStatus hevc_destroy_status = vaDestroyConfig(dpy, hevc_config);
-    if (st != VA_STATUS_SUCCESS || hevc_surface_width != 3840 ||
-        hevc_surface_height != 2160 ||
+    if (st != VA_STATUS_SUCCESS || hevc_surface_width != 8192 ||
+        hevc_surface_height != 4096 ||
         hevc_destroy_status != VA_STATUS_SUCCESS) {
         fprintf(stderr, "HEVC Main surface limits mismatch: status=%s max=%ux%u attrs=%u\n",
                 vaErrorStr(st), hevc_surface_width, hevc_surface_height,
@@ -339,6 +711,15 @@ int main(void) {
     }
     printf("vaLockSurface: success, fourcc=NV12, stride=%u, chroma_offset=%u, buffer=%p\n",
            luma_stride, chroma_offset, mapped);
+    st = vaUnlockSurface(dpy, surface);
+    if (st != VA_STATUS_SUCCESS) {
+        fprintf(stderr, "vaUnlockSurface failed before export: %s\n", vaErrorStr(st));
+        vaDestroySurfaces(dpy, &surface, 1);
+        vaDestroyConfig(dpy, config);
+        vaTerminate(dpy);
+        close(fd);
+        return 1;
+    }
 
     VADRMPRIMESurfaceDescriptor prime = {0};
     st = vaExportSurfaceHandle(dpy, surface, VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2,
@@ -433,7 +814,6 @@ int main(void) {
     for (uint32_t i = 0; i < composed.num_objects; i++)
         close(composed.objects[i].fd);
 
-    vaUnlockSurface(dpy, surface);
     vaDestroySurfaces(dpy, &surface, 1);
 
     VAStatus destroy_st = vaDestroyConfig(dpy, config);

@@ -77,7 +77,7 @@ int main(int argc, char **argv)
 
     const char *device_path = getenv("HOBOT_DRM_DEVICE");
     if (!device_path || !*device_path)
-        device_path = "/dev/dri/card0";
+        device_path = "/dev/dri/renderD128";
     int drm_fd = open(device_path, O_RDWR | O_CLOEXEC);
     if (drm_fd < 0) {
         perror("open DRM device");
@@ -205,6 +205,18 @@ int main(int argc, char **argv)
     status = vaEndPicture(display, context);
     if (status != VA_STATUS_SUCCESS) {
         fprintf(stderr, "vaEndPicture failed: %s\n", vaErrorStr(status));
+        goto cleanup;
+    }
+    status = vaSyncBuffer(display, coded_buffer, 0);
+    if (status != VA_STATUS_SUCCESS) {
+        fprintf(stderr, "ready coded buffer zero-timeout sync failed: %s\n",
+                vaErrorStr(status));
+        goto cleanup;
+    }
+    status = vaSyncBuffer(display, coded_buffer, VA_TIMEOUT_INFINITE);
+    if (status != VA_STATUS_SUCCESS) {
+        fprintf(stderr, "coded buffer infinite-timeout sync failed: %s\n",
+                vaErrorStr(status));
         goto cleanup;
     }
 

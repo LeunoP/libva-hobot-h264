@@ -3,7 +3,7 @@ set -euo pipefail
 
 ffmpeg_bin=${FFMPEG:-ffmpeg}
 ffprobe_bin=${FFPROBE:-ffprobe}
-drm_device=${HOBOT_DRM_DEVICE:-/dev/dri/card0}
+drm_device=${HOBOT_DRM_DEVICE:-/dev/dri/renderD128}
 driver_name=${LIBVA_DRIVER_NAME:-hobot}
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 fixture="$script_dir/testdata/hevc_main_640x360_two_slices_idr_p_p.hevc"

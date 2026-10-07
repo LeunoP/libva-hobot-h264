@@ -3,7 +3,7 @@ set -euo pipefail
 
 ffmpeg_bin=${FFMPEG:-ffmpeg}
 ffprobe_bin=${FFPROBE:-ffprobe}
-drm_device=${HOBOT_DRM_DEVICE:-/dev/dri/card0}
+drm_device=${HOBOT_DRM_DEVICE:-/dev/dri/renderD128}
 driver_name=${LIBVA_DRIVER_NAME:-hobot}
 width=${HOBOT_HEVC_ENCODE_WIDTH:-640}
 height=${HOBOT_HEVC_ENCODE_HEIGHT:-360}
@@ -12,6 +12,8 @@ frames=${HOBOT_HEVC_ENCODE_FRAMES:-64}
 level=${HOBOT_HEVC_ENCODE_LEVEL:-4.1}
 bitrate=${HOBOT_HEVC_ENCODE_BITRATE:-4M}
 bufsize=${HOBOT_HEVC_ENCODE_BUFSIZE:-8M}
+rate_control=${HOBOT_HEVC_ENCODE_RC_MODE:-CBR}
+qp=${HOBOT_HEVC_ENCODE_QP:-26}
 
 command -v "$ffmpeg_bin" >/dev/null 2>&1 || {
     printf 'missing ffmpeg: %s\n' "$ffmpeg_bin" >&2
@@ -34,6 +36,14 @@ command -v "$ffprobe_bin" >/dev/null 2>&1 || {
     printf 'width, height, rate and frame count must be positive integers\n' >&2
     exit 2
 }
+if [[ "$rate_control" != CBR && "$rate_control" != VBR && "$rate_control" != CQP ]]; then
+    printf 'HOBOT_HEVC_ENCODE_RC_MODE must be CBR, VBR or CQP\n' >&2
+    exit 2
+fi
+if [[ ! "$qp" =~ ^([1-9]|[1-4][0-9]|5[01])$ ]]; then
+    printf 'HOBOT_HEVC_ENCODE_QP must be in [1, 51]; use the direct VA test for QP 0\n' >&2
+    exit 2
+fi
 if [[ $# -gt 1 ]]; then
     printf 'usage: %s [new-output-directory]\n' "$0" >&2
     exit 2
@@ -74,11 +84,19 @@ if [[ -n "${LIBVA_TRACE:-}" ]]; then
     driver_env+=("LIBVA_TRACE=$LIBVA_TRACE")
 fi
 
+if [[ "$rate_control" == CBR ]]; then
+    rate_control_args=(-rc_mode CBR -b:v "$bitrate" -maxrate "$bitrate" -bufsize "$bufsize")
+elif [[ "$rate_control" == VBR ]]; then
+    rate_control_args=(-rc_mode VBR -b:v "$bitrate" -maxrate "${HOBOT_HEVC_ENCODE_MAX_BITRATE:-8M}" -bufsize "$bufsize")
+else
+    rate_control_args=(-rc_mode CQP -qp "$qp")
+fi
+
 env "${driver_env[@]}" "$ffmpeg_bin" -hide_banner -loglevel error -y \
     -vaapi_device "$drm_device" -f lavfi \
     -i "testsrc2=size=${width}x${height}:rate=${rate}" \
     -vf 'format=nv12,hwupload' -c:v hevc_vaapi -profile:v main -level:v "$level" \
-    -b:v "$bitrate" -maxrate "$bitrate" -bufsize "$bufsize" -g 30 -bf 0 \
+    "${rate_control_args[@]}" -g 30 -bf 0 \
     -frames:v "$frames" "$clip"
 
 probe_stream_field() {
@@ -132,6 +150,19 @@ if ! awk '/sample_adaptive_offset_enabled_flag[[:space:]]/ {
         "$header_log" >&2
     exit 1
 fi
+if [[ "$rate_control" == CQP ]] &&
+   ! awk -v expected="$qp" '
+        /init_qp_minus26[[:space:]]/ { base_qp = $NF + 26 }
+        /slice_qp_delta[[:space:]]/ {
+            if (base_qp + $NF != expected) invalid = 1
+            slices++
+        }
+        END { exit (invalid || slices == 0) }
+    ' "$header_log"; then
+    printf 'HEVC CQP output did not preserve requested QP %s; see %s\n' \
+        "$qp" "$header_log" >&2
+    exit 1
+fi
 if (( actual_coded_width != actual_width || actual_coded_height != actual_height )); then
     expected_right_offset=$(((actual_coded_width - actual_width) / 2))
     expected_bottom_offset=$(((actual_coded_height - actual_height) / 2))
@@ -175,5 +206,6 @@ if ! diff -u "$software_hashes" "$hardware_hashes"; then
     exit 1
 fi
 
-printf 'PASS: HEVC Main L%s %sx%s %sfps, %s no-B frames; hardware re-decode bit-exact to software; artifacts: %s\n' \
-    "$level" "$width" "$height" "$rate" "$frames" "$output_dir"
+printf 'PASS: HEVC Main L%s %sx%s %sfps, %s %s frames QP=%s; hardware re-decode bit-exact to software; artifacts: %s\n' \
+    "$level" "$width" "$height" "$rate" "$frames" "$rate_control" \
+    "${qp:--}" "$output_dir"

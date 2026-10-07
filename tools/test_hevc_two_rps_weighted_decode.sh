@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ffmpeg_bin=${FFMPEG:-ffmpeg}
-drm_device=${HOBOT_DRM_DEVICE:-/dev/dri/card0}
+drm_device=${HOBOT_DRM_DEVICE:-/dev/dri/renderD128}
 driver_name=${LIBVA_DRIVER_NAME:-hobot}
 cycles=${HOBOT_HEVC_TWO_RPS_WEIGHTED_CYCLES:-5}
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)

@@ -3,7 +3,7 @@ set -euo pipefail
 
 ffmpeg_bin=${FFMPEG:-ffmpeg}
 ffprobe_bin=${FFPROBE:-ffprobe}
-drm_device=${HOBOT_DRM_DEVICE:-/dev/dri/card0}
+drm_device=${HOBOT_DRM_DEVICE:-/dev/dri/renderD128}
 driver_name=${LIBVA_DRIVER_NAME:-hobot}
 
 command -v "$ffmpeg_bin" >/dev/null 2>&1 || {
@@ -49,8 +49,15 @@ fi
 run_case() {
     local name=$1 frames=$2 rate=$3 bframes=$4 x265_params=$5 width=$6 height=$7
     local level=${8:-4.1}
+    local decode_cycles=${9:-1}
+    local expected_refs=${10:-0}
+    local cycle
     local expected_level_idc=123
     local required_level_idc=0
+    if [[ ! "$decode_cycles" =~ ^[1-9][0-9]*$ ]]; then
+        printf 'invalid decode cycle count for %s: %s\n' "$name" "$decode_cycles" >&2
+        exit 2
+    fi
     if [[ "$level" == 5.0 ]]; then
         expected_level_idc=150
         if [[ "$width" == 1920 && "$height" == 1080 && "$rate" == 60 ]]; then
@@ -61,13 +68,18 @@ run_case() {
         if [[ "$width" == 3840 && "$height" == 2160 && "$rate" == 60 ]]; then
             required_level_idc=153
         fi
+    elif [[ "$level" == 6.0 ]]; then
+        expected_level_idc=180
+        if [[ "$width" == 8192 && "$height" == 4096 ]]; then
+            required_level_idc=180
+        fi
     elif [[ "$level" != 4.1 ]]; then
         printf 'unsupported test level: %s\n' "$level" >&2
         exit 2
     fi
     local clip="$output_dir/hevc-main-$name.mp4"
     local software_hashes="$output_dir/$name-software.framemd5"
-    local hardware_hashes="$output_dir/$name-hardware.framemd5"
+    local hardware_hashes
     local params_with_level="${x265_params}:level-idc=${level}"
 
     "$ffmpeg_bin" -hide_banner -loglevel error -y \
@@ -108,20 +120,49 @@ run_case() {
         exit 1
     fi
 
+    if ((expected_refs > 0)); then
+        local expected_ref_minus1=$((expected_refs - 1))
+        local header_trace
+        header_trace=$("$ffmpeg_bin" -hide_banner -loglevel trace -i "$clip" \
+            -c:v copy -bsf:v trace_headers -f null - 2>&1)
+        if ! grep -Eq "sps_max_dec_pic_buffering_minus1\\[0\\][[:space:]]+.*= ${expected_refs}$" \
+            <<<"$header_trace" || \
+           ! grep -Eq "num_negative_pics[[:space:]]+.*= ${expected_refs}$" \
+            <<<"$header_trace" || \
+           ! grep -Eq "num_ref_idx_l0_active_minus1[[:space:]]+.*= ${expected_ref_minus1}$" \
+            <<<"$header_trace"; then
+            printf '%s HEVC stream did not contain the expected DPB/RPS/L0 reference counts (%s)\n' \
+                "$name" "$expected_refs" >&2
+            exit 1
+        fi
+    fi
+
     "$ffmpeg_bin" -hide_banner -loglevel error -i "$clip" -map 0:v:0 \
         -vf format=nv12 -f framemd5 "$software_hashes"
-    env "${driver_env[@]}" "$ffmpeg_bin" -hide_banner -loglevel error \
-        -vaapi_device "$drm_device" -hwaccel vaapi -hwaccel_output_format vaapi \
-        -i "$clip" -map 0:v:0 -vf 'hwdownload,format=nv12' \
-        -f framemd5 "$hardware_hashes"
+    for ((cycle = 1; cycle <= decode_cycles; cycle++)); do
+        hardware_hashes="$output_dir/$name-hardware.framemd5"
+        if ((decode_cycles > 1)); then
+            hardware_hashes="$output_dir/$name-hardware-cycle-$cycle.framemd5"
+        fi
+        env "${driver_env[@]}" "$ffmpeg_bin" -hide_banner -loglevel error \
+            -vaapi_device "$drm_device" -hwaccel vaapi -hwaccel_output_format vaapi \
+            -i "$clip" -map 0:v:0 -vf 'hwdownload,format=nv12' \
+            -f framemd5 "$hardware_hashes"
 
-    if ! diff -u "$software_hashes" "$hardware_hashes"; then
-        printf '%s HEVC Main output differs from software; artifacts: %s\n' \
-            "$name" "$output_dir" >&2
-        exit 1
-    fi
-    printf 'PASS: HEVC Main %s %sx%s (%s frames, max consecutive B=%s), bit-exact to software\n' \
-        "$name" "$width" "$height" "$frame_count" "$max_b_run"
+        if ! diff -u "$software_hashes" "$hardware_hashes"; then
+            printf '%s HEVC Main cycle %s/%s differs from software; artifacts: %s\n' \
+                "$name" "$cycle" "$decode_cycles" "$output_dir" >&2
+            exit 1
+        fi
+    done
+    printf 'PASS: HEVC Main %s %sx%s (%s frame(s), %s cycle(s), max consecutive B=%s), bit-exact to software\n' \
+        "$name" "$width" "$height" "$frame_count" "$decode_cycles" "$max_b_run"
+}
+
+run_ref8_case() {
+    run_case ref8 64 30 0 \
+        'log-level=error:pools=none:frame-threads=1:wpp=0:bframes=0:ref=8:sao=0:weightp=0:weightb=0:temporal-mvp=0:strong-intra-smoothing=0:keyint=64:min-keyint=64:scenecut=0:open-gop=0' \
+        640 360 4.1 "${HOBOT_HEVC_REF8_CYCLES:-5}" 8
 }
 
 run_weighted_p_case() {
@@ -227,11 +268,25 @@ if [[ "${HOBOT_HEVC_WEIGHTED_P_ONLY:-0}" == 1 ]]; then
     exit 0
 fi
 
+if [[ "${HOBOT_HEVC_REF8_ONLY:-0}" == 1 ]]; then
+    run_ref8_case
+    exit 0
+fi
+
+if [[ "${HOBOT_HEVC_8K_ONLY:-0}" == 1 ]]; then
+    run_case max_8k 2 1 0 \
+        'log-level=error:pools=none:frame-threads=1:wpp=0:bframes=0:ref=1:keyint=2:min-keyint=2:scenecut=0:open-gop=0' \
+        8192 4096 6.0 "${HOBOT_HEVC_8K_CYCLES:-5}"
+    exit 0
+fi
+
 run_case p 30 30 0 'log-level=error:bframes=0:keyint=32:min-keyint=32:scenecut=0:open-gop=0' 640 360
+run_ref8_case
 run_case b3 64 60 3 'log-level=error:bframes=3:b-adapt=0:keyint=32:min-keyint=32:scenecut=0:open-gop=0' 1280 720
 run_case b6 64 60 6 'log-level=error:bframes=6:b-adapt=0:rc-lookahead=10:keyint=32:min-keyint=32:scenecut=0:open-gop=0' 1280 720
 run_case b6_1080p 64 60 6 'log-level=error:bframes=6:b-adapt=0:rc-lookahead=10:keyint=32:min-keyint=32:scenecut=0:open-gop=0' 1920 1080 5.0
 run_case b3_4k60 16 60 3 'log-level=error:bframes=3:b-adapt=0:rc-lookahead=10:keyint=32:min-keyint=32:scenecut=0:open-gop=0' 3840 2160 5.1
+run_case max_8k 2 1 0 'log-level=error:pools=none:frame-threads=1:wpp=0:bframes=0:ref=1:keyint=2:min-keyint=2:scenecut=0:open-gop=0' 8192 4096 6.0 "${HOBOT_HEVC_8K_CYCLES:-5}"
 run_weighted_p_case
 run_weighted_b_case
 

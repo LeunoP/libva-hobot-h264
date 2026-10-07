@@ -1,6 +1,9 @@
 #define _GNU_SOURCE
 #include <stdint.h>
+#include <fcntl.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <va/va.h>
@@ -12,6 +15,7 @@
 #include <libavutil/hwcontext.h>
 #include <libavutil/hwcontext_vaapi.h>
 #include <libavutil/pixdesc.h>
+#include <errno.h>
 
 static enum AVPixelFormat get_vaapi_format(AVCodecContext *context,
                                             const enum AVPixelFormat *formats)
@@ -76,8 +80,51 @@ static int check_export(VADisplay display, VASurfaceID surface, int separate_lay
     return 0;
 }
 
+static int check_buffer_handle(VADisplay display, VASurfaceID surface)
+{
+    VAImage image = {0};
+    image.image_id = VA_INVALID_ID;
+    VAStatus status = vaDeriveImage(display, surface, &image);
+    if (status != VA_STATUS_SUCCESS) {
+        fprintf(stderr, "vaDeriveImage failed before handle acquire: status=%d\n",
+                status);
+        return -1;
+    }
+
+    VABufferInfo info = {0};
+    info.mem_type = VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME;
+    status = vaAcquireBufferHandle(display, image.buf, &info);
+    int acquired = status == VA_STATUS_SUCCESS;
+    int valid = acquired && info.handle <= INT32_MAX &&
+                info.type == VAImageBufferType &&
+                info.mem_type == VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME &&
+                info.mem_size >= image.data_size;
+    if (valid) {
+        struct stat st;
+        valid = fstat((int)info.handle, &st) == 0 &&
+                vaSyncSurface(display, surface) == VA_STATUS_ERROR_SURFACE_BUSY;
+    }
+    if (acquired) {
+        int handle = (int)info.handle;
+        VAStatus release_status = vaReleaseBufferHandle(display, image.buf);
+        valid = valid && release_status == VA_STATUS_SUCCESS &&
+                fcntl(handle, F_GETFD) == -1 && errno == EBADF;
+        if (release_status != VA_STATUS_SUCCESS)
+            fprintf(stderr, "vaReleaseBufferHandle failed: status=%d\n",
+                    release_status);
+    }
+
+    VAStatus destroy_status = vaDestroyImage(display, image.image_id);
+    valid = valid && destroy_status == VA_STATUS_SUCCESS;
+    if (!valid)
+        fprintf(stderr, "DRM PRIME buffer-handle lifecycle failed: acquire=%d\n",
+                status);
+    return valid ? 0 : -1;
+}
+
 static int receive_frames(AVCodecContext *decoder, VADisplay display,
-                          unsigned long long *decoded_frames)
+                          unsigned long long *decoded_frames,
+                          unsigned long long *sync_timeouts)
 {
     AVFrame *frame = av_frame_alloc();
     if (!frame)
@@ -94,8 +141,13 @@ static int receive_frames(AVCodecContext *decoder, VADisplay display,
         }
 
         VASurfaceID surface = (VASurfaceID)(uintptr_t)frame->data[3];
-        status = vaSyncSurface(display, surface);
+        status = vaSyncSurface2(display, surface, 1000000ULL);
+        if (status == VA_STATUS_ERROR_TIMEDOUT) {
+            (*sync_timeouts)++;
+            status = vaSyncSurface2(display, surface, VA_TIMEOUT_INFINITE);
+        }
         if (status != VA_STATUS_SUCCESS) {
+            fprintf(stderr, "surface synchronization failed: status=%d\n", status);
             result = AVERROR_EXTERNAL;
             break;
         }
@@ -113,7 +165,8 @@ static int receive_frames(AVCodecContext *decoder, VADisplay display,
                                         (uintptr_t)info.virt_addr[0]));
         }
         if (check_export(display, surface, 1) != 0 ||
-            check_export(display, surface, 0) != 0) {
+            check_export(display, surface, 0) != 0 ||
+            check_buffer_handle(display, surface) != 0) {
             result = AVERROR_EXTERNAL;
             break;
         }
@@ -136,8 +189,12 @@ int main(int argc, char **argv)
     AVPacket *packet = NULL;
     int result = 1;
     unsigned long long decoded_frames = 0;
+    unsigned long long sync_timeouts = 0;
     int video_stream = -1;
     int read_status;
+    const char *drm_device = getenv("HOBOT_DRM_DEVICE");
+    if (!drm_device || !*drm_device)
+        drm_device = "/dev/dri/renderD128";
 
     if (avformat_open_input(&format, path, NULL, NULL) < 0 ||
         avformat_find_stream_info(format, NULL) < 0) {
@@ -154,7 +211,7 @@ int main(int argc, char **argv)
     decoder = avcodec_alloc_context3(codec);
     if (!codec || !decoder ||
         avcodec_parameters_to_context(decoder, format->streams[video_stream]->codecpar) < 0 ||
-        av_hwdevice_ctx_create(&device, AV_HWDEVICE_TYPE_VAAPI, "/dev/dri/card0", NULL, 0) < 0) {
+        av_hwdevice_ctx_create(&device, AV_HWDEVICE_TYPE_VAAPI, drm_device, NULL, 0) < 0) {
         fprintf(stderr, "could not initialize VAAPI decoder\n");
         goto cleanup;
     }
@@ -178,12 +235,13 @@ int main(int argc, char **argv)
             int status = avcodec_send_packet(decoder, packet);
             if (status == AVERROR(EAGAIN)) {
                 if (receive_frames(decoder, vaapi_context->display,
-                                   &decoded_frames) < 0)
+                                   &decoded_frames, &sync_timeouts) < 0)
                     goto cleanup;
                 status = avcodec_send_packet(decoder, packet);
             }
             if (status < 0 || receive_frames(decoder, vaapi_context->display,
-                                             &decoded_frames) < 0) {
+                                             &decoded_frames,
+                                             &sync_timeouts) < 0) {
                 fprintf(stderr, "hardware decode or PRIME validation failed\n");
                 goto cleanup;
             }
@@ -198,7 +256,8 @@ int main(int argc, char **argv)
 
     int flush_status = avcodec_send_packet(decoder, NULL);
     if (flush_status == AVERROR(EAGAIN)) {
-        if (receive_frames(decoder, vaapi_context->display, &decoded_frames) < 0)
+        if (receive_frames(decoder, vaapi_context->display, &decoded_frames,
+                           &sync_timeouts) < 0)
             goto cleanup;
         flush_status = avcodec_send_packet(decoder, NULL);
     }
@@ -206,12 +265,13 @@ int main(int argc, char **argv)
         fprintf(stderr, "decoder flush failed: %d\n", flush_status);
         goto cleanup;
     }
-    if (receive_frames(decoder, vaapi_context->display, &decoded_frames) < 0)
+    if (receive_frames(decoder, vaapi_context->display, &decoded_frames,
+                       &sync_timeouts) < 0)
         goto cleanup;
 
     if (decoded_frames > 0) {
-        printf("validated %llu decoded %dx%d frames with NV12 and separate-layer PRIME export\n",
-               decoded_frames, decoder->width, decoder->height);
+        printf("validated %llu decoded %dx%d frames with timed sync, PRIME exports, and DRM buffer-handle acquire/release (%llu timeouts retried)\n",
+               decoded_frames, decoder->width, decoder->height, sync_timeouts);
         result = 0;
     } else {
         fprintf(stderr, "decoder produced no VAAPI frame\n");

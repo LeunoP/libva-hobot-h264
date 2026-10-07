@@ -80,14 +80,40 @@ static int write_visible_nv12(void *mapping,
 
 int main(int argc, char **argv)
 {
-    if (argc != 3) {
-        fprintf(stderr, "usage: %s OUTPUT.h264 REFERENCE.nv12\n", argv[0]);
+    if (argc < 3 || argc > 5) {
+        fprintf(stderr, "usage: %s OUTPUT.h264 REFERENCE.nv12 [constrained-baseline|main|high] [cqp-qp]\n",
+                argv[0]);
         return 2;
+    }
+
+    const char *profile_name = argc >= 4 ? argv[3] : "high";
+    VAProfile profile;
+    if (strcmp(profile_name, "constrained-baseline") == 0)
+        profile = VAProfileH264ConstrainedBaseline;
+    else if (strcmp(profile_name, "main") == 0)
+        profile = VAProfileH264Main;
+    else if (strcmp(profile_name, "high") == 0)
+        profile = VAProfileH264High;
+    else {
+        fprintf(stderr, "unsupported H.264 profile: %s\n", profile_name);
+        return 2;
+    }
+    int cqp_enabled = argc == 5;
+    long cqp_value = 0;
+    if (cqp_enabled) {
+        char *end = NULL;
+        errno = 0;
+        cqp_value = strtol(argv[4], &end, 10);
+        if (errno != 0 || !end || *end != '\0' || cqp_value < 0 ||
+            cqp_value > 51) {
+            fprintf(stderr, "CQP value must be an integer in [0, 51]\n");
+            return 2;
+        }
     }
 
     const char *device = getenv("HOBOT_DRM_DEVICE");
     if (!device || !*device)
-        device = "/dev/dri/card0";
+        device = "/dev/dri/renderD128";
     int drm_fd = open(device, O_RDWR | O_CLOEXEC);
     if (drm_fd < 0) {
         perror("open DRM device");
@@ -123,9 +149,10 @@ int main(int argc, char **argv)
 
     VAConfigAttrib attributes[] = {
         { .type = VAConfigAttribRTFormat, .value = VA_RT_FORMAT_YUV420 },
-        { .type = VAConfigAttribRateControl, .value = VA_RC_CBR }
+        { .type = VAConfigAttribRateControl,
+          .value = cqp_enabled ? VA_RC_CQP : VA_RC_CBR }
     };
-    status = vaCreateConfig(display, VAProfileH264High, VAEntrypointEncSlice,
+    status = vaCreateConfig(display, profile, VAEntrypointEncSlice,
                             attributes, 2, &config);
     if (status != VA_STATUS_SUCCESS) {
         fprintf(stderr, "H.264 config creation failed: %s\n", vaErrorStr(status));
@@ -185,8 +212,8 @@ int main(int argc, char **argv)
     sequence.intra_period = 1;
     sequence.intra_idr_period = 1;
     sequence.ip_period = 1;
-    sequence.bits_per_second = 3000000;
-    sequence.max_num_ref_frames = 1;
+    sequence.bits_per_second = cqp_enabled ? 0 : 3000000;
+    sequence.max_num_ref_frames = 0;
     sequence.picture_width_in_mbs = CODED_WIDTH / 16u;
     sequence.picture_height_in_mbs = CODED_HEIGHT / 16u;
     sequence.seq_fields.bits.chroma_format_idc = 1;
@@ -213,7 +240,7 @@ int main(int argc, char **argv)
     for (size_t i = 0; i < 16; i++)
         picture.ReferenceFrames[i].flags = VA_PICTURE_H264_INVALID;
     picture.coded_buf = coded;
-    picture.pic_init_qp = 26;
+    picture.pic_init_qp = cqp_enabled ? (uint8_t)cqp_value : 26;
     picture.num_ref_idx_l0_active_minus1 = 0;
     picture.pic_fields.bits.idr_pic_flag = 1;
     picture.pic_fields.bits.reference_pic_flag = 1;
@@ -237,61 +264,82 @@ int main(int argc, char **argv)
         goto cleanup;
     }
 
-    status = vaBeginPicture(display, context, surface);
-    if (status != VA_STATUS_SUCCESS) {
-        fprintf(stderr, "vaBeginPicture failed: %s\n", vaErrorStr(status));
-        goto cleanup;
-    }
-    VABufferID render_buffers[] = {sequence_id, picture_id, slice_id};
-    status = vaRenderPicture(display, context, render_buffers, 3);
-    if (status != VA_STATUS_SUCCESS) {
-        fprintf(stderr, "vaRenderPicture failed: %s\n", vaErrorStr(status));
-        goto cleanup;
-    }
-    status = vaEndPicture(display, context);
-    if (status != VA_STATUS_SUCCESS) {
-        fprintf(stderr, "vaEndPicture failed: %s\n", vaErrorStr(status));
-        goto cleanup;
-    }
-
-    VACodedBufferSegment *segment = NULL;
-    status = vaMapBuffer(display, coded, (void **)&segment);
-    if (status != VA_STATUS_SUCCESS || !segment) {
-        fprintf(stderr, "coded buffer map failed: %s\n", vaErrorStr(status));
-        goto cleanup;
-    }
     output = fopen(argv[1], "wb");
     if (!output) {
         perror("open H.264 output");
-        vaUnmapBuffer(display, coded);
         goto cleanup;
     }
-    for (VACodedBufferSegment *part = segment; part; part = part->next) {
-        if (!part->buf || part->size == 0 ||
-            fwrite(part->buf, 1, part->size, output) != part->size) {
-            fprintf(stderr, "invalid or unwritable H.264 coded segment\n");
-            fclose(output);
-            output = NULL;
-            vaUnmapBuffer(display, coded);
+    output_written = 1;
+
+    enum { ENCODED_FRAMES = 3 };
+    for (unsigned int frame = 0; frame < ENCODED_FRAMES; frame++) {
+        status = vaBeginPicture(display, context, surface);
+        if (status != VA_STATUS_SUCCESS) {
+            fprintf(stderr, "vaBeginPicture failed at frame %u: %s\n",
+                    frame, vaErrorStr(status));
             goto cleanup;
         }
+        VABufferID render_buffers[] = {sequence_id, picture_id, slice_id};
+        VABufferID frame_buffers[] = {picture_id, slice_id};
+        status = vaRenderPicture(display, context,
+                                 frame == 0 ? render_buffers : frame_buffers,
+                                 frame == 0 ? 3 : 2);
+        if (status != VA_STATUS_SUCCESS) {
+            fprintf(stderr, "vaRenderPicture failed at frame %u: %s\n",
+                    frame, vaErrorStr(status));
+            goto cleanup;
+        }
+        status = vaEndPicture(display, context);
+        if (status != VA_STATUS_SUCCESS) {
+            fprintf(stderr, "vaEndPicture failed at frame %u: %s\n",
+                    frame, vaErrorStr(status));
+            goto cleanup;
+        }
+
+        VACodedBufferSegment *segment = NULL;
+        status = vaMapBuffer(display, coded, (void **)&segment);
+        if (status != VA_STATUS_SUCCESS || !segment) {
+            fprintf(stderr, "coded buffer map failed at frame %u: %s\n",
+                    frame, vaErrorStr(status));
+            if (status == VA_STATUS_SUCCESS)
+                vaUnmapBuffer(display, coded);
+            goto cleanup;
+        }
+        int write_failed = 0;
+        for (VACodedBufferSegment *part = segment; part; part = part->next) {
+            if (!part->buf || part->size == 0 ||
+                fwrite(part->buf, 1, part->size, output) != part->size) {
+                fprintf(stderr, "invalid or unwritable H.264 coded segment at frame %u\n",
+                        frame);
+                write_failed = 1;
+                break;
+            }
+        }
+        VAStatus unmap_status = vaUnmapBuffer(display, coded);
+        if (unmap_status != VA_STATUS_SUCCESS) {
+            fprintf(stderr, "coded buffer unmap failed at frame %u: %s\n",
+                    frame, vaErrorStr(unmap_status));
+            goto cleanup;
+        }
+        if (write_failed)
+            goto cleanup;
     }
+
     if (fclose(output) != 0) {
         output = NULL;
         perror("close H.264 output");
-        vaUnmapBuffer(display, coded);
         goto cleanup;
     }
     output = NULL;
-    output_written = 1;
-    status = vaUnmapBuffer(display, coded);
-    if (status != VA_STATUS_SUCCESS) {
-        fprintf(stderr, "coded buffer unmap failed: %s\n", vaErrorStr(status));
-        goto cleanup;
-    }
 
-    printf("encoded visible=%ux%u coded=%ux%u crop=left1/top1/right0/bottom3 output=%s\n",
-           VISIBLE_WIDTH, VISIBLE_HEIGHT, CODED_WIDTH, CODED_HEIGHT, argv[1]);
+    char qp_label[16] = "-";
+    if (cqp_enabled)
+        snprintf(qp_label, sizeof(qp_label), "%ld", cqp_value);
+    printf("encoded profile=%s rc=%s qp=%s frames=%u visible=%ux%u coded=%ux%u crop=left1/top1/right0/bottom3 all-intra refs=0 output=%s\n",
+           profile_name, cqp_enabled ? "CQP" : "CBR", qp_label,
+           ENCODED_FRAMES,
+           VISIBLE_WIDTH, VISIBLE_HEIGHT, CODED_WIDTH,
+           CODED_HEIGHT, argv[1]);
     result = 0;
 
 cleanup:

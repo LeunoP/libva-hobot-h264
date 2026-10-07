@@ -6,11 +6,14 @@ static int mock_dequeue_result;
 static int mock_dequeue_output_calls;
 static int mock_dequeue_output_invalid;
 static int mock_err_mb;
+static int mock_decode_result = HOBOT_DECODE_RESULT_SUCCESS;
 static int recycled_output_count;
 static int mock_initialize_result;
+static int mock_initialize_calls;
 static int mock_configure_result;
 static int mock_configure_calls;
 static mc_h264_profile_t mock_initialized_h264_profile;
+static int mock_initialized_h264_gop_preset_idx;
 static int mock_start_result;
 static int mock_start_calls;
 static int mock_stop_result;
@@ -19,6 +22,10 @@ static int mock_stop_calls;
 static int mock_release_calls;
 static int mock_queue_input_result;
 static int mock_queue_input_calls;
+static int mock_input_listener_result;
+static int mock_suppress_input_callback;
+static media_codec_callback_t mock_input_listener;
+static hb_ptr mock_input_listener_userdata;
 static int mock_rate_control_result;
 static int mock_rate_control_calls;
 static int mock_vui_get_result;
@@ -58,16 +65,32 @@ static int mock_encoder_input_vstride = 8;
 static unsigned int mock_encoded_size;
 static int mock_queue_output_calls;
 static int mock_queue_output_result;
+static int mock_queue_output_wait_timeout;
 static int mock_mem_flush_result;
 static int mock_mem_invalidate_result;
 static int mock_mem_flush_calls;
 static int mock_mem_invalidate_calls;
+static int mock_mem_flush_fd;
+static uint64_t mock_mem_flush_offset;
+static uint64_t mock_mem_flush_size;
+static int mock_mem_invalidate_fd;
+static uint64_t mock_mem_invalidate_offset;
+static uint64_t mock_mem_invalidate_size;
 static int mock_mem_module_open_result;
 static int mock_mem_module_open_calls;
 static int mock_mem_module_close_result;
 static int mock_mem_module_close_calls;
 static int mock_mem_free_result;
 static int mock_mem_free_calls;
+static int mock_mem_free_fd;
+static int mock_mem_get_graph_buf_result;
+static int mock_mem_get_graph_buf_calls;
+static int mock_mem_get_graph_buf_fd;
+static int mock_mem_import_graph_buf_result;
+static int mock_mem_import_graph_buf_calls;
+static int mock_mem_import_bad_metadata;
+static int mock_mem_import_next_fd = 200;
+static hb_mem_graphic_buf_t mock_external_graph_buf;
 static int mock_graph_alloc_enabled;
 static int mock_graph_alloc_calls;
 static media_codec_context_t *mock_last_output_context;
@@ -80,6 +103,7 @@ static uint8_t mock_graph_data[8 * 1024 * 1024];
 static pthread_mutex_t mock_dequeue_gate_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t mock_dequeue_gate_cond = PTHREAD_COND_INITIALIZER;
 static int mock_dequeue_block_enabled;
+static int mock_dequeue_respect_timeout;
 static int mock_dequeue_entered;
 static int mock_dequeue_release;
 
@@ -92,9 +116,12 @@ typedef struct {
     VADriverContextP ctx;
     int operation;
     VASurfaceID surface;
+    VABufferID buffer;
     VAContextID context;
     VAStatus status;
     VASurfaceStatus surface_status;
+    uint64_t timeout_ns;
+    int started;
     int completed;
 } SyncIsolationWorker;
 
@@ -106,7 +133,26 @@ hb_s32 hb_mm_mc_queue_input_buffer(media_codec_context_t *context,
     (void)buffer;
     (void)timeout;
     mock_queue_input_calls++;
+    if (mock_queue_input_result == 0 && !mock_suppress_input_callback &&
+        mock_input_listener.on_input_buffer_consumed &&
+        buffer && buffer->user_ptr)
+        mock_input_listener.on_input_buffer_consumed(mock_input_listener_userdata,
+                                                      buffer);
     return mock_queue_input_result;
+}
+
+hb_s32 hb_mm_mc_set_input_buffer_listener(media_codec_context_t *context,
+                                           const media_codec_callback_t *callback,
+                                           hb_ptr userdata)
+{
+    (void)context;
+    if (mock_input_listener_result != 0)
+        return mock_input_listener_result;
+    if (!callback)
+        return -1;
+    mock_input_listener = *callback;
+    mock_input_listener_userdata = userdata;
+    return 0;
 }
 
 hb_s32 hb_mm_mc_set_rate_control_config(media_codec_context_t *context,
@@ -205,9 +251,13 @@ hb_s32 hb_mm_mc_dequeue_input_buffer(media_codec_context_t *context,
 
 hb_s32 hb_mm_mc_initialize(media_codec_context_t *context)
 {
-    if (context && context->encoder && context->codec_id == MEDIA_CODEC_ID_H264)
+    mock_initialize_calls++;
+    if (context && context->encoder && context->codec_id == MEDIA_CODEC_ID_H264) {
         mock_initialized_h264_profile =
             context->video_enc_params.h264_enc_config.h264_profile;
+        mock_initialized_h264_gop_preset_idx =
+            context->video_enc_params.gop_params.gop_preset_idx;
+    }
     return mock_initialize_result;
 }
 
@@ -286,19 +336,19 @@ int32_t hb_mem_module_close(void)
 
 int32_t hb_mem_flush_buf(int32_t fd, uint64_t offset, uint64_t size)
 {
-    (void)fd;
-    (void)offset;
-    (void)size;
     mock_mem_flush_calls++;
+    mock_mem_flush_fd = fd;
+    mock_mem_flush_offset = offset;
+    mock_mem_flush_size = size;
     return mock_mem_flush_result;
 }
 
 int32_t hb_mem_invalidate_buf(int32_t fd, uint64_t offset, uint64_t size)
 {
-    (void)fd;
-    (void)offset;
-    (void)size;
     mock_mem_invalidate_calls++;
+    mock_mem_invalidate_fd = fd;
+    mock_mem_invalidate_offset = offset;
+    mock_mem_invalidate_size = size;
     return mock_mem_invalidate_result;
 }
 
@@ -321,17 +371,46 @@ int32_t hb_mem_alloc_graph_buf(int32_t width, int32_t height, int32_t format,
     buffer->fd[0] = 99;
     buffer->stride = stride;
     buffer->vstride = vstride;
-    buffer->size[0] = y_size + uv_size;
+    buffer->size[0] = y_size;
+    buffer->size[1] = uv_size;
     buffer->offset[1] = y_size;
+    buffer->is_contig = 1;
     buffer->virt_addr[0] = mock_graph_data;
     buffer->virt_addr[1] = mock_graph_data + y_size;
+    buffer->phys_addr[0] = 0x100000;
+    buffer->phys_addr[1] = 0x100000 + y_size;
+    return 0;
+}
+
+int32_t hb_mem_get_graph_buf(int32_t fd, hb_mem_graphic_buf_t *buffer)
+{
+    mock_mem_get_graph_buf_calls++;
+    mock_mem_get_graph_buf_fd = fd;
+    if (mock_mem_get_graph_buf_result != 0 || fd < 0 || !buffer)
+        return -1;
+    *buffer = mock_external_graph_buf;
+    buffer->fd[0] = fd;
+    return 0;
+}
+
+int32_t hb_mem_import_graph_buf(hb_mem_graphic_buf_t *buffer,
+                                hb_mem_graphic_buf_t *out_buffer)
+{
+    mock_mem_import_graph_buf_calls++;
+    if (mock_mem_import_graph_buf_result != 0 || !buffer || !out_buffer)
+        return -1;
+    *out_buffer = *buffer;
+    out_buffer->fd[0] = mock_mem_import_next_fd++;
+    out_buffer->fd[1] = -1;
+    if (mock_mem_import_bad_metadata)
+        out_buffer->plane_cnt = 1;
     return 0;
 }
 
 int32_t hb_mem_free_buf(int32_t fd)
 {
-    (void)fd;
     mock_mem_free_calls++;
+    mock_mem_free_fd = fd;
     return mock_mem_free_result;
 }
 
@@ -347,16 +426,36 @@ hb_s32 hb_mm_mc_dequeue_output_buffer(media_codec_context_t *context,
                                        hb_s32 timeout)
 {
     (void)context;
-    (void)timeout;
+    int timed_out = 0;
     pthread_mutex_lock(&mock_dequeue_gate_mutex);
     if (mock_dequeue_block_enabled) {
         mock_dequeue_entered = 1;
         pthread_cond_broadcast(&mock_dequeue_gate_cond);
-        while (!mock_dequeue_release)
-            pthread_cond_wait(&mock_dequeue_gate_cond, &mock_dequeue_gate_mutex);
+        if (mock_dequeue_respect_timeout && timeout >= 0) {
+            struct timespec deadline;
+            clock_gettime(CLOCK_REALTIME, &deadline);
+            deadline.tv_sec += timeout / 1000;
+            deadline.tv_nsec += (long)(timeout % 1000) * 1000000L;
+            if (deadline.tv_nsec >= 1000000000L) {
+                deadline.tv_sec++;
+                deadline.tv_nsec -= 1000000000L;
+            }
+            int wait_status = 0;
+            while (!mock_dequeue_release && wait_status != ETIMEDOUT)
+                wait_status = pthread_cond_timedwait(&mock_dequeue_gate_cond,
+                                                     &mock_dequeue_gate_mutex,
+                                                     &deadline);
+            timed_out = !mock_dequeue_release && wait_status == ETIMEDOUT;
+        } else {
+            while (!mock_dequeue_release)
+                pthread_cond_wait(&mock_dequeue_gate_cond,
+                                  &mock_dequeue_gate_mutex);
+        }
     }
     pthread_mutex_unlock(&mock_dequeue_gate_mutex);
     mock_dequeue_output_calls++;
+    if (timed_out)
+        return HB_MEDIA_ERR_WAIT_TIMEOUT;
     if (mock_dequeue_result != 0)
         return mock_dequeue_result;
 
@@ -375,6 +474,7 @@ hb_s32 hb_mm_mc_dequeue_output_buffer(media_codec_context_t *context,
         buffer->vframe_buf.vir_ptr[0] = NULL;
         buffer->vframe_buf.fd[0] = -1;
     }
+    info->video_frame_info.decode_result = mock_decode_result;
     info->video_frame_info.err_mb_in_frame_display = mock_err_mb;
     info->video_frame_info.total_mb_in_frame_display = 100;
     return 0;
@@ -385,9 +485,18 @@ hb_s32 hb_mm_mc_queue_output_buffer(media_codec_context_t *context,
                                      hb_s32 timeout)
 {
     (void)buffer;
-    (void)timeout;
     mock_queue_output_calls++;
     mock_last_output_context = context;
+    if (mock_queue_output_wait_timeout) {
+        struct timespec pause = {
+            .tv_sec = timeout / 1000,
+            .tv_nsec = (long)(timeout % 1000) * 1000000L,
+        };
+        while (nanosleep(&pause, &pause) != 0 && errno == EINTR) {
+            continue;
+        }
+        return HB_MEDIA_ERR_WAIT_TIMEOUT;
+    }
     if (mock_queue_output_result == 0)
         recycled_output_count++;
     return mock_queue_output_result;
@@ -633,12 +742,78 @@ static int test_encoder_parameter_buffers_reject_truncation(void)
     return 1;
 }
 
+static int test_fixed_record_parameters_reject_array_shape(void)
+{
+    HobotDriverData drv = {0};
+    struct VADriverContext va_ctx = {0};
+    VAEncPictureParameterBufferH264 picture = {0};
+    uint8_t coded_data[16] = {0};
+    if (pthread_mutex_init(&drv.mutex, NULL) != 0)
+        return 0;
+    va_ctx.pDriverData = &drv;
+
+    for (size_t i = 0; i < sizeof(picture.ReferenceFrames) /
+                            sizeof(picture.ReferenceFrames[0]); i++) {
+        picture.ReferenceFrames[i].picture_id = VA_INVALID_SURFACE;
+        picture.ReferenceFrames[i].flags = VA_PICTURE_H264_INVALID;
+    }
+    picture.CurrPic.picture_id = 1;
+    drv.surfaces[1].allocated = 1;
+
+    HobotContext *hctx = &drv.contexts[1];
+    hctx->allocated = 1;
+    hctx->vpu_running = 1;
+    hctx->is_encoder = 1;
+    hctx->encoder_picture_active = 1;
+    hctx->profile = VAProfileH264Main;
+    picture.coded_buf = 2;
+    drv.buffers[1] = (HobotBuffer){
+        .id = 1, .allocated = 1, .type = VAEncPictureParameterBufferType,
+        .size = sizeof(picture), .capacity = sizeof(picture),
+        .element_size = sizeof(picture) / 2, .num_elements = 2,
+        .data = &picture
+    };
+    drv.buffers[2] = (HobotBuffer){
+        .id = 2, .allocated = 1, .type = VAEncCodedBufferType,
+        .size = sizeof(coded_data), .capacity = sizeof(coded_data),
+        .data = coded_data
+    };
+
+    VABufferID buffer_id = 1;
+    VAStatus status = hobot_vaRenderPicture(&va_ctx, 1, &buffer_id, 1);
+    if (status != VA_STATUS_ERROR_INVALID_PARAMETER || hctx->enc_coded_buf != 0) {
+        fprintf(stderr, "multi-element H.264 picture parameter was accepted: status=%d coded=%u\n",
+                status, hctx->enc_coded_buf);
+        pthread_mutex_destroy(&drv.mutex);
+        return 0;
+    }
+
+    drv.buffers[1].element_size = sizeof(picture);
+    drv.buffers[1].num_elements = 1;
+    status = hobot_vaRenderPicture(&va_ctx, 1, &buffer_id, 1);
+    int passed = status == VA_STATUS_SUCCESS && hctx->enc_coded_buf == 2;
+    if (!passed)
+        fprintf(stderr, "valid single-record H.264 picture parameter was rejected: status=%d coded=%u\n",
+                status, hctx->enc_coded_buf);
+
+    pthread_mutex_destroy(&drv.mutex);
+    return passed;
+}
+
 static int test_hevc_main_subset_parameter_validation(void)
 {
-    if (!hobot_profile_resolution_supported(VAProfileHEVCMain, 3840, 2160) ||
-        hobot_profile_resolution_supported(VAProfileHEVCMain, 3842, 2160) ||
-        hobot_profile_resolution_supported(VAProfileHEVCMain, 3840, 2162) ||
-        !hobot_profile_resolution_supported(VAProfileH264High, 4096, 4096)) {
+    if (!hobot_profile_resolution_supported(VAProfileHEVCMain,
+                                             VAEntrypointVLD, 8192, 4096) ||
+        hobot_profile_resolution_supported(VAProfileHEVCMain,
+                                            VAEntrypointVLD, 8194, 4096) ||
+        hobot_profile_resolution_supported(VAProfileHEVCMain,
+                                            VAEntrypointVLD, 8192, 4098) ||
+        !hobot_profile_resolution_supported(VAProfileHEVCMain,
+                                             VAEntrypointEncSlice, 3840, 2160) ||
+        hobot_profile_resolution_supported(VAProfileHEVCMain,
+                                            VAEntrypointEncSlice, 4096, 2160) ||
+        !hobot_profile_resolution_supported(VAProfileH264High,
+                                             VAEntrypointVLD, 4096, 4096)) {
         fprintf(stderr, "codec-specific picture resolution bounds are inaccurate\n");
         return 0;
     }
@@ -683,8 +858,8 @@ static int test_hevc_main_subset_parameter_validation(void)
         return 0;
     }
     picture.slice_parsing_fields.bits.IdrPicFlag = 0;
-    if (hobot_hevc_picture_parameters_supported(&picture, 640, 360)) {
-        fprintf(stderr, "non-IDR picture with unsupported additional SPS RPS sets was accepted\n");
+    if (!hobot_hevc_picture_parameters_supported(&picture, 640, 360)) {
+        fprintf(stderr, "non-IDR picture with additional SPS RPS sets was rejected before slice validation\n");
         return 0;
     }
     picture.num_short_term_ref_pic_sets = 2;
@@ -692,12 +867,24 @@ static int test_hevc_main_subset_parameter_validation(void)
     picture.slice_parsing_fields.bits.RapPicFlag = 0;
     picture.slice_parsing_fields.bits.IntraPicFlag = 0;
     picture.st_rps_bits = 1;
+    if (!hobot_hevc_picture_parameters_supported(&picture, 640, 360)) {
+        fprintf(stderr, "HEVC bounded two-set inline RPS was rejected before slice validation\n");
+        return 0;
+    }
+    picture.slice_parsing_fields.bits.sps_temporal_mvp_enabled_flag = 1;
+    picture.st_rps_bits = 6;
+    if (!hobot_hevc_picture_parameters_supported(&picture, 640, 360)) {
+        fprintf(stderr, "HEVC two-set temporal-MVP inline RPS was rejected\n");
+        return 0;
+    }
+    picture.st_rps_bits = 2049;
     if (hobot_hevc_picture_parameters_supported(&picture, 640, 360)) {
-        fprintf(stderr, "HEVC two-set SPS RPS accepted nonzero slice-local RPS bits\n");
+        fprintf(stderr, "oversized HEVC two-set inline RPS was accepted\n");
         return 0;
     }
     picture.num_short_term_ref_pic_sets = 0;
     picture.st_rps_bits = 12;
+    picture.slice_parsing_fields.bits.sps_temporal_mvp_enabled_flag = 0;
 
     picture.bit_depth_luma_minus8 = 2;
     if (hobot_hevc_picture_parameters_supported(&picture, 640, 360)) {
@@ -705,12 +892,141 @@ static int test_hevc_main_subset_parameter_validation(void)
         return 0;
     }
     picture.bit_depth_luma_minus8 = 0;
-    picture.pic_fields.bits.tiles_enabled_flag = 1;
+    picture.log2_diff_max_min_luma_coding_block_size = 0;
     if (hobot_hevc_picture_parameters_supported(&picture, 640, 360)) {
-        fprintf(stderr, "HEVC Main accepted tiles\n");
+        fprintf(stderr, "HEVC Main accepted an 8x8 CTB size\n");
+        return 0;
+    }
+    picture.log2_diff_max_min_luma_coding_block_size = 1;
+    if (!hobot_hevc_picture_parameters_supported(&picture, 640, 360)) {
+        fprintf(stderr, "HEVC Main rejected the minimum 16x16 CTB size\n");
+        return 0;
+    }
+    picture.log2_diff_max_min_luma_coding_block_size = 3;
+    picture.pic_fields.bits.tiles_enabled_flag = 1;
+    picture.pic_fields.bits.loop_filter_across_tiles_enabled_flag = 1;
+    picture.num_tile_columns_minus1 = 1;
+    picture.num_tile_rows_minus1 = 1;
+    picture.column_width_minus1[0] = 4;
+    picture.row_height_minus1[0] = 2;
+    if (!hobot_hevc_picture_parameters_supported(&picture, 640, 360)) {
+        fprintf(stderr, "valid uniform HEVC tile layout was rejected\n");
+        return 0;
+    }
+    picture.column_width_minus1[0] = 2;
+    if (hobot_hevc_picture_parameters_supported(&picture, 640, 360)) {
+        fprintf(stderr, "HEVC Main accepted a tile column narrower than 256 samples\n");
+        return 0;
+    }
+    picture.column_width_minus1[0] = 7;
+    picture.row_height_minus1[0] = 0;
+    picture.log2_diff_max_min_luma_coding_block_size = 2;
+    if (hobot_hevc_picture_parameters_supported(&picture, 640, 360)) {
+        fprintf(stderr, "HEVC Main accepted a tile row shorter than 64 samples\n");
+        return 0;
+    }
+    picture.row_height_minus1[0] = 1;
+    if (!hobot_hevc_picture_parameters_supported(&picture, 640, 360)) {
+        fprintf(stderr, "HEVC Main rejected tiles at the minimum 256x64 size\n");
+        return 0;
+    }
+    picture.log2_diff_max_min_luma_coding_block_size = 3;
+    picture.column_width_minus1[0] = 4;
+    picture.row_height_minus1[0] = 2;
+    picture.column_width_minus1[0] = 9;
+    if (hobot_hevc_picture_parameters_supported(&picture, 640, 360)) {
+        fprintf(stderr, "HEVC tile width leaving an empty final tile was accepted\n");
+        return 0;
+    }
+    picture.column_width_minus1[0] = 5;
+    picture.row_height_minus1[0] = 3;
+    if (!hobot_hevc_picture_parameters_supported(&picture, 640, 360)) {
+        fprintf(stderr, "valid non-uniform HEVC tile layout was rejected\n");
+        return 0;
+    }
+    picture.row_height_minus1[0] = 5;
+    if (hobot_hevc_picture_parameters_supported(&picture, 640, 360)) {
+        fprintf(stderr, "HEVC tile row leaving an empty final tile was accepted\n");
+        return 0;
+    }
+    picture.row_height_minus1[0] = 3;
+    picture.column_width_minus1[0] = 9;
+    if (hobot_hevc_picture_parameters_supported(&picture, 640, 360)) {
+        fprintf(stderr, "HEVC non-uniform tile layout exceeded the CTB grid\n");
+        return 0;
+    }
+    picture.column_width_minus1[0] = 4;
+    picture.row_height_minus1[0] = 2;
+    picture.num_tile_columns_minus1 = 10;
+    if (hobot_hevc_picture_parameters_supported(&picture, 640, 360)) {
+        fprintf(stderr, "HEVC tile count larger than CTB columns was accepted\n");
         return 0;
     }
     picture.pic_fields.bits.tiles_enabled_flag = 0;
+    picture.pic_fields.bits.loop_filter_across_tiles_enabled_flag = 0;
+    picture.num_tile_columns_minus1 = 0;
+    picture.num_tile_rows_minus1 = 0;
+    picture.column_width_minus1[0] = 0;
+    picture.row_height_minus1[0] = 0;
+    picture.pic_fields.bits.pcm_enabled_flag = 1;
+    picture.pcm_sample_bit_depth_luma_minus1 = 7;
+    picture.pcm_sample_bit_depth_chroma_minus1 = 7;
+    picture.log2_min_pcm_luma_coding_block_size_minus3 = 0;
+    picture.log2_diff_max_min_pcm_luma_coding_block_size = 2;
+    if (!hobot_hevc_picture_parameters_supported(&picture, 640, 360)) {
+        fprintf(stderr, "valid 8-bit HEVC PCM parameters were rejected\n");
+        return 0;
+    }
+    picture.pcm_sample_bit_depth_luma_minus1 = 8;
+    if (hobot_hevc_picture_parameters_supported(&picture, 640, 360)) {
+        fprintf(stderr, "HEVC PCM accepted a sample depth outside the 8-bit Main subset\n");
+        return 0;
+    }
+    picture.pcm_sample_bit_depth_luma_minus1 = 7;
+    picture.log2_min_luma_coding_block_size_minus3 = 2;
+    picture.log2_diff_max_min_luma_coding_block_size = 1;
+    if (hobot_hevc_picture_parameters_supported(&picture, 640, 360)) {
+        fprintf(stderr, "HEVC PCM accepted a minimum block smaller than the SPS minimum CB\n");
+        return 0;
+    }
+    picture.log2_min_pcm_luma_coding_block_size_minus3 = 2;
+    picture.log2_diff_max_min_pcm_luma_coding_block_size = 1;
+    if (hobot_hevc_picture_parameters_supported(&picture, 640, 360)) {
+        fprintf(stderr, "HEVC PCM accepted a maximum block larger than the capped CTB size\n");
+        return 0;
+    }
+    picture.log2_diff_max_min_pcm_luma_coding_block_size = 0;
+    if (!hobot_hevc_picture_parameters_supported(&picture, 640, 360)) {
+        fprintf(stderr, "valid HEVC PCM blocks matching the SPS minimum CB were rejected\n");
+        return 0;
+    }
+    picture.pic_fields.bits.pcm_enabled_flag = 0;
+    picture.log2_min_luma_coding_block_size_minus3 = 0;
+    picture.log2_diff_max_min_luma_coding_block_size = 3;
+    picture.pic_fields.bits.entropy_coding_sync_enabled_flag = 1;
+    if (!hobot_hevc_picture_parameters_supported(&picture, 640, 360)) {
+        fprintf(stderr, "HEVC Main rejected WPP without tiles\n");
+        return 0;
+    }
+    picture.pic_fields.bits.tiles_enabled_flag = 1;
+    picture.num_tile_columns_minus1 = 1;
+    picture.num_tile_rows_minus1 = 1;
+    picture.column_width_minus1[0] = 4;
+    picture.row_height_minus1[0] = 2;
+    if (hobot_hevc_picture_parameters_supported(&picture, 640, 360)) {
+        fprintf(stderr, "HEVC Main accepted WPP together with tiles\n");
+        return 0;
+    }
+    picture.pic_fields.bits.entropy_coding_sync_enabled_flag = 0;
+    if (!hobot_hevc_picture_parameters_supported(&picture, 640, 360)) {
+        fprintf(stderr, "HEVC Main rejected tiles without WPP\n");
+        return 0;
+    }
+    picture.pic_fields.bits.tiles_enabled_flag = 0;
+    picture.num_tile_columns_minus1 = 0;
+    picture.num_tile_rows_minus1 = 0;
+    picture.column_width_minus1[0] = 0;
+    picture.row_height_minus1[0] = 0;
     if (hobot_hevc_picture_parameters_supported(&picture, 65536, 360)) {
         fprintf(stderr, "HEVC Main accepted dimensions wider than VA fields\n");
         return 0;
@@ -727,8 +1043,14 @@ static int test_hevc_main_subset_parameter_validation(void)
         return 0;
     }
     slice.LongSliceFlags.fields.dependent_slice_segment_flag = 1;
-    if (hobot_hevc_slice_parameter_fields_supported(&slice)) {
-        fprintf(stderr, "HEVC Main accepted a dependent slice segment\n");
+    if (!hobot_hevc_slice_parameter_fields_supported(&slice)) {
+        fprintf(stderr, "valid dependent HEVC slice fields rejected\n");
+        return 0;
+    }
+    slice.LongSliceFlags.fields.dependent_slice_segment_flag = 0;
+    slice.num_entry_point_offsets = 1;
+    if (!hobot_hevc_slice_parameter_fields_supported(&slice)) {
+        fprintf(stderr, "HEVC WPP entry-point fields were rejected\n");
         return 0;
     }
 
@@ -753,6 +1075,185 @@ static int test_hevc_main_subset_parameter_validation(void)
         !hobot_hevc_slice_sequence_add(&sequence, &slices[1], 48) ||
         !hobot_hevc_slice_sequence_complete(&sequence)) {
         fprintf(stderr, "valid HEVC two-slice CTU sequence rejected\n");
+        return 0;
+    }
+
+    picture.pic_fields.bits.entropy_coding_sync_enabled_flag = 1;
+    slices[0].LongSliceFlags.fields.LastSliceOfPic = 1;
+    slices[0].num_entry_point_offsets = 5;
+    if (!hobot_hevc_slice_sequence_init(&picture, 1, &sequence) ||
+        !hobot_hevc_slice_sequence_add(&sequence, &slices[0], 64) ||
+        !hobot_hevc_slice_sequence_complete(&sequence)) {
+        fprintf(stderr, "valid HEVC WPP entry-point count rejected\n");
+        return 0;
+    }
+    slices[0].num_entry_point_offsets = 12;
+    if (!hobot_hevc_slice_sequence_init(&picture, 1, &sequence) ||
+        hobot_hevc_slice_sequence_add(&sequence, &slices[0], 64)) {
+        fprintf(stderr, "HEVC WPP accepted more entry points than CTB rows allow\n");
+        return 0;
+    }
+    picture.pic_fields.bits.entropy_coding_sync_enabled_flag = 0;
+    slices[0].num_entry_point_offsets = 1;
+    if (!hobot_hevc_slice_sequence_init(&picture, 1, &sequence) ||
+        hobot_hevc_slice_sequence_add(&sequence, &slices[0], 64)) {
+        fprintf(stderr, "HEVC accepted entry points with WPP disabled\n");
+        return 0;
+    }
+    slices[0].num_entry_point_offsets = 0;
+
+    picture.pic_fields.bits.tiles_enabled_flag = 1;
+    picture.num_tile_columns_minus1 = 1;
+    picture.num_tile_rows_minus1 = 1;
+    picture.column_width_minus1[0] = 9;
+    picture.row_height_minus1[0] = 5;
+    slices[0].LongSliceFlags.fields.LastSliceOfPic = 1;
+    slices[0].num_entry_point_offsets = 3;
+    if (!hobot_hevc_slice_sequence_init(&picture, 1, &sequence) ||
+        !hobot_hevc_slice_sequence_add(&sequence, &slices[0], 64) ||
+        !hobot_hevc_slice_sequence_complete(&sequence)) {
+        fprintf(stderr, "valid HEVC uniform 2x2 tile entry points were rejected\n");
+        return 0;
+    }
+    picture.column_width_minus1[0] = 7;
+    picture.row_height_minus1[0] = 3;
+    if (!hobot_hevc_slice_sequence_init(&picture, 1, &sequence) ||
+        !hobot_hevc_slice_sequence_add(&sequence, &slices[0], 64) ||
+        !hobot_hevc_slice_sequence_complete(&sequence)) {
+        fprintf(stderr, "valid HEVC non-uniform 2x2 tile entry points were rejected\n");
+        return 0;
+    }
+    picture.column_width_minus1[0] = 19;
+    if (hobot_hevc_slice_sequence_init(&picture, 1, &sequence)) {
+        fprintf(stderr, "invalid HEVC tile geometry reached slice validation\n");
+        return 0;
+    }
+    picture.column_width_minus1[0] = 9;
+    picture.row_height_minus1[0] = 5;
+    slices[0].num_entry_point_offsets = 2;
+    if (!hobot_hevc_slice_sequence_init(&picture, 1, &sequence) ||
+        hobot_hevc_slice_sequence_add(&sequence, &slices[0], 64)) {
+        fprintf(stderr, "HEVC tile slice accepted a mismatched entry-point count\n");
+        return 0;
+    }
+    slices[0].num_entry_point_offsets = 3;
+    slices[0].LongSliceFlags.fields.LastSliceOfPic = 0;
+    slices[1].LongSliceFlags.fields.LastSliceOfPic = 1;
+    slices[0].num_entry_point_offsets = 0;
+    slices[1].num_entry_point_offsets = 0;
+    uint64_t tile_slice_entry_points[2] = {UINT64_MAX, UINT64_MAX};
+    if (!hobot_hevc_slice_sequence_init(&picture, 2, &sequence) ||
+        !hobot_hevc_slice_sequence_add_with_next(
+            &sequence, &slices[0], 64, 1,
+            slices[1].slice_segment_address, &tile_slice_entry_points[0]) ||
+        tile_slice_entry_points[0] != 1 ||
+        !hobot_hevc_slice_sequence_add_with_next(
+            &sequence, &slices[1], 48, 0, 0,
+            &tile_slice_entry_points[1]) ||
+        tile_slice_entry_points[1] != 1 ||
+        !hobot_hevc_slice_sequence_complete(&sequence)) {
+        fprintf(stderr, "valid two-slice HEVC tile-row sequence was rejected\n");
+        return 0;
+    }
+    if (!hobot_hevc_slice_sequence_init(&picture, 2, &sequence) ||
+        hobot_hevc_slice_sequence_add_with_next(
+            &sequence, &slices[0], 64, 1, 121, NULL)) {
+        fprintf(stderr, "HEVC tiled slice ending inside a tile was accepted\n");
+        return 0;
+    }
+    const uint32_t four_tile_addresses[] = {0, 10, 120, 130};
+    VASliceParameterBufferHEVC four_tile_slices[4] = {{0}};
+    for (size_t i = 0; i < 4; i++) {
+        four_tile_slices[i].slice_segment_address = four_tile_addresses[i];
+        four_tile_slices[i].slice_data_size = 32;
+        four_tile_slices[i].slice_data_flag = VA_SLICE_DATA_FLAG_ALL;
+        four_tile_slices[i].LongSliceFlags.fields.slice_type = 2;
+        four_tile_slices[i].LongSliceFlags.fields.LastSliceOfPic = i == 3;
+    }
+    if (!hobot_hevc_slice_sequence_init(&picture, 4, &sequence)) {
+        fprintf(stderr, "HEVC four-tile slice sequence initialization failed\n");
+        return 0;
+    }
+    for (size_t i = 0; i < 4; i++) {
+        uint64_t expected_entry_points = UINT64_MAX;
+        int has_next_slice = i + 1u < 4u;
+        uint32_t next_address = has_next_slice ?
+            four_tile_addresses[i + 1u] : 0;
+        if (!hobot_hevc_slice_sequence_add_with_next(
+                &sequence, &four_tile_slices[i], 32, has_next_slice,
+                next_address, &expected_entry_points) ||
+            expected_entry_points != 0) {
+            fprintf(stderr, "HEVC one-slice-per-tile entry-point count was incorrect\n");
+            return 0;
+        }
+    }
+    if (!hobot_hevc_slice_sequence_complete(&sequence)) {
+        fprintf(stderr, "HEVC four-tile slice sequence was incomplete\n");
+        return 0;
+    }
+    picture.pic_fields.bits.tiles_enabled_flag = 0;
+    picture.num_tile_columns_minus1 = 0;
+    picture.num_tile_rows_minus1 = 0;
+    picture.column_width_minus1[0] = 0;
+    picture.row_height_minus1[0] = 0;
+    slices[0].num_entry_point_offsets = 0;
+    slices[0].LongSliceFlags.fields.LastSliceOfPic = 0;
+
+    VASliceParameterBufferHEVC three_slices[3] = {{0}};
+    const uint32_t three_slice_addresses[] = {0, 80, 160};
+    for (size_t i = 0; i < 3; i++) {
+        memset(three_slices[i].RefPicList, 0xff,
+               sizeof(three_slices[i].RefPicList));
+        three_slices[i].slice_segment_address = three_slice_addresses[i];
+        three_slices[i].slice_data_size = 32;
+        three_slices[i].slice_data_flag = VA_SLICE_DATA_FLAG_ALL;
+        three_slices[i].LongSliceFlags.fields.LastSliceOfPic = (i == 2);
+        three_slices[i].LongSliceFlags.fields.slice_type = 2;
+    }
+    if (!hobot_hevc_slice_sequence_init(&picture, 3, &sequence) ||
+        !hobot_hevc_slice_sequence_add(&sequence, &three_slices[0], 32) ||
+        !hobot_hevc_slice_sequence_add(&sequence, &three_slices[1], 32) ||
+        !hobot_hevc_slice_sequence_add(&sequence, &three_slices[2], 32) ||
+        !hobot_hevc_slice_sequence_complete(&sequence)) {
+        fprintf(stderr, "valid HEVC three-slice CTU sequence rejected\n");
+        return 0;
+    }
+    picture.slice_parsing_fields.bits.dependent_slice_segments_enabled_flag = 1;
+    three_slices[1].LongSliceFlags.fields.dependent_slice_segment_flag = 1;
+    three_slices[2].LongSliceFlags.fields.dependent_slice_segment_flag = 1;
+    if (!hobot_hevc_slice_sequence_init(&picture, 3, &sequence) ||
+        !hobot_hevc_slice_sequence_add(&sequence, &three_slices[0], 32) ||
+        !hobot_hevc_slice_sequence_add(&sequence, &three_slices[1], 32) ||
+        !hobot_hevc_slice_sequence_add(&sequence, &three_slices[2], 32) ||
+        !hobot_hevc_slice_sequence_complete(&sequence)) {
+        fprintf(stderr, "valid HEVC dependent slice sequence rejected\n");
+        return 0;
+    }
+    three_slices[2].LongSliceFlags.fields.slice_type = 1;
+    if (!hobot_hevc_slice_sequence_init(&picture, 3, &sequence) ||
+        !hobot_hevc_slice_sequence_add(&sequence, &three_slices[0], 32) ||
+        !hobot_hevc_slice_sequence_add(&sequence, &three_slices[1], 32) ||
+        hobot_hevc_slice_sequence_add(&sequence, &three_slices[2], 32)) {
+        fprintf(stderr, "HEVC dependent slice changed inherited slice type\n");
+        return 0;
+    }
+    three_slices[2].LongSliceFlags.fields.slice_type = 2;
+    three_slices[0].LongSliceFlags.fields.dependent_slice_segment_flag = 1;
+    if (!hobot_hevc_slice_sequence_init(&picture, 3, &sequence) ||
+        hobot_hevc_slice_sequence_add(&sequence, &three_slices[0], 32)) {
+        fprintf(stderr, "HEVC accepted a dependent first slice segment\n");
+        return 0;
+    }
+    three_slices[0].LongSliceFlags.fields.dependent_slice_segment_flag = 0;
+    three_slices[1].LongSliceFlags.fields.dependent_slice_segment_flag = 0;
+    three_slices[2].LongSliceFlags.fields.dependent_slice_segment_flag = 0;
+    picture.slice_parsing_fields.bits.dependent_slice_segments_enabled_flag = 0;
+    three_slices[2].LongSliceFlags.fields.LastSliceOfPic = 0;
+    if (!hobot_hevc_slice_sequence_init(&picture, 3, &sequence) ||
+        !hobot_hevc_slice_sequence_add(&sequence, &three_slices[0], 32) ||
+        !hobot_hevc_slice_sequence_add(&sequence, &three_slices[1], 32) ||
+        hobot_hevc_slice_sequence_add(&sequence, &three_slices[2], 32)) {
+        fprintf(stderr, "HEVC three-slice sequence accepted a missing final-slice flag\n");
         return 0;
     }
 
@@ -794,6 +1295,299 @@ static int test_hevc_main_subset_parameter_validation(void)
     }
 
     return 1;
+}
+
+static int test_hevc_pcm_sps_serialization(void)
+{
+    VAPictureParameterBufferHEVC picture = {0};
+    picture.pic_width_in_luma_samples = 640;
+    picture.pic_height_in_luma_samples = 360;
+    picture.pic_fields.bits.chroma_format_idc = 1;
+    picture.pic_fields.bits.pcm_enabled_flag = 1;
+    picture.pic_fields.bits.pcm_loop_filter_disabled_flag = 1;
+    picture.sps_max_dec_pic_buffering_minus1 = 3;
+    picture.log2_max_pic_order_cnt_lsb_minus4 = 4;
+    picture.log2_diff_max_min_luma_coding_block_size = 3;
+    picture.log2_diff_max_min_transform_block_size = 3;
+    picture.pcm_sample_bit_depth_luma_minus1 = 7;
+    picture.pcm_sample_bit_depth_chroma_minus1 = 7;
+    picture.log2_min_pcm_luma_coding_block_size_minus3 = 0;
+    picture.log2_diff_max_min_pcm_luma_coding_block_size = 2;
+    if (!hobot_hevc_picture_parameters_supported(&picture, 640, 360)) {
+        fprintf(stderr, "valid PCM SPS parameters were rejected before serialization\n");
+        return 0;
+    }
+
+    uint8_t sps[256];
+    int sps_size = generate_hevc_sps(&picture, 1, NULL, sps, sizeof(sps));
+    uint8_t rbsp[256];
+    size_t rbsp_size = 0;
+    if (sps_size < 3 ||
+        !hobot_hevc_unescape_rbsp(sps + 2, (size_t)sps_size - 2u,
+                                  rbsp, sizeof(rbsp), &rbsp_size)) {
+        fprintf(stderr, "PCM-enabled HEVC SPS generation or unescape failed\n");
+        return 0;
+    }
+
+    BitReader reader = {rbsp, rbsp_size * 8u, 0};
+    uint32_t value;
+    if (!br_skip_bits(&reader, 4u + 3u + 1u + 96u) ||
+        !br_read_ue(&reader, &value, NULL, NULL) ||
+        !br_read_ue(&reader, &value, NULL, NULL) ||
+        !br_read_ue(&reader, &value, NULL, NULL) ||
+        !br_read_ue(&reader, &value, NULL, NULL) ||
+        !br_skip_bits(&reader, 1) ||
+        !br_read_ue(&reader, &value, NULL, NULL) ||
+        !br_read_ue(&reader, &value, NULL, NULL) ||
+        !br_read_ue(&reader, &value, NULL, NULL) ||
+        !br_skip_bits(&reader, 1) ||
+        !br_read_ue(&reader, &value, NULL, NULL) ||
+        !br_read_ue(&reader, &value, NULL, NULL) ||
+        !br_read_ue(&reader, &value, NULL, NULL)) {
+        fprintf(stderr, "PCM-enabled HEVC SPS header parse failed\n");
+        return 0;
+    }
+    for (size_t i = 0; i < 6; i++) {
+        if (!br_read_ue(&reader, &value, NULL, NULL)) {
+            fprintf(stderr, "PCM-enabled HEVC SPS coding syntax is truncated\n");
+            return 0;
+        }
+    }
+
+    uint32_t pcm_enabled;
+    uint32_t pcm_luma_depth;
+    uint32_t pcm_chroma_depth;
+    uint32_t pcm_min_size;
+    uint32_t pcm_size_diff;
+    uint32_t pcm_filter_disabled;
+    uint32_t rps_count;
+    if (!br_skip_bits(&reader, 3) ||
+        !br_read_bits(&reader, 1, &pcm_enabled) || pcm_enabled != 1 ||
+        !br_read_bits(&reader, 4, &pcm_luma_depth) || pcm_luma_depth != 7 ||
+        !br_read_bits(&reader, 4, &pcm_chroma_depth) || pcm_chroma_depth != 7 ||
+        !br_read_ue(&reader, &pcm_min_size, NULL, NULL) || pcm_min_size != 0 ||
+        !br_read_ue(&reader, &pcm_size_diff, NULL, NULL) || pcm_size_diff != 2 ||
+        !br_read_bits(&reader, 1, &pcm_filter_disabled) || pcm_filter_disabled != 1 ||
+        !br_read_ue(&reader, &rps_count, NULL, NULL) || rps_count != 0) {
+        fprintf(stderr, "PCM SPS syntax values or following RPS alignment are incorrect\n");
+        return 0;
+    }
+    return 1;
+}
+
+static int test_hevc_tiles_pps_layout(
+    const VAPictureParameterBufferHEVC *picture,
+    uint32_t expected_uniform_spacing,
+    uint32_t expected_column_width_minus1,
+    uint32_t expected_row_height_minus1
+)
+{
+    uint8_t pps[256];
+    uint8_t rbsp[256];
+    size_t rbsp_size = 0;
+    int pps_size = generate_hevc_pps(picture, pps, sizeof(pps));
+    if (pps_size < 3 ||
+        !hobot_hevc_unescape_rbsp(pps + 2, (size_t)pps_size - 2u,
+                                  rbsp, sizeof(rbsp), &rbsp_size)) {
+        fprintf(stderr, "HEVC tile PPS generation or unescape failed\n");
+        return 0;
+    }
+
+    BitReader reader = {rbsp, rbsp_size * 8u, 0};
+    uint32_t value;
+    int32_t signed_value;
+    uint32_t tiles_enabled;
+    uint32_t entropy_coding_sync_enabled;
+    uint32_t uniform_spacing;
+    uint32_t loop_filter_across_tiles;
+    uint32_t pps_loop_filter_across_slices;
+    uint32_t deblocking_filter_control_present;
+    uint32_t deblocking_filter_override;
+    uint32_t pps_disable_deblocking_filter;
+    if (!br_read_ue(&reader, &value, NULL, NULL) || value != 0 ||
+        !br_read_ue(&reader, &value, NULL, NULL) || value != 0 ||
+        !br_skip_bits(&reader, 2u + 3u + 2u) ||
+        !br_read_ue(&reader, &value, NULL, NULL) ||
+        !br_read_ue(&reader, &value, NULL, NULL) ||
+        !br_read_se(&reader, &signed_value) ||
+        !br_skip_bits(&reader, 3) ||
+        !br_read_se(&reader, &signed_value) ||
+        !br_read_se(&reader, &signed_value) ||
+        !br_skip_bits(&reader, 4) ||
+        !br_read_bits(&reader, 1, &tiles_enabled) ||
+            tiles_enabled != picture->pic_fields.bits.tiles_enabled_flag ||
+        !br_read_bits(&reader, 1, &entropy_coding_sync_enabled) ||
+            entropy_coding_sync_enabled !=
+                picture->pic_fields.bits.entropy_coding_sync_enabled_flag ||
+        !br_read_ue(&reader, &value, NULL, NULL) ||
+            value != picture->num_tile_columns_minus1 ||
+        !br_read_ue(&reader, &value, NULL, NULL) ||
+            value != picture->num_tile_rows_minus1 ||
+        !br_read_bits(&reader, 1, &uniform_spacing) ||
+            uniform_spacing != expected_uniform_spacing ||
+        (!uniform_spacing &&
+         (!br_read_ue(&reader, &value, NULL, NULL) ||
+          value != expected_column_width_minus1 ||
+          !br_read_ue(&reader, &value, NULL, NULL) ||
+          value != expected_row_height_minus1)) ||
+        !br_read_bits(&reader, 1, &loop_filter_across_tiles) ||
+            loop_filter_across_tiles !=
+                picture->pic_fields.bits.loop_filter_across_tiles_enabled_flag ||
+        !br_read_bits(&reader, 1, &pps_loop_filter_across_slices) ||
+            pps_loop_filter_across_slices !=
+                picture->pic_fields.bits.pps_loop_filter_across_slices_enabled_flag ||
+        !br_read_bits(&reader, 1, &deblocking_filter_control_present) ||
+            deblocking_filter_control_present != 1 ||
+        !br_read_bits(&reader, 1, &deblocking_filter_override) ||
+            deblocking_filter_override !=
+                picture->slice_parsing_fields.bits.deblocking_filter_override_enabled_flag ||
+        !br_read_bits(&reader, 1, &pps_disable_deblocking_filter) ||
+            pps_disable_deblocking_filter !=
+                picture->slice_parsing_fields.bits.pps_disable_deblocking_filter_flag) {
+        fprintf(stderr, "HEVC tile PPS syntax or following fields are misaligned\n");
+        return 0;
+    }
+    return 1;
+}
+
+static int test_hevc_tiles_pps_serialization(void)
+{
+    VAPictureParameterBufferHEVC picture = {0};
+    picture.pic_width_in_luma_samples = 640;
+    picture.pic_height_in_luma_samples = 360;
+    picture.pic_fields.bits.chroma_format_idc = 1;
+    picture.log2_diff_max_min_luma_coding_block_size = 3;
+    picture.pic_fields.bits.tiles_enabled_flag = 1;
+    picture.pic_fields.bits.loop_filter_across_tiles_enabled_flag = 1;
+    picture.num_tile_columns_minus1 = 1;
+    picture.num_tile_rows_minus1 = 1;
+    picture.column_width_minus1[0] = 4;
+    picture.row_height_minus1[0] = 2;
+    if (!hobot_hevc_picture_parameters_supported(&picture, 640, 360) ||
+        !test_hevc_tiles_pps_layout(&picture, 1, 0, 0)) {
+        fprintf(stderr, "valid uniform HEVC tile PPS was rejected or misserialized\n");
+        return 0;
+    }
+
+    picture.column_width_minus1[0] = 5;
+    picture.row_height_minus1[0] = 3;
+    if (!hobot_hevc_picture_parameters_supported(&picture, 640, 360) ||
+        !test_hevc_tiles_pps_layout(&picture, 0, 5, 3)) {
+        fprintf(stderr, "valid non-uniform HEVC tile PPS was rejected or misserialized\n");
+        return 0;
+    }
+    return 1;
+}
+
+static size_t test_build_two_rps_sao_slice(
+    uint8_t *data,
+    size_t capacity,
+    unsigned int slice_type,
+    int temporal_mvp_enabled,
+    int collocated_from_l0_flag,
+    int sao_luma_flag,
+    int sao_chroma_flag
+)
+{
+    if (!data || capacity < 8 || (slice_type != 0 && slice_type != 1))
+        return 0;
+
+    memset(data, 0, capacity);
+    data[0] = 0x02;
+    data[1] = 0x01;
+    BitWriter writer = {data + 2, 0};
+    bw_put_bit(&writer, 1);       /* first_slice_segment_in_pic_flag */
+    bw_put_ue(&writer, 0);        /* slice_pic_parameter_set_id */
+    bw_put_ue(&writer, slice_type);
+    bw_put_bits(&writer, 1, 8);   /* slice_pic_order_cnt_lsb */
+    bw_put_bit(&writer, 1);       /* select an SPS RPS */
+    bw_put_bit(&writer, 0);       /* select SPS RPS index 0 */
+    if (temporal_mvp_enabled) {
+        bw_put_bit(&writer, 1);
+    }
+    bw_put_bit(&writer, (unsigned int)sao_luma_flag);
+    bw_put_bit(&writer, (unsigned int)sao_chroma_flag);
+    bw_put_bit(&writer, 0);       /* no active-reference override */
+    if (slice_type == 0)
+        bw_put_bit(&writer, 0);   /* mvd_l1_zero_flag */
+    if (temporal_mvp_enabled && slice_type == 0)
+        bw_put_bit(&writer, (unsigned int)collocated_from_l0_flag);
+    bw_put_ue(&writer, 0);        /* five_minus_max_num_merge_cand */
+    bw_put_se(&writer, 0);        /* slice_qp_delta */
+    bw_put_bit(&writer, 1);       /* byte_alignment() */
+    while (writer.bit_pos % 8u)
+        bw_put_bit(&writer, 0);
+
+    return 2u + writer.bit_pos / 8u;
+}
+
+static size_t test_build_two_rps_inline_tmvp_slice(
+    uint8_t *data,
+    size_t capacity
+)
+{
+    if (!data || capacity < 8)
+        return 0;
+
+    memset(data, 0, capacity);
+    data[0] = 0x02;
+    data[1] = 0x01;
+    BitWriter writer = {data + 2, 0};
+    bw_put_bit(&writer, 1);       /* first_slice_segment_in_pic_flag */
+    bw_put_ue(&writer, 0);        /* slice_pic_parameter_set_id */
+    bw_put_ue(&writer, 1);        /* P slice */
+    bw_put_bits(&writer, 1, 8);   /* slice_pic_order_cnt_lsb */
+    bw_put_bit(&writer, 0);       /* inline short-term RPS */
+    bw_put_bit(&writer, 0);       /* no inter-RPS prediction */
+    bw_put_ue(&writer, 1);        /* one negative reference */
+    bw_put_ue(&writer, 0);        /* no positive references */
+    bw_put_ue(&writer, 0);        /* reference POC -1 */
+    bw_put_bit(&writer, 1);       /* reference is used by current picture */
+    bw_put_bit(&writer, 1);       /* temporal MVP enabled */
+    bw_put_bit(&writer, 1);       /* SAO luma */
+    bw_put_bit(&writer, 1);       /* SAO chroma */
+    bw_put_bit(&writer, 0);       /* no active-reference override */
+    bw_put_ue(&writer, 0);        /* five_minus_max_num_merge_cand */
+    bw_put_se(&writer, 0);        /* slice_qp_delta */
+    bw_put_bit(&writer, 1);       /* byte_alignment() */
+    while (writer.bit_pos % 8u)
+        bw_put_bit(&writer, 0);
+
+    return 2u + writer.bit_pos / 8u;
+}
+
+static size_t test_build_zero_rps_tmvp_slice(
+    uint8_t *data,
+    size_t capacity
+)
+{
+    if (!data || capacity < 8)
+        return 0;
+
+    memset(data, 0, capacity);
+    data[0] = 0x02;
+    data[1] = 0x01;
+    BitWriter writer = {data + 2, 0};
+    bw_put_bit(&writer, 1);       /* first_slice_segment_in_pic_flag */
+    bw_put_ue(&writer, 0);        /* slice_pic_parameter_set_id */
+    bw_put_ue(&writer, 1);        /* P slice */
+    bw_put_bits(&writer, 1, 8);   /* slice_pic_order_cnt_lsb */
+    bw_put_bit(&writer, 0);       /* inline short-term RPS */
+    bw_put_ue(&writer, 1);        /* one negative reference */
+    bw_put_ue(&writer, 0);        /* no positive references */
+    bw_put_ue(&writer, 0);        /* reference POC -1 */
+    bw_put_bit(&writer, 1);       /* reference is used by current picture */
+    bw_put_bit(&writer, 1);       /* temporal MVP enabled */
+    bw_put_bit(&writer, 1);       /* SAO luma */
+    bw_put_bit(&writer, 1);       /* SAO chroma */
+    bw_put_bit(&writer, 0);       /* no active-reference override */
+    bw_put_ue(&writer, 0);        /* five_minus_max_num_merge_cand */
+    bw_put_se(&writer, 0);        /* slice_qp_delta */
+    bw_put_bit(&writer, 1);       /* byte_alignment() */
+    while (writer.bit_pos % 8u)
+        bw_put_bit(&writer, 0);
+
+    return 2u + writer.bit_pos / 8u;
 }
 
 static size_t test_build_two_rps_weighted_slice(
@@ -907,6 +1701,12 @@ static size_t test_build_inline_rps_slice(
         return 0;
     (void)use_delta; /* Direct RPS syntax has no use_delta_flag. */
 
+    TestHevcInlineSliceOptions defaults = {
+        .temporal_mvp_present = 1,
+        .temporal_mvp_enabled = 1,
+    };
+    const TestHevcInlineSliceOptions *opts = options ? options : &defaults;
+
     memset(data, 0, capacity);
     data[0] = 0x02;
     data[1] = 0x01;
@@ -927,11 +1727,6 @@ static size_t test_build_inline_rps_slice(
         }
         *rps_bits = (uint32_t)(writer.bit_pos - rps_start);
     }
-    TestHevcInlineSliceOptions defaults = {
-        .temporal_mvp_present = 1,
-        .temporal_mvp_enabled = 1,
-    };
-    const TestHevcInlineSliceOptions *opts = options ? options : &defaults;
     if (opts->temporal_mvp_present)
         bw_put_bit(&writer, (unsigned int)opts->temporal_mvp_enabled);
     if (slice_type != 2) {
@@ -962,6 +1757,9 @@ static size_t test_build_inline_rps_slice(
         if (slice_type == 0)
             bw_put_bit(&writer, (unsigned int)opts->mvd_l1_zero);
     }
+    if (opts->temporal_mvp_present && opts->temporal_mvp_enabled &&
+        slice_type == 0)
+        bw_put_bit(&writer, 1); /* collocated_from_l0_flag */
     bw_put_ue(&writer, 0);
     bw_put_se(&writer, 0);
     bw_put_bit(&writer, 1);
@@ -1110,6 +1908,87 @@ static int test_hevc_rps_slice_validation(void)
         return 0;
     }
 
+    picture.num_short_term_ref_pic_sets = 0;
+    picture.st_rps_bits = 0;
+    picture.CurrPic.pic_order_cnt = 32;
+    picture.slice_parsing_fields.bits.RapPicFlag = 1;
+    picture.slice_parsing_fields.bits.sps_temporal_mvp_enabled_flag = 1;
+    const int32_t cra_ref_pocs[4] = {22, 28, 26, 24};
+    for (size_t i = 0; i < 15; i++) {
+        picture.ReferenceFrames[i].picture_id = VA_INVALID_SURFACE;
+        picture.ReferenceFrames[i].flags = VA_PICTURE_HEVC_INVALID;
+    }
+    for (size_t i = 0; i < 4; i++) {
+        picture.ReferenceFrames[i].picture_id = (VASurfaceID)(10 + i);
+        picture.ReferenceFrames[i].pic_order_cnt = cra_ref_pocs[i];
+        picture.ReferenceFrames[i].flags = 0;
+    }
+
+    uint8_t cra_leading_data[64] = {0x2a, 0x01};
+    BitWriter cra_leading_writer = {cra_leading_data + 2, 0};
+    bw_put_bit(&cra_leading_writer, 1);       /* first_slice_segment_in_pic_flag */
+    bw_put_bit(&cra_leading_writer, 0);       /* no_output_of_prior_pics_flag */
+    bw_put_ue(&cra_leading_writer, 0);        /* slice_pic_parameter_set_id */
+    bw_put_ue(&cra_leading_writer, 2);        /* I slice */
+    bw_put_bits(&cra_leading_writer, 32, 8);  /* slice_pic_order_cnt_lsb */
+    bw_put_bit(&cra_leading_writer, 0);       /* inline short-term RPS */
+    size_t cra_leading_rps_start = cra_leading_writer.bit_pos;
+    bw_put_ue(&cra_leading_writer, 4);        /* num_negative_pics */
+    bw_put_ue(&cra_leading_writer, 0);        /* num_positive_pics */
+    const uint32_t cra_delta_pocs[4] = {3, 1, 1, 1};
+    for (size_t i = 0; i < 4; i++) {
+        bw_put_ue(&cra_leading_writer, cra_delta_pocs[i]);
+        bw_put_bit(&cra_leading_writer, 0);   /* not used by current CRA */
+    }
+    picture.st_rps_bits =
+        (uint32_t)(cra_leading_writer.bit_pos - cra_leading_rps_start);
+    bw_put_bit(&cra_leading_writer, 1);       /* slice_temporal_mvp_enabled_flag */
+    bw_put_bit(&cra_leading_writer, 1);       /* slice_sao_luma_flag */
+    bw_put_bit(&cra_leading_writer, 1);       /* slice_sao_chroma_flag */
+    bw_put_se(&cra_leading_writer, 6);        /* slice_qp_delta */
+    bw_put_bit(&cra_leading_writer, 1);       /* loop_filter_across_slices */
+    bw_put_bit(&cra_leading_writer, 1);       /* byte_alignment() */
+    while (cra_leading_writer.bit_pos % 8u)
+        bw_put_bit(&cra_leading_writer, 0);
+    size_t cra_leading_size = 2u + cra_leading_writer.bit_pos / 8u;
+
+    memset(&slice, 0, sizeof(slice));
+    memset(slice.RefPicList, 0xff, sizeof(slice.RefPicList));
+    slice.slice_data_size = (uint32_t)cra_leading_size;
+    slice.slice_data_byte_offset = (uint32_t)cra_leading_size;
+    slice.slice_data_flag = VA_SLICE_DATA_FLAG_ALL;
+    slice.LongSliceFlags.fields.LastSliceOfPic = 1;
+    slice.LongSliceFlags.fields.slice_type = 2;
+    slice.LongSliceFlags.fields.slice_temporal_mvp_enabled_flag = 1;
+    slice.LongSliceFlags.fields.slice_sao_luma_flag = 1;
+    slice.LongSliceFlags.fields.slice_sao_chroma_flag = 1;
+    slice.LongSliceFlags.fields.slice_loop_filter_across_slices_enabled_flag = 1;
+    slice.slice_qp_delta = 6;
+    if (!hobot_hevc_validated_rps_slice_supported(
+            &picture, &slice, cra_leading_data, cra_leading_size, &sequence)) {
+        fprintf(stderr, "CRA with inline unused following references was rejected\n");
+        return 0;
+    }
+    picture.ReferenceFrames[3].pic_order_cnt = 25;
+    if (hobot_hevc_validated_rps_slice_supported(
+            &picture, &slice, cra_leading_data, cra_leading_size, &sequence)) {
+        fprintf(stderr, "CRA with a mismatched retained-reference POC was accepted\n");
+        return 0;
+    }
+    picture.ReferenceFrames[3].pic_order_cnt = cra_ref_pocs[3];
+    picture.ReferenceFrames[4].picture_id = 14;
+    picture.ReferenceFrames[4].pic_order_cnt = 20;
+    picture.ReferenceFrames[4].flags = 0;
+    if (hobot_hevc_validated_rps_slice_supported(
+            &picture, &slice, cra_leading_data, cra_leading_size, &sequence)) {
+        fprintf(stderr, "CRA with an unlisted DPB reference was accepted\n");
+        return 0;
+    }
+
+    for (size_t i = 0; i < 15; i++) {
+        picture.ReferenceFrames[i].picture_id = VA_INVALID_SURFACE;
+        picture.ReferenceFrames[i].flags = VA_PICTURE_HEVC_INVALID;
+    }
     picture.num_short_term_ref_pic_sets = 2;
     picture.st_rps_bits = 0;
     picture.slice_parsing_fields.bits.RapPicFlag = 0;
@@ -1177,7 +2056,8 @@ static int test_hevc_rps_slice_validation(void)
     }
 
     uint8_t generated_sps[256];
-    int generated_sps_size = generate_hevc_sps(&picture, 1, generated_sps,
+    int generated_sps_size = generate_hevc_sps(&picture, 1, NULL,
+                                               generated_sps,
                                                sizeof(generated_sps));
     if (generated_sps_size < 3) {
         fprintf(stderr, "single-set HEVC SPS synthesis failed\n");
@@ -1251,7 +2131,7 @@ static int test_hevc_rps_slice_validation(void)
     slice.slice_data_size = (uint32_t)(2u + source_ebsp_size);
     uint8_t *rewritten_nal = NULL;
     size_t rewritten_nal_size = 0;
-    int rewrite_status = hobot_hevc_rewrite_single_rps_slice(
+    int rewrite_status = hobot_hevc_rewrite_rps_slice(
         &picture, &slice, source_nal, slice.slice_data_size,
         &rewritten_nal, &rewritten_nal_size);
     if (rewrite_status != 1 || !rewritten_nal || rewritten_nal_size < 3) {
@@ -1275,7 +2155,7 @@ static int test_hevc_rps_slice_validation(void)
     int sps_rps_selected = 0;
     if (!hobot_hevc_validated_rps_slice_supported_internal(
             &picture, &slice, source_nal, slice.slice_data_size, &sequence,
-            &insert_bit, &sps_rps_selected) || !sps_rps_selected ||
+            NULL, &insert_bit, &sps_rps_selected, NULL, NULL) || !sps_rps_selected ||
         insert_bit >= rewritten_rbsp_size * 8u ||
         ((rewritten_rbsp[insert_bit / 8u] >>
           (7u - (insert_bit % 8u))) & 1u) != 0) {
@@ -1353,7 +2233,8 @@ static int test_hevc_rps_slice_validation(void)
     int second_sps_rps_selected = 0;
     if (!hobot_hevc_validated_rps_slice_supported_internal(
             &picture, &slice, second_slice_nal, slice.slice_data_size,
-            &sequence, &second_insert_bit, &second_sps_rps_selected) ||
+            &sequence, NULL, &second_insert_bit,
+            &second_sps_rps_selected, NULL, NULL) ||
         !second_sps_rps_selected || second_insert_bit != 20u) {
         fprintf(stderr, "independent second slice did not select SPS RPS at bit 20\n");
         return 0;
@@ -1361,7 +2242,7 @@ static int test_hevc_rps_slice_validation(void)
 
     rewritten_nal = NULL;
     rewritten_nal_size = 0;
-    if (hobot_hevc_rewrite_single_rps_slice(
+    if (hobot_hevc_rewrite_rps_slice(
             &picture, &slice, second_slice_nal, slice.slice_data_size,
             &rewritten_nal, &rewritten_nal_size) != 1 ||
         !rewritten_nal || rewritten_nal_size < 3u) {
@@ -1494,7 +2375,7 @@ static int test_hevc_rps_slice_validation(void)
     picture.pic_height_in_luma_samples = 360;
     uint8_t *sps_sao_rewritten = NULL;
     size_t sps_sao_rewritten_size = 0;
-    if (hobot_hevc_rewrite_single_rps_slice(
+    if (hobot_hevc_rewrite_rps_slice(
             &picture, &slice, sps_sao_p_data, sps_sao_size,
             &sps_sao_rewritten, &sps_sao_rewritten_size) != 1 ||
         !sps_sao_rewritten || sps_sao_rewritten_size < 3) {
@@ -1671,7 +2552,7 @@ static int test_hevc_rps_slice_validation(void)
     picture.pic_height_in_luma_samples = 360;
     uint8_t *inline_rewrite = NULL;
     size_t inline_rewrite_size = 0;
-    if (hobot_hevc_rewrite_single_rps_slice(
+    if (hobot_hevc_rewrite_rps_slice(
             &picture, &slice, count1_inline_data, count1_inline_size,
             &inline_rewrite, &inline_rewrite_size) != 0 ||
         inline_rewrite || inline_rewrite_size != 0) {
@@ -1702,6 +2583,7 @@ static int test_hevc_rps_slice_validation(void)
     picture.st_rps_bits = inline_rps_bits;
     picture.slice_parsing_fields.bits.sps_temporal_mvp_enabled_flag = 1;
     slice.LongSliceFlags.fields.slice_temporal_mvp_enabled_flag = 1;
+    slice.LongSliceFlags.fields.collocated_from_l0_flag = 1;
     slice.LongSliceFlags.fields.slice_sao_luma_flag = 0;
     slice.LongSliceFlags.fields.slice_sao_chroma_flag = 0;
     slice.LongSliceFlags.fields.slice_loop_filter_across_slices_enabled_flag = 0;
@@ -2109,6 +2991,213 @@ static int test_hevc_rps_slice_validation(void)
         return 0;
     }
     picture.slice_parsing_fields.bits.lists_modification_present_flag = 0;
+
+    picture.slice_parsing_fields.bits.sample_adaptive_offset_enabled_flag = 1;
+    size_t two_rps_sao_offset = test_build_two_rps_sao_slice(
+        p_data, sizeof(p_data), 1, 0, 0, 1, 1);
+    slice.slice_data_size = (uint32_t)two_rps_sao_offset;
+    slice.slice_data_byte_offset = (uint32_t)two_rps_sao_offset;
+    slice.LongSliceFlags.fields.slice_sao_luma_flag = 1;
+    slice.LongSliceFlags.fields.slice_sao_chroma_flag = 1;
+    if (!two_rps_sao_offset || !hobot_hevc_validated_rps_slice_supported(
+            &picture, &slice, p_data, two_rps_sao_offset, &sequence)) {
+        fprintf(stderr, "valid two-RPS P slice with luma/chroma SAO was rejected\n");
+        return 0;
+    }
+    slice.LongSliceFlags.fields.slice_sao_luma_flag = 0;
+    if (hobot_hevc_validated_rps_slice_supported(
+            &picture, &slice, p_data, two_rps_sao_offset, &sequence)) {
+        fprintf(stderr, "two-RPS P slice accepted mismatched luma SAO metadata\n");
+        return 0;
+    }
+    slice.LongSliceFlags.fields.slice_sao_luma_flag = 1;
+    slice.LongSliceFlags.fields.slice_sao_chroma_flag = 0;
+    if (hobot_hevc_validated_rps_slice_supported(
+            &picture, &slice, p_data, two_rps_sao_offset, &sequence)) {
+        fprintf(stderr, "two-RPS P slice accepted mismatched chroma SAO metadata\n");
+        return 0;
+    }
+    slice.LongSliceFlags.fields.slice_sao_chroma_flag = 1;
+    slice.slice_data_byte_offset = (uint32_t)(two_rps_sao_offset - 1u);
+    if (hobot_hevc_validated_rps_slice_supported(
+            &picture, &slice, p_data, two_rps_sao_offset, &sequence)) {
+        fprintf(stderr, "two-RPS SAO slice header crossed its data boundary\n");
+        return 0;
+    }
+    picture.slice_parsing_fields.bits.sample_adaptive_offset_enabled_flag = 0;
+    slice.slice_data_byte_offset = (uint32_t)two_rps_sao_offset;
+    if (hobot_hevc_validated_rps_slice_supported(
+            &picture, &slice, p_data, two_rps_sao_offset, &sequence)) {
+        fprintf(stderr, "two-RPS slice accepted SAO flags when SPS SAO was disabled\n");
+        return 0;
+    }
+    picture.slice_parsing_fields.bits.sample_adaptive_offset_enabled_flag = 1;
+    picture.slice_parsing_fields.bits.sps_temporal_mvp_enabled_flag = 1;
+    slice.LongSliceFlags.fields.slice_temporal_mvp_enabled_flag = 1;
+    slice.LongSliceFlags.fields.collocated_from_l0_flag = 1;
+    slice.collocated_ref_idx = 0;
+    two_rps_sao_offset = test_build_two_rps_sao_slice(
+        p_data, sizeof(p_data), 1, 1, 1, 1, 1);
+    slice.slice_data_size = (uint32_t)two_rps_sao_offset;
+    slice.slice_data_byte_offset = (uint32_t)two_rps_sao_offset;
+    slice.LongSliceFlags.fields.slice_sao_luma_flag = 1;
+    slice.LongSliceFlags.fields.slice_sao_chroma_flag = 1;
+    if (!two_rps_sao_offset || !hobot_hevc_validated_rps_slice_supported(
+            &picture, &slice, p_data, two_rps_sao_offset, &sequence)) {
+        fprintf(stderr, "valid two-RPS P slice with temporal MVP was rejected\n");
+        return 0;
+    }
+    uint8_t *tmvp_rewritten_nal = NULL;
+    size_t tmvp_rewritten_nal_size = 0;
+    if (hobot_hevc_rewrite_rps_slice(
+            &picture, &slice, p_data, two_rps_sao_offset,
+            &tmvp_rewritten_nal, &tmvp_rewritten_nal_size) != 1 ||
+        !tmvp_rewritten_nal || tmvp_rewritten_nal_size < 3u) {
+        fprintf(stderr, "two-RPS temporal-MVP selection rewrite failed\n");
+        free(tmvp_rewritten_nal);
+        return 0;
+    }
+
+    uint8_t inline_tmvp_data[64];
+    size_t inline_tmvp_data_size = test_build_two_rps_inline_tmvp_slice(
+        inline_tmvp_data, sizeof(inline_tmvp_data));
+    VAPictureParameterBufferHEVC inline_source_picture = picture;
+    VASliceParameterBufferHEVC inline_source_slice = slice;
+    inline_source_picture.st_rps_bits = 7;
+    inline_source_slice.slice_data_size = (uint32_t)inline_tmvp_data_size;
+    inline_source_slice.slice_data_byte_offset =
+        (uint32_t)inline_tmvp_data_size;
+    if (!inline_tmvp_data_size || !hobot_hevc_validated_rps_slice_supported(
+            &inline_source_picture, &inline_source_slice, inline_tmvp_data,
+            inline_tmvp_data_size, &sequence)) {
+        fprintf(stderr, "valid inline two-RPS temporal-MVP syntax was rejected\n");
+        free(tmvp_rewritten_nal);
+        return 0;
+    }
+    uint8_t *inline_tmvp_rewritten_nal = NULL;
+    size_t inline_tmvp_rewritten_nal_size = 0;
+    if (hobot_hevc_rewrite_rps_slice(
+            &inline_source_picture, &inline_source_slice, inline_tmvp_data,
+            inline_tmvp_data_size, &inline_tmvp_rewritten_nal,
+            &inline_tmvp_rewritten_nal_size) != 1 ||
+        !inline_tmvp_rewritten_nal) {
+        fprintf(stderr, "inline two-RPS temporal-MVP rewrite failed\n");
+        free(tmvp_rewritten_nal);
+        free(inline_tmvp_rewritten_nal);
+        return 0;
+    }
+
+    VAPictureParameterBufferHEVC inline_tmvp_picture = picture;
+    VASliceParameterBufferHEVC inline_tmvp_slice = slice;
+    inline_tmvp_picture.num_short_term_ref_pic_sets = 0;
+    inline_tmvp_picture.st_rps_bits = 6;
+    inline_tmvp_slice.slice_data_size = (uint32_t)tmvp_rewritten_nal_size;
+    inline_tmvp_slice.slice_data_byte_offset =
+        (uint32_t)tmvp_rewritten_nal_size;
+    VASliceParameterBufferHEVC malformed_zero_rps_slice = inline_tmvp_slice;
+    malformed_zero_rps_slice.slice_data_size = (uint32_t)inline_tmvp_data_size;
+    malformed_zero_rps_slice.slice_data_byte_offset =
+        (uint32_t)inline_tmvp_data_size;
+    if (hobot_hevc_validated_rps_slice_supported(
+            &inline_tmvp_picture, &malformed_zero_rps_slice,
+            inline_tmvp_data, inline_tmvp_data_size, &sequence)) {
+        fprintf(stderr, "zero-RPS syntax accepted a two-set RPS prediction flag\n");
+        free(tmvp_rewritten_nal);
+        free(inline_tmvp_rewritten_nal);
+        return 0;
+    }
+
+    size_t zero_tmvp_data_size = test_build_zero_rps_tmvp_slice(
+        inline_tmvp_data, sizeof(inline_tmvp_data));
+    VASliceParameterBufferHEVC zero_tmvp_slice = inline_tmvp_slice;
+    zero_tmvp_slice.slice_data_size = (uint32_t)zero_tmvp_data_size;
+    zero_tmvp_slice.slice_data_byte_offset = (uint32_t)zero_tmvp_data_size;
+    if (!zero_tmvp_data_size || !hobot_hevc_validated_rps_slice_supported(
+            &inline_tmvp_picture, &zero_tmvp_slice, inline_tmvp_data,
+            zero_tmvp_data_size, &sequence)) {
+        fprintf(stderr, "valid zero-RPS inline syntax was rejected\n");
+        free(tmvp_rewritten_nal);
+        free(inline_tmvp_rewritten_nal);
+        return 0;
+    }
+    if (!hobot_hevc_validated_rps_slice_supported(
+            &inline_tmvp_picture, &inline_tmvp_slice, tmvp_rewritten_nal,
+            tmvp_rewritten_nal_size, &sequence)) {
+        fprintf(stderr, "rewritten two-RPS temporal-MVP inline syntax was invalid\n");
+        free(tmvp_rewritten_nal);
+        free(inline_tmvp_rewritten_nal);
+        return 0;
+    }
+    inline_tmvp_slice.slice_data_size =
+        (uint32_t)inline_tmvp_rewritten_nal_size;
+    inline_tmvp_slice.slice_data_byte_offset =
+        (uint32_t)inline_tmvp_rewritten_nal_size;
+    if (!hobot_hevc_validated_rps_slice_supported(
+            &inline_tmvp_picture, &inline_tmvp_slice,
+            inline_tmvp_rewritten_nal, inline_tmvp_rewritten_nal_size,
+            &sequence) ||
+        inline_tmvp_rewritten_nal_size != zero_tmvp_data_size ||
+        memcmp(inline_tmvp_rewritten_nal, inline_tmvp_data,
+               zero_tmvp_data_size) != 0 ||
+        tmvp_rewritten_nal_size != inline_tmvp_rewritten_nal_size ||
+        memcmp(tmvp_rewritten_nal, inline_tmvp_rewritten_nal,
+               tmvp_rewritten_nal_size) != 0) {
+        fprintf(stderr, "selected and inline two-RPS rewrites did not produce the expected zero-RPS header\n");
+        free(tmvp_rewritten_nal);
+        free(inline_tmvp_rewritten_nal);
+        return 0;
+    }
+    free(tmvp_rewritten_nal);
+    free(inline_tmvp_rewritten_nal);
+    slice.LongSliceFlags.fields.slice_temporal_mvp_enabled_flag = 0;
+    if (hobot_hevc_validated_rps_slice_supported(
+            &picture, &slice, p_data, two_rps_sao_offset, &sequence)) {
+        fprintf(stderr, "two-RPS P slice accepted mismatched temporal MVP metadata\n");
+        return 0;
+    }
+    slice.LongSliceFlags.fields.slice_temporal_mvp_enabled_flag = 1;
+    slice.LongSliceFlags.fields.collocated_from_l0_flag = 0;
+    if (hobot_hevc_validated_rps_slice_supported(
+            &picture, &slice, p_data, two_rps_sao_offset, &sequence)) {
+        fprintf(stderr, "two-RPS P slice accepted an invalid inferred collocated list\n");
+        return 0;
+    }
+    slice.LongSliceFlags.fields.collocated_from_l0_flag = 1;
+    slice.collocated_ref_idx = 1;
+    if (hobot_hevc_validated_rps_slice_supported(
+            &picture, &slice, p_data, two_rps_sao_offset, &sequence)) {
+        fprintf(stderr, "two-RPS P slice accepted an invalid collocated reference index\n");
+        return 0;
+    }
+
+    slice.collocated_ref_idx = 0;
+    slice.LongSliceFlags.fields.slice_type = 0;
+    slice.RefPicList[1][0] = 3;
+    two_rps_sao_offset = test_build_two_rps_sao_slice(
+        p_data, sizeof(p_data), 0, 1, 1, 1, 1);
+    slice.slice_data_size = (uint32_t)two_rps_sao_offset;
+    slice.slice_data_byte_offset = (uint32_t)two_rps_sao_offset;
+    if (!two_rps_sao_offset || !hobot_hevc_validated_rps_slice_supported(
+            &picture, &slice, p_data, two_rps_sao_offset, &sequence)) {
+        fprintf(stderr, "valid two-RPS B slice with temporal MVP was rejected\n");
+        return 0;
+    }
+    slice.LongSliceFlags.fields.collocated_from_l0_flag = 0;
+    if (hobot_hevc_validated_rps_slice_supported(
+            &picture, &slice, p_data, two_rps_sao_offset, &sequence)) {
+        fprintf(stderr, "two-RPS B slice accepted mismatched collocated-list metadata\n");
+        return 0;
+    }
+    slice.LongSliceFlags.fields.collocated_from_l0_flag = 1;
+    slice.LongSliceFlags.fields.slice_type = 1;
+    slice.RefPicList[1][0] = 0xff;
+    picture.slice_parsing_fields.bits.sps_temporal_mvp_enabled_flag = 0;
+    picture.slice_parsing_fields.bits.sample_adaptive_offset_enabled_flag = 0;
+    slice.LongSliceFlags.fields.slice_temporal_mvp_enabled_flag = 0;
+    slice.LongSliceFlags.fields.slice_sao_luma_flag = 0;
+    slice.LongSliceFlags.fields.slice_sao_chroma_flag = 0;
+    slice.slice_data_size = sizeof(p_data);
+
     picture.pic_fields.bits.weighted_pred_flag = 1;
     size_t weighted_p_offset = test_build_two_rps_weighted_slice(
         p_data, sizeof(p_data), 1, 1, 0, 0, 0, 0, 0, -1, 2, 0, 0, 0, 0,
@@ -2206,7 +3295,7 @@ static int test_hevc_rps_slice_validation(void)
     p_data[3] |= 0x02;
     if (hobot_hevc_validated_rps_slice_supported(
             &picture, &slice, p_data, sizeof(p_data), &sequence)) {
-        fprintf(stderr, "HEVC slice selecting unvalidated RPS index 1 was accepted\n");
+        fprintf(stderr, "HEVC slice with inconsistent SPS RPS index and references was accepted\n");
         return 0;
     }
     p_data[3] &= (uint8_t)~0x02u;
@@ -2214,6 +3303,183 @@ static int test_hevc_rps_slice_validation(void)
     if (hobot_hevc_validated_rps_slice_supported(
             &picture, &slice, p_data, sizeof(p_data), &sequence)) {
         fprintf(stderr, "HEVC RPS accepted a non-consecutive reference POC\n");
+        return 0;
+    }
+    return 1;
+}
+
+static size_t test_build_indexed_sps_rps_slice(
+    uint8_t *data,
+    size_t capacity,
+    unsigned int index,
+    unsigned int index_bits
+)
+{
+    if (!data || capacity < 8 || index_bits == 0 || index_bits > 6)
+        return 0;
+
+    memset(data, 0, capacity);
+    data[0] = 0x02;
+    data[1] = 0x01;
+    BitWriter writer = {data + 2, 0};
+    bw_put_bit(&writer, 1);
+    bw_put_ue(&writer, 0);
+    bw_put_ue(&writer, 1);
+    bw_put_bits(&writer, 1, 8);
+    bw_put_bit(&writer, 1);
+    bw_put_bits(&writer, index, index_bits);
+    bw_put_bit(&writer, 1);
+    bw_put_bit(&writer, 1);
+    bw_put_bit(&writer, 0);
+    bw_put_ue(&writer, 0);
+    bw_put_se(&writer, 0);
+    bw_put_bit(&writer, 1);
+    while (writer.bit_pos % 8u)
+        bw_put_bit(&writer, 0);
+
+    return 2u + writer.bit_pos / 8u;
+}
+
+static int test_hevc_three_sps_rps_index_rewrite(void)
+{
+    VAPictureParameterBufferHEVC picture = {0};
+    picture.CurrPic.picture_id = 1;
+    picture.CurrPic.pic_order_cnt = 1;
+    picture.pic_width_in_luma_samples = 640;
+    picture.pic_height_in_luma_samples = 360;
+    picture.log2_max_pic_order_cnt_lsb_minus4 = 4;
+    picture.log2_diff_max_min_luma_coding_block_size = 3;
+    picture.log2_diff_max_min_transform_block_size = 3;
+    picture.num_short_term_ref_pic_sets = 3;
+    picture.pic_fields.bits.chroma_format_idc = 1;
+    picture.slice_parsing_fields.bits.sample_adaptive_offset_enabled_flag = 1;
+    picture.sps_max_dec_pic_buffering_minus1 = 3;
+    for (size_t i = 0; i < 15; i++) {
+        picture.ReferenceFrames[i].picture_id = VA_INVALID_SURFACE;
+        picture.ReferenceFrames[i].flags = VA_PICTURE_HEVC_INVALID;
+    }
+    picture.ReferenceFrames[3].picture_id = 7;
+    picture.ReferenceFrames[3].pic_order_cnt = 0;
+    picture.ReferenceFrames[3].flags = VA_PICTURE_HEVC_RPS_ST_CURR_BEFORE;
+
+    HobotHevcSliceSequence sequence;
+    if (!hobot_hevc_slice_sequence_init(&picture, 1, &sequence))
+        return 0;
+
+    uint8_t data[64];
+    size_t data_size = test_build_indexed_sps_rps_slice(
+        data, sizeof(data), 2, 2);
+    VASliceParameterBufferHEVC slice = {0};
+    slice.slice_data_size = (uint32_t)data_size;
+    slice.slice_data_byte_offset = (uint32_t)data_size;
+    slice.slice_data_flag = VA_SLICE_DATA_FLAG_ALL;
+    slice.LongSliceFlags.fields.LastSliceOfPic = 1;
+    slice.LongSliceFlags.fields.slice_type = 1;
+    slice.LongSliceFlags.fields.slice_sao_luma_flag = 1;
+    slice.LongSliceFlags.fields.slice_sao_chroma_flag = 1;
+    slice.RefPicList[0][0] = 3;
+    memset(&slice.RefPicList[0][1], 0xff,
+           sizeof(slice.RefPicList[0]) - sizeof(slice.RefPicList[0][0]));
+    memset(slice.RefPicList[1], 0xff, sizeof(slice.RefPicList[1]));
+    if (!data_size || !hobot_hevc_picture_parameters_supported(
+            &picture, 640, 360) ||
+        !hobot_hevc_validated_rps_slice_supported(
+            &picture, &slice, data, data_size, &sequence)) {
+        fprintf(stderr, "valid three-set HEVC SPS RPS index was rejected\n");
+        return 0;
+    }
+
+    uint8_t *rewritten = NULL;
+    size_t rewritten_size = 0;
+    if (hobot_hevc_rewrite_rps_slice(
+            &picture, &slice, data, data_size,
+            &rewritten, &rewritten_size) != 1 || !rewritten) {
+        fprintf(stderr, "three-set HEVC SPS RPS was not rewritten inline\n");
+        free(rewritten);
+        return 0;
+    }
+
+    VAPictureParameterBufferHEVC inline_picture = picture;
+    inline_picture.num_short_term_ref_pic_sets = 0;
+    inline_picture.st_rps_bits = 6;
+    VASliceParameterBufferHEVC inline_slice = slice;
+    inline_slice.slice_data_size = (uint32_t)rewritten_size;
+    inline_slice.slice_data_byte_offset = (uint32_t)rewritten_size;
+    if (!hobot_hevc_validated_rps_slice_supported(
+            &inline_picture, &inline_slice, rewritten,
+            rewritten_size, &sequence)) {
+        fprintf(stderr, "three-set RPS rewrite did not produce valid inline syntax\n");
+        free(rewritten);
+        return 0;
+    }
+    free(rewritten);
+
+    uint8_t inline_data[64];
+    size_t inline_size = test_build_two_rps_inline_tmvp_slice(
+        inline_data, sizeof(inline_data));
+    VAPictureParameterBufferHEVC three_set_inline_picture = picture;
+    three_set_inline_picture.st_rps_bits = 7;
+    three_set_inline_picture.slice_parsing_fields.bits
+        .sps_temporal_mvp_enabled_flag = 1;
+    VASliceParameterBufferHEVC three_set_inline_slice = slice;
+    three_set_inline_slice.slice_data_size = (uint32_t)inline_size;
+    three_set_inline_slice.slice_data_byte_offset = (uint32_t)inline_size;
+    three_set_inline_slice.LongSliceFlags.fields
+        .slice_temporal_mvp_enabled_flag = 1;
+    three_set_inline_slice.LongSliceFlags.fields.collocated_from_l0_flag = 1;
+    uint8_t *inline_rewritten = NULL;
+    size_t inline_rewritten_size = 0;
+    if (!inline_size || !hobot_hevc_validated_rps_slice_supported(
+            &three_set_inline_picture, &three_set_inline_slice,
+            inline_data, inline_size, &sequence) ||
+        hobot_hevc_rewrite_rps_slice(
+            &three_set_inline_picture, &three_set_inline_slice,
+            inline_data, inline_size, &inline_rewritten,
+            &inline_rewritten_size) != 1 || !inline_rewritten) {
+        fprintf(stderr, "valid inline RPS with three SPS sets was rejected or not rewritten\n");
+        free(inline_rewritten);
+        return 0;
+    }
+    VAPictureParameterBufferHEVC rewritten_inline_picture =
+        three_set_inline_picture;
+    rewritten_inline_picture.num_short_term_ref_pic_sets = 0;
+    rewritten_inline_picture.st_rps_bits = 6;
+    three_set_inline_slice.slice_data_size = (uint32_t)inline_rewritten_size;
+    three_set_inline_slice.slice_data_byte_offset =
+        (uint32_t)inline_rewritten_size;
+    if (!hobot_hevc_validated_rps_slice_supported(
+            &rewritten_inline_picture, &three_set_inline_slice,
+            inline_rewritten, inline_rewritten_size, &sequence)) {
+        fprintf(stderr, "rewritten three-set inline RPS was invalid under the synthetic SPS\n");
+        free(inline_rewritten);
+        return 0;
+    }
+    free(inline_rewritten);
+
+    data_size = test_build_indexed_sps_rps_slice(
+        data, sizeof(data), 3, 2);
+    slice.slice_data_size = (uint32_t)data_size;
+    slice.slice_data_byte_offset = (uint32_t)data_size;
+    if (hobot_hevc_validated_rps_slice_supported(
+            &picture, &slice, data, data_size, &sequence)) {
+        fprintf(stderr, "out-of-range three-set HEVC SPS RPS index was accepted\n");
+        return 0;
+    }
+
+    picture.num_short_term_ref_pic_sets = 64;
+    data_size = test_build_indexed_sps_rps_slice(data, sizeof(data), 63, 6);
+    slice.slice_data_size = (uint32_t)data_size;
+    slice.slice_data_byte_offset = (uint32_t)data_size;
+    if (!hobot_hevc_validated_rps_slice_supported(
+            &picture, &slice, data, data_size, &sequence)) {
+        fprintf(stderr, "valid maximum-count HEVC SPS RPS index was rejected\n");
+        return 0;
+    }
+
+    picture.num_short_term_ref_pic_sets = 63;
+    if (hobot_hevc_validated_rps_slice_supported(
+            &picture, &slice, data, data_size, &sequence)) {
+        fprintf(stderr, "out-of-range maximum-width HEVC SPS RPS index was accepted\n");
         return 0;
     }
     return 1;
@@ -2232,6 +3498,7 @@ static int test_hevc_two_rps_multislice_p_validation(void)
     picture.pic_fields.bits.chroma_format_idc = 1;
     picture.ReferenceFrames[3].picture_id = 7;
     picture.ReferenceFrames[3].pic_order_cnt = 0;
+    picture.ReferenceFrames[3].flags = VA_PICTURE_HEVC_RPS_ST_CURR_BEFORE;
     for (size_t i = 0; i < 15; i++) {
         if (i != 3) {
             picture.ReferenceFrames[i].picture_id = VA_INVALID_SURFACE;
@@ -2305,11 +3572,391 @@ static int test_hevc_two_rps_multislice_p_validation(void)
     slices[1].slice_segment_address = 30;
 
     second_data[4] |= 0x08;
-    if (hobot_hevc_validated_rps_slice_supported(
+    if (!hobot_hevc_validated_rps_slice_supported(
             &picture, &slices[1], second_data, sizeof(second_data), &sequence)) {
-        fprintf(stderr, "HEVC P slice accepted an unsupported SPS RPS index\n");
+        fprintf(stderr, "valid HEVC P slice selecting SPS RPS index 1 was rejected\n");
         return 0;
     }
+    return 1;
+}
+
+static int test_hevc_rasl_nal_type_validation(void)
+{
+    VAPictureParameterBufferHEVC picture = {0};
+    picture.log2_max_pic_order_cnt_lsb_minus4 = 4;
+    picture.pic_fields.bits.chroma_format_idc = 1;
+    picture.pic_fields.bits.pps_loop_filter_across_slices_enabled_flag = 1;
+    picture.CurrPic.picture_id = 1;
+    picture.CurrPic.pic_order_cnt = 1;
+    picture.slice_parsing_fields.bits.IntraPicFlag = 0;
+    HobotHevcSliceSequence sequence = {
+        .picture_ctb_count = 1,
+        .slice_count = 1,
+    };
+    for (size_t i = 0; i < 15; i++) {
+        picture.ReferenceFrames[i].picture_id = VA_INVALID_SURFACE;
+        picture.ReferenceFrames[i].flags = VA_PICTURE_HEVC_INVALID;
+    }
+    picture.ReferenceFrames[0].picture_id = 2;
+    picture.ReferenceFrames[0].pic_order_cnt = 0;
+    picture.ReferenceFrames[0].flags = VA_PICTURE_HEVC_RPS_ST_CURR_BEFORE;
+
+    TestHevcInlineSliceOptions options = {0};
+    uint8_t data[64];
+    uint32_t rps_bits;
+    size_t data_size = test_build_inline_rps_slice(
+        data, sizeof(data), 1, 0, 1, 0, 0, 1, 0, &options, &rps_bits);
+    if (!data_size)
+        return 0;
+    picture.st_rps_bits = rps_bits;
+
+    VASliceParameterBufferHEVC slice = {0};
+    memset(slice.RefPicList, 0xff, sizeof(slice.RefPicList));
+    slice.slice_data_size = (uint32_t)data_size;
+    slice.slice_data_byte_offset = (uint32_t)data_size;
+    slice.slice_data_flag = VA_SLICE_DATA_FLAG_ALL;
+    slice.LongSliceFlags.fields.LastSliceOfPic = 1;
+    slice.LongSliceFlags.fields.slice_type = 1;
+    slice.LongSliceFlags.fields.slice_loop_filter_across_slices_enabled_flag = 1;
+    slice.RefPicList[0][0] = 0;
+
+    const uint8_t rasl_nal_types[] = {8, 9};
+    for (size_t i = 0; i < sizeof(rasl_nal_types); i++) {
+        data[0] = (uint8_t)(rasl_nal_types[i] << 1);
+        if (!hobot_hevc_validated_rps_slice_supported(
+                &picture, &slice, data, data_size, &sequence)) {
+            fprintf(stderr, "valid RASL NAL type %u was rejected\n",
+                    rasl_nal_types[i]);
+            return 0;
+        }
+    }
+
+    const uint8_t radl_nal_types[] = {6, 7};
+    for (size_t i = 0; i < sizeof(radl_nal_types); i++) {
+        data[0] = (uint8_t)(radl_nal_types[i] << 1);
+        if (hobot_hevc_validated_rps_slice_supported(
+                &picture, &slice, data, data_size, &sequence)) {
+            fprintf(stderr, "unsupported RADL NAL type %u was accepted\n",
+                    radl_nal_types[i]);
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static int test_hevc_two_rps_b_sao_validation(void)
+{
+    VAPictureParameterBufferHEVC picture = {0};
+    picture.CurrPic.picture_id = 1;
+    picture.CurrPic.pic_order_cnt = 1;
+    picture.pic_width_in_luma_samples = 640;
+    picture.pic_height_in_luma_samples = 360;
+    picture.log2_diff_max_min_luma_coding_block_size = 3;
+    picture.log2_max_pic_order_cnt_lsb_minus4 = 4;
+    picture.num_short_term_ref_pic_sets = 2;
+    picture.pic_fields.bits.chroma_format_idc = 1;
+    picture.slice_parsing_fields.bits.cabac_init_present_flag = 1;
+    picture.slice_parsing_fields.bits.sample_adaptive_offset_enabled_flag = 1;
+    picture.pic_fields.bits.pps_loop_filter_across_slices_enabled_flag = 1;
+    for (size_t i = 0; i < 15; i++) {
+        picture.ReferenceFrames[i].picture_id = VA_INVALID_SURFACE;
+        picture.ReferenceFrames[i].flags = VA_PICTURE_HEVC_INVALID;
+    }
+    picture.ReferenceFrames[3].picture_id = 7;
+    picture.ReferenceFrames[3].pic_order_cnt = 0;
+    picture.ReferenceFrames[3].flags = VA_PICTURE_HEVC_RPS_ST_CURR_BEFORE;
+
+    uint8_t data[32] = {0x02, 0x01};
+    BitWriter writer = {data + 2, 0};
+    bw_put_bit(&writer, 1);       /* first slice */
+    bw_put_ue(&writer, 0);        /* PPS id */
+    bw_put_ue(&writer, 0);        /* B slice */
+    bw_put_bits(&writer, 1, 8);   /* POC LSB */
+    bw_put_bit(&writer, 1);       /* select an SPS RPS */
+    bw_put_bit(&writer, 0);       /* select SPS RPS index 0 */
+    bw_put_bit(&writer, 1);       /* SAO luma */
+    bw_put_bit(&writer, 1);       /* SAO chroma */
+    bw_put_bit(&writer, 0);       /* no active-reference override */
+    bw_put_bit(&writer, 1);       /* mvd_l1_zero_flag */
+    bw_put_bit(&writer, 0);       /* cabac_init_flag */
+    bw_put_ue(&writer, 0);        /* five_minus_max_num_merge_cand */
+    bw_put_se(&writer, 6);        /* slice_qp_delta */
+    bw_put_bit(&writer, 1);       /* loop_filter_across_slices */
+    bw_put_bit(&writer, 1);       /* byte_alignment() */
+    while (writer.bit_pos % 8u)
+        bw_put_bit(&writer, 0);
+    size_t data_size = 2u + writer.bit_pos / 8u;
+
+    VASliceParameterBufferHEVC slice = {0};
+    memset(slice.RefPicList, 0xff, sizeof(slice.RefPicList));
+    slice.slice_data_size = (uint32_t)data_size;
+    slice.slice_data_byte_offset = (uint32_t)data_size;
+    slice.slice_data_flag = VA_SLICE_DATA_FLAG_ALL;
+    slice.RefPicList[0][0] = 3;
+    slice.RefPicList[1][0] = 3;
+    slice.LongSliceFlags.fields.LastSliceOfPic = 1;
+    slice.LongSliceFlags.fields.slice_type = 0;
+    slice.LongSliceFlags.fields.slice_sao_luma_flag = 1;
+    slice.LongSliceFlags.fields.slice_sao_chroma_flag = 1;
+    slice.LongSliceFlags.fields.mvd_l1_zero_flag = 1;
+    slice.LongSliceFlags.fields.slice_loop_filter_across_slices_enabled_flag = 1;
+    slice.slice_qp_delta = 6;
+
+    HobotHevcSliceSequence sequence;
+    if (!hobot_hevc_slice_sequence_init(&picture, 1, &sequence) ||
+        !hobot_hevc_slice_sequence_add(&sequence, &slice, data_size) ||
+        !hobot_hevc_slice_sequence_complete(&sequence) ||
+        !hobot_hevc_validated_rps_slice_supported(
+            &picture, &slice, data, data_size, &sequence)) {
+        fprintf(stderr, "valid two-RPS B slice with luma/chroma SAO was rejected\n");
+        return 0;
+    }
+
+    slice.LongSliceFlags.fields.slice_sao_luma_flag = 0;
+    if (hobot_hevc_validated_rps_slice_supported(
+            &picture, &slice, data, data_size, &sequence)) {
+        fprintf(stderr, "two-RPS B slice accepted mismatched luma SAO metadata\n");
+        return 0;
+    }
+    slice.LongSliceFlags.fields.slice_sao_luma_flag = 1;
+    slice.LongSliceFlags.fields.slice_sao_chroma_flag = 0;
+    if (hobot_hevc_validated_rps_slice_supported(
+            &picture, &slice, data, data_size, &sequence)) {
+        fprintf(stderr, "two-RPS B slice accepted mismatched chroma SAO metadata\n");
+        return 0;
+    }
+    slice.slice_data_byte_offset = (uint32_t)(data_size - 1u);
+    if (hobot_hevc_validated_rps_slice_supported(
+            &picture, &slice, data, data_size, &sequence)) {
+        fprintf(stderr, "two-RPS B SAO header crossed its data boundary\n");
+        return 0;
+    }
+    return 1;
+}
+
+static int test_hevc_two_rps_multireference_list_modification(void)
+{
+    VAPictureParameterBufferHEVC picture = {0};
+    picture.CurrPic.picture_id = 1;
+    picture.CurrPic.pic_order_cnt = 4;
+    picture.pic_width_in_luma_samples = 640;
+    picture.pic_height_in_luma_samples = 360;
+    picture.log2_diff_max_min_luma_coding_block_size = 3;
+    picture.log2_max_pic_order_cnt_lsb_minus4 = 4;
+    picture.num_short_term_ref_pic_sets = 2;
+    picture.num_ref_idx_l0_default_active_minus1 = 3;
+    picture.num_ref_idx_l1_default_active_minus1 = 3;
+    picture.pic_fields.bits.chroma_format_idc = 1;
+    picture.slice_parsing_fields.bits.cabac_init_present_flag = 1;
+    picture.slice_parsing_fields.bits.sample_adaptive_offset_enabled_flag = 1;
+    picture.slice_parsing_fields.bits.sps_temporal_mvp_enabled_flag = 1;
+    picture.slice_parsing_fields.bits.lists_modification_present_flag = 1;
+    picture.pic_fields.bits.pps_loop_filter_across_slices_enabled_flag = 1;
+
+    const uint8_t ref_slots[] = {2, 5, 7, 9};
+    for (size_t i = 0; i < 15; i++) {
+        picture.ReferenceFrames[i].picture_id = VA_INVALID_SURFACE;
+        picture.ReferenceFrames[i].flags = VA_PICTURE_HEVC_INVALID;
+    }
+    for (size_t i = 0; i < sizeof(ref_slots); i++) {
+        VAPictureHEVC *ref = &picture.ReferenceFrames[ref_slots[i]];
+        ref->picture_id = (VASurfaceID)(10u + i);
+        ref->pic_order_cnt = (int32_t)(3u - i);
+        ref->flags = VA_PICTURE_HEVC_RPS_ST_CURR_BEFORE;
+    }
+
+    uint8_t data[64] = {0x02, 0x01};
+    BitWriter writer = {data + 2, 0};
+    bw_put_bit(&writer, 1);       /* first slice */
+    bw_put_ue(&writer, 0);        /* PPS id */
+    bw_put_ue(&writer, 0);        /* B slice */
+    bw_put_bits(&writer, 4, 8);   /* POC LSB */
+    bw_put_bit(&writer, 1);       /* select an SPS RPS */
+    bw_put_bit(&writer, 0);       /* select SPS RPS index 0 */
+    bw_put_bit(&writer, 1);       /* temporal MVP enabled */
+    bw_put_bit(&writer, 1);       /* SAO luma */
+    bw_put_bit(&writer, 1);       /* SAO chroma */
+    bw_put_bit(&writer, 0);       /* no active-reference override */
+    bw_put_bit(&writer, 1);       /* modify L0 */
+    bw_put_bits(&writer, 2, 2);
+    bw_put_bits(&writer, 0, 2);
+    bw_put_bits(&writer, 3, 2);
+    bw_put_bits(&writer, 1, 2);
+    bw_put_bit(&writer, 1);       /* modify L1 */
+    bw_put_bits(&writer, 3, 2);
+    bw_put_bits(&writer, 1, 2);
+    bw_put_bits(&writer, 0, 2);
+    bw_put_bits(&writer, 2, 2);
+    bw_put_bit(&writer, 1);       /* mvd_l1_zero_flag */
+    bw_put_bit(&writer, 0);       /* cabac_init_flag */
+    bw_put_bit(&writer, 0);       /* collocated_from_l0_flag */
+    bw_put_ue(&writer, 2);        /* collocated_ref_idx */
+    bw_put_ue(&writer, 0);        /* five_minus_max_num_merge_cand */
+    bw_put_se(&writer, 0);        /* slice_qp_delta */
+    bw_put_bit(&writer, 1);       /* loop_filter_across_slices */
+    bw_put_bit(&writer, 1);       /* byte_alignment() */
+    while (writer.bit_pos % 8u)
+        bw_put_bit(&writer, 0);
+    size_t data_size = 2u + writer.bit_pos / 8u;
+
+    VASliceParameterBufferHEVC slice = {0};
+    memset(slice.RefPicList, 0xff, sizeof(slice.RefPicList));
+    slice.slice_data_size = (uint32_t)data_size;
+    slice.slice_data_byte_offset = (uint32_t)data_size;
+    slice.slice_data_flag = VA_SLICE_DATA_FLAG_ALL;
+    slice.num_ref_idx_l0_active_minus1 = 3;
+    slice.num_ref_idx_l1_active_minus1 = 3;
+    slice.RefPicList[0][0] = ref_slots[2];
+    slice.RefPicList[0][1] = ref_slots[0];
+    slice.RefPicList[0][2] = ref_slots[3];
+    slice.RefPicList[0][3] = ref_slots[1];
+    slice.RefPicList[1][0] = ref_slots[3];
+    slice.RefPicList[1][1] = ref_slots[1];
+    slice.RefPicList[1][2] = ref_slots[0];
+    slice.RefPicList[1][3] = ref_slots[2];
+    slice.LongSliceFlags.fields.LastSliceOfPic = 1;
+    slice.LongSliceFlags.fields.slice_type = 0;
+    slice.LongSliceFlags.fields.slice_temporal_mvp_enabled_flag = 1;
+    slice.LongSliceFlags.fields.slice_sao_luma_flag = 1;
+    slice.LongSliceFlags.fields.slice_sao_chroma_flag = 1;
+    slice.LongSliceFlags.fields.mvd_l1_zero_flag = 1;
+    slice.LongSliceFlags.fields.collocated_from_l0_flag = 0;
+    slice.LongSliceFlags.fields.slice_loop_filter_across_slices_enabled_flag = 1;
+    slice.collocated_ref_idx = 2;
+
+    HobotHevcSliceSequence sequence;
+    if (!hobot_hevc_slice_sequence_init(&picture, 1, &sequence) ||
+        !hobot_hevc_slice_sequence_add(&sequence, &slice, data_size) ||
+        !hobot_hevc_slice_sequence_complete(&sequence) ||
+        !hobot_hevc_validated_rps_slice_supported(
+            &picture, &slice, data, data_size, &sequence)) {
+        fprintf(stderr, "valid four-reference B slice with L0/L1 reordering was rejected\n");
+        return 0;
+    }
+
+    slice.RefPicList[0][0] = ref_slots[0];
+    if (hobot_hevc_validated_rps_slice_supported(
+            &picture, &slice, data, data_size, &sequence)) {
+        fprintf(stderr, "two-RPS B slice accepted a mismatched reordered L0 list\n");
+        return 0;
+    }
+    slice.RefPicList[0][0] = ref_slots[2];
+
+    picture.ReferenceFrames[12].picture_id = 20;
+    picture.ReferenceFrames[12].pic_order_cnt = -1;
+    picture.ReferenceFrames[12].flags = 0;
+    if (hobot_hevc_validated_rps_slice_supported(
+            &picture, &slice, data, data_size, &sequence)) {
+        fprintf(stderr, "selected SPS RPS accepted an unlisted retained DPB entry\n");
+        return 0;
+    }
+    picture.ReferenceFrames[12].picture_id = VA_INVALID_SURFACE;
+    picture.ReferenceFrames[12].flags = VA_PICTURE_HEVC_INVALID;
+
+    uint8_t *rewritten = NULL;
+    size_t rewritten_size = 0;
+    if (hobot_hevc_rewrite_rps_slice(
+            &picture, &slice, data, data_size, &rewritten, &rewritten_size) != 1 ||
+        !rewritten || rewritten_size < 3u) {
+        fprintf(stderr, "four-reference SPS-RPS slice rewrite failed\n");
+        free(rewritten);
+        return 0;
+    }
+
+    uint8_t rbsp[256];
+    size_t rbsp_size = 0;
+    BitReader rewritten_reader;
+    uint32_t value;
+    if (!hobot_hevc_unescape_rbsp(rewritten + 2, rewritten_size - 2u,
+                                  rbsp, sizeof(rbsp), &rbsp_size)) {
+        fprintf(stderr, "rewritten four-reference RBSP was invalid\n");
+        free(rewritten);
+        return 0;
+    }
+    rewritten_reader = (BitReader){rbsp, rbsp_size * 8u, 0};
+    uint32_t rps_start, negative_count, positive_count;
+    if (!br_skip_bits(&rewritten_reader, 1) ||
+        !br_read_ue(&rewritten_reader, &value, NULL, NULL) || value != 0 ||
+        !br_read_ue(&rewritten_reader, &value, NULL, NULL) || value != 0 ||
+        !br_read_bits(&rewritten_reader, 8, &value) || value != 4 ||
+        !br_read_bits(&rewritten_reader, 1, &value) || value != 0) {
+        fprintf(stderr, "rewritten slice did not contain inline RPS syntax\n");
+        free(rewritten);
+        return 0;
+    }
+    rps_start = (uint32_t)rewritten_reader.bit_pos;
+    if (!br_read_ue(&rewritten_reader, &negative_count, NULL, NULL) ||
+        negative_count != 4 ||
+        !br_read_ue(&rewritten_reader, &positive_count, NULL, NULL) ||
+        positive_count != 0) {
+        fprintf(stderr, "rewritten RPS lost the four negative references\n");
+        free(rewritten);
+        return 0;
+    }
+    for (uint32_t i = 0; i < negative_count; i++) {
+        if (!br_read_ue(&rewritten_reader, &value, NULL, NULL) || value != 0 ||
+            !br_read_bits(&rewritten_reader, 1, &value) || value != 1) {
+            fprintf(stderr, "rewritten RPS corrupted reference %u delta/use flag\n", i);
+            free(rewritten);
+            return 0;
+        }
+    }
+    uint32_t rps_bits = (uint32_t)(rewritten_reader.bit_pos - rps_start);
+    if (!br_read_bits(&rewritten_reader, 1, &value) || value != 1 ||
+        !br_read_bits(&rewritten_reader, 1, &value) || value != 1 ||
+        !br_read_bits(&rewritten_reader, 1, &value) || value != 1 ||
+        !br_read_bits(&rewritten_reader, 1, &value) || value != 0 ||
+        !br_read_bits(&rewritten_reader, 1, &value) || value != 1 ||
+        !br_read_bits(&rewritten_reader, 2, &value) || value != 2 ||
+        !br_read_bits(&rewritten_reader, 2, &value) || value != 0 ||
+        !br_read_bits(&rewritten_reader, 2, &value) || value != 3 ||
+        !br_read_bits(&rewritten_reader, 2, &value) || value != 1 ||
+        !br_read_bits(&rewritten_reader, 1, &value) || value != 1 ||
+        !br_read_bits(&rewritten_reader, 2, &value) || value != 3 ||
+        !br_read_bits(&rewritten_reader, 2, &value) || value != 1 ||
+        !br_read_bits(&rewritten_reader, 2, &value) || value != 0 ||
+        !br_read_bits(&rewritten_reader, 2, &value) || value != 2) {
+        fprintf(stderr, "rewritten slice did not preserve both modified reference lists\n");
+        free(rewritten);
+        return 0;
+    }
+
+    int32_t rewritten_qp_delta;
+    if (!br_read_bits(&rewritten_reader, 1, &value) || value != 1 ||
+        !br_read_bits(&rewritten_reader, 1, &value) || value != 0 ||
+        !br_read_bits(&rewritten_reader, 1, &value) || value != 0 ||
+        !br_read_ue(&rewritten_reader, &value, NULL, NULL) || value != 2 ||
+        !br_read_ue(&rewritten_reader, &value, NULL, NULL) || value != 0 ||
+        !br_read_se(&rewritten_reader, &rewritten_qp_delta) ||
+        rewritten_qp_delta != 0 ||
+        !br_read_bits(&rewritten_reader, 1, &value) || value != 1 ||
+        !br_read_bits(&rewritten_reader, 1, &value) || value != 1) {
+        fprintf(stderr, "rewritten B-slice suffix syntax was corrupted\n");
+        free(rewritten);
+        return 0;
+    }
+    while (rewritten_reader.bit_pos % 8u) {
+        if (!br_read_bits(&rewritten_reader, 1, &value) || value != 0) {
+            fprintf(stderr, "rewritten B-slice alignment padding was invalid\n");
+            free(rewritten);
+            return 0;
+        }
+    }
+    VAPictureParameterBufferHEVC inline_picture = picture;
+    VASliceParameterBufferHEVC inline_slice = slice;
+    inline_picture.num_short_term_ref_pic_sets = 0;
+    inline_picture.st_rps_bits = rps_bits;
+    inline_slice.slice_data_size = (uint32_t)rewritten_size;
+    inline_slice.slice_data_byte_offset =
+        (uint32_t)(2u + rewritten_reader.bit_pos / 8u);
+    if (!hobot_hevc_validated_rps_slice_supported(
+            &inline_picture, &inline_slice, rewritten, rewritten_size,
+            &sequence)) {
+        fprintf(stderr, "rewritten multi-reference inline B slice failed validation\n");
+        free(rewritten);
+        return 0;
+    }
+    free(rewritten);
     return 1;
 }
 
@@ -2328,6 +3975,7 @@ static int test_hevc_two_rps_multislice_b_validation(void)
     picture.pic_fields.bits.pps_loop_filter_across_slices_enabled_flag = 1;
     picture.ReferenceFrames[3].picture_id = 7;
     picture.ReferenceFrames[3].pic_order_cnt = 0;
+    picture.ReferenceFrames[3].flags = VA_PICTURE_HEVC_RPS_ST_CURR_BEFORE;
     for (size_t i = 0; i < 15; i++) {
         if (i != 3) {
             picture.ReferenceFrames[i].picture_id = VA_INVALID_SURFACE;
@@ -2622,16 +4270,16 @@ static int test_hevc_two_rps_multislice_idr_validation(void)
         !hobot_hevc_slice_sequence_add(&sequence, &slices[0], sizeof(first_data)) ||
         !hobot_hevc_slice_sequence_add(&sequence, &slices[1], sizeof(second_data)) ||
         !hobot_hevc_slice_sequence_complete(&sequence) ||
-        !hobot_hevc_idr_slice_supported(
+        !hobot_hevc_validated_rps_slice_supported(
             &picture, &slices[0], first_data, sizeof(first_data), &sequence) ||
-        !hobot_hevc_idr_slice_supported(
+        !hobot_hevc_validated_rps_slice_supported(
             &picture, &slices[1], second_data, sizeof(second_data), &sequence)) {
         fprintf(stderr, "valid two-slice IDR with unused SPS RPS sets was rejected\n");
         return 0;
     }
 
     slices[1].slice_segment_address = 29;
-    if (hobot_hevc_idr_slice_supported(
+    if (hobot_hevc_validated_rps_slice_supported(
             &picture, &slices[1], second_data, sizeof(second_data), &sequence)) {
         fprintf(stderr, "HEVC IDR accepted a slice address inconsistent with its NAL header\n");
         return 0;
@@ -2640,7 +4288,7 @@ static int test_hevc_two_rps_multislice_idr_validation(void)
 
     uint8_t non_idr_nal_type = second_data[0];
     second_data[0] = 0x02;
-    if (hobot_hevc_idr_slice_supported(
+    if (hobot_hevc_validated_rps_slice_supported(
             &picture, &slices[1], second_data, sizeof(second_data), &sequence)) {
         fprintf(stderr, "HEVC multi-slice RPS validator accepted non-IDR input\n");
         return 0;
@@ -2649,7 +4297,7 @@ static int test_hevc_two_rps_multislice_idr_validation(void)
 
     uint8_t non_independent_header = second_data[2];
     second_data[2] |= 0x80;
-    if (hobot_hevc_idr_slice_supported(
+    if (hobot_hevc_validated_rps_slice_supported(
             &picture, &slices[1], second_data, sizeof(second_data), &sequence)) {
         fprintf(stderr, "HEVC multi-slice RPS validator accepted a wrong first-slice flag\n");
         return 0;
@@ -2690,8 +4338,42 @@ static int test_hevc_main_encoder_parameter_validation(void)
         !hobot_hevc_encode_sequence_supported(&sequence, 640, 368) ||
         !hobot_hevc_encode_picture_supported(&picture) ||
         !hobot_hevc_encode_slice_supported(&sequence, &picture, &slice,
-                                           640, 360)) {
+                                           640, 360, VA_RC_CBR)) {
         fprintf(stderr, "valid HEVC Main I-frame encode parameters were rejected\n");
+        return 0;
+    }
+
+    VAEncSequenceParameterBufferHEVC changed_sequence = sequence;
+    if (!hobot_hevc_encode_sequence_static_equal(&sequence, &sequence)) {
+        fprintf(stderr, "identical HEVC sequence parameters were not considered static-equal\n");
+        return 0;
+    }
+    changed_sequence.intra_period++;
+    changed_sequence.bits_per_second += 1000000;
+    if (!hobot_hevc_encode_sequence_static_equal(&sequence, &changed_sequence)) {
+        fprintf(stderr, "dynamic HEVC rate-control fields were treated as static\n");
+        return 0;
+    }
+    changed_sequence = sequence;
+    changed_sequence.pic_width_in_luma_samples++;
+    if (hobot_hevc_encode_sequence_static_equal(&sequence, &changed_sequence)) {
+        fprintf(stderr, "HEVC coded width change was treated as dynamic\n");
+        return 0;
+    }
+    changed_sequence = sequence;
+    changed_sequence.seq_fields.bits.sps_temporal_mvp_enabled_flag = 1;
+    if (hobot_hevc_encode_sequence_static_equal(&sequence, &changed_sequence)) {
+        fprintf(stderr, "HEVC SPS syntax change was treated as dynamic\n");
+        return 0;
+    }
+
+    VAEncPictureParameterBufferHEVC wpp_picture = picture;
+    wpp_picture.pic_fields.bits.entropy_coding_sync_enabled_flag = 1;
+    if (!hobot_hevc_encode_picture_supported(&wpp_picture) ||
+        !hobot_hevc_encode_slice_supported(&sequence, &wpp_picture, &slice,
+                                           640, 360, VA_RC_CBR) ||
+        hobot_hevc_encode_picture_static_equal(&picture, &wpp_picture)) {
+        fprintf(stderr, "HEVC WPP encode settings were rejected or treated as dynamic\n");
         return 0;
     }
 
@@ -2720,7 +4402,8 @@ static int test_hevc_main_encoder_parameter_validation(void)
     VAEncSliceParameterBufferHEVC ctu_boundary_slice = slice;
     ctu_boundary_slice.num_ctu_in_slice = 1;
     if (!hobot_hevc_encode_slice_supported(&ctu_boundary_sequence, &picture,
-                                           &ctu_boundary_slice, 64, 79)) {
+                                           &ctu_boundary_slice, 64, 79,
+                                           VA_RC_CBR)) {
         fprintf(stderr, "HEVC CTU validation used padded context dimensions\n");
         return 0;
     }
@@ -2756,18 +4439,34 @@ static int test_hevc_main_encoder_parameter_validation(void)
     sequence.pic_height_in_luma_samples = 360;
     slice.num_ctu_in_slice--;
     if (hobot_hevc_encode_slice_supported(&sequence, &picture, &slice,
-                                          640, 360)) {
+                                          640, 360, VA_RC_CBR)) {
         fprintf(stderr, "partial HEVC picture slice was accepted\n");
         return 0;
     }
     slice.num_ctu_in_slice++;
     slice.slice_fields.bits.slice_temporal_mvp_enabled_flag = 1;
     if (hobot_hevc_encode_slice_supported(&sequence, &picture, &slice,
-                                          640, 360)) {
+                                          640, 360, VA_RC_CBR)) {
         fprintf(stderr, "HEVC slice enabled temporal MVP without SPS support\n");
         return 0;
     }
     slice.slice_fields.bits.slice_temporal_mvp_enabled_flag = 0;
+
+    VAEncSliceParameterBufferHEVC cqp_slice = slice;
+    cqp_slice.slice_qp_delta = 25;
+    if (!hobot_hevc_encode_slice_supported(&sequence, &picture, &cqp_slice,
+                                           640, 360, VA_RC_CQP) ||
+        hobot_hevc_encode_slice_supported(&sequence, &picture, &cqp_slice,
+                                          640, 360, VA_RC_CBR)) {
+        fprintf(stderr, "HEVC CQP slice delta was rejected or accepted in CBR\n");
+        return 0;
+    }
+    cqp_slice.slice_qp_delta = -27;
+    if (hobot_hevc_encode_slice_supported(&sequence, &picture, &cqp_slice,
+                                          640, 360, VA_RC_CQP)) {
+        fprintf(stderr, "HEVC CQP out-of-range effective QP was accepted\n");
+        return 0;
+    }
 
     VAEncPictureParameterBufferHEVC changed_picture = picture;
     changed_picture.pic_fields.bits.transform_skip_enabled_flag = 1;
@@ -2776,7 +4475,147 @@ static int test_hevc_main_encoder_parameter_validation(void)
         fprintf(stderr, "HEVC PPS change was not distinguished from per-frame state\n");
         return 0;
     }
+    changed_picture = picture;
+    changed_picture.pic_init_qp = 40;
+    if (!hobot_hevc_encode_picture_static_equal(&picture, &changed_picture)) {
+        fprintf(stderr, "per-picture HEVC QP change was treated as a static PPS change\n");
+        return 0;
+    }
     return 1;
+}
+
+static int test_hevc_encoder_sequence_reconfiguration_contract(void)
+{
+    HobotDriverData drv = {0};
+    struct VADriverContext va_ctx = {0};
+    uint8_t coded_data[16] = {0};
+    if (pthread_mutex_init(&drv.mutex, NULL) != 0)
+        return 0;
+    va_ctx.pDriverData = &drv;
+
+    HobotContext *hctx = &drv.contexts[1];
+    hctx->allocated = 1;
+    hctx->id = 1;
+    hctx->is_encoder = 1;
+    hctx->encoder_picture_active = 1;
+    hctx->encoder_init_deferred = 1;
+    hctx->profile = VAProfileHEVCMain;
+    hctx->rate_control = VA_RC_CBR;
+    hctx->width = 640;
+    hctx->height = 360;
+    hctx->vpu_ctx.codec_id = MEDIA_CODEC_ID_H265;
+    hctx->hevc_encode_sequence_valid = 1;
+
+    VAEncSequenceParameterBufferHEVC sequence = {0};
+    sequence.general_profile_idc = 1;
+    sequence.general_level_idc = MC_H265_LEVEL4_1;
+    sequence.intra_period = 30;
+    sequence.intra_idr_period = 30;
+    sequence.ip_period = 1;
+    sequence.bits_per_second = 4000000;
+    sequence.pic_width_in_luma_samples = 640;
+    sequence.pic_height_in_luma_samples = 360;
+    sequence.seq_fields.bits.chroma_format_idc = 1;
+    sequence.log2_diff_max_min_luma_coding_block_size = 3;
+    sequence.log2_diff_max_min_transform_block_size = 3;
+    hctx->hevc_encode_sequence = sequence;
+    hctx->vpu_ctx.video_enc_params.rc_params.h265_cbr_params.bit_rate = 4000;
+    hctx->vpu_ctx.video_enc_params.rc_params.h265_cbr_params.intra_period = 30;
+    hctx->current_render_target = 1;
+    drv.surfaces[1].allocated = 1;
+    drv.surfaces[1].width = 640;
+    drv.surfaces[1].height = 360;
+    drv.surfaces[1].dma_fd = -1;
+    drv.buffers[1] = (HobotBuffer){
+        .id = 1,
+        .allocated = 1,
+        .type = VAEncSequenceParameterBufferType,
+        .size = sizeof(sequence),
+        .capacity = sizeof(sequence),
+        .element_size = sizeof(sequence),
+        .num_elements = 1,
+        .data = &sequence
+    };
+    VAEncPictureParameterBufferHEVC picture = {0};
+    picture.decoded_curr_pic.picture_id = 1;
+    for (size_t i = 0; i < sizeof(picture.reference_frames) /
+                            sizeof(picture.reference_frames[0]); i++) {
+        picture.reference_frames[i].picture_id = VA_INVALID_SURFACE;
+        picture.reference_frames[i].flags = VA_PICTURE_HEVC_INVALID;
+    }
+    picture.coded_buf = 4;
+    picture.pic_init_qp = 26;
+    picture.pic_fields.bits.coding_type = 1;
+    drv.buffers[2] = (HobotBuffer){
+        .id = 2,
+        .allocated = 1,
+        .type = VAEncPictureParameterBufferType,
+        .size = sizeof(picture),
+        .capacity = sizeof(picture),
+        .element_size = sizeof(picture),
+        .num_elements = 1,
+        .data = &picture
+    };
+    VAEncSliceParameterBufferHEVC slice = {0};
+    slice.num_ctu_in_slice = 60;
+    slice.slice_type = 2;
+    slice.max_num_merge_cand = 5;
+    slice.slice_fields.bits.last_slice_of_pic_flag = 1;
+    drv.buffers[3] = (HobotBuffer){
+        .id = 3,
+        .allocated = 1,
+        .type = VAEncSliceParameterBufferType,
+        .size = sizeof(slice),
+        .capacity = sizeof(slice),
+        .element_size = sizeof(slice),
+        .num_elements = 1,
+        .data = &slice
+    };
+    drv.buffers[4] = (HobotBuffer){
+        .id = 4,
+        .allocated = 1,
+        .type = VAEncCodedBufferType,
+        .size = sizeof(coded_data),
+        .capacity = sizeof(coded_data),
+        .data = coded_data
+    };
+    VABufferID frame_buffers[] = {1, 2, 3};
+
+    sequence.intra_period = 45;
+    sequence.bits_per_second = 5000000;
+    int dynamic_supported = hobot_hevc_encode_sequence_supported(
+        &sequence, 640, 360);
+    int dynamic_static_equal = hobot_hevc_encode_sequence_static_equal(
+        &hctx->hevc_encode_sequence, &sequence);
+    VAStatus dynamic_status = hobot_vaRenderPicture(
+        &va_ctx, 1, frame_buffers, 3);
+    VAStatus status = dynamic_status;
+    int dynamic_update_applied = dynamic_status == VA_STATUS_SUCCESS &&
+        hctx->hevc_encode_sequence.intra_period == 45 &&
+        hctx->hevc_encode_sequence.bits_per_second == 5000000 &&
+        hctx->vpu_ctx.video_enc_params.rc_params.h265_cbr_params.intra_period == 45 &&
+        hctx->vpu_ctx.video_enc_params.rc_params.h265_cbr_params.bit_rate == 5000;
+
+    sequence.seq_fields.bits.sps_temporal_mvp_enabled_flag = 1;
+    status = hobot_vaRenderPicture(&va_ctx, 1, frame_buffers, 3);
+    int static_update_rejected = status == VA_STATUS_ERROR_ATTR_NOT_SUPPORTED &&
+        hctx->hevc_encode_sequence.seq_fields.bits.sps_temporal_mvp_enabled_flag == 0 &&
+        hctx->hevc_encode_sequence.intra_period == 45 &&
+        hctx->hevc_encode_sequence.bits_per_second == 5000000 &&
+        hctx->vpu_ctx.video_enc_params.rc_params.h265_cbr_params.intra_period == 45 &&
+        hctx->vpu_ctx.video_enc_params.rc_params.h265_cbr_params.bit_rate == 5000;
+
+    if (!dynamic_update_applied || !static_update_rejected)
+        fprintf(stderr,
+                "HEVC sequence reconfiguration contract failed: dynamic=%d dynamic_status=%d supported=%d equal=%d static=%d status=%d cached_mvp=%u intra=%u bitrate=%u\n",
+                dynamic_update_applied, dynamic_status, dynamic_supported,
+                dynamic_static_equal, static_update_rejected, status,
+                hctx->hevc_encode_sequence.seq_fields.bits.sps_temporal_mvp_enabled_flag,
+                hctx->vpu_ctx.video_enc_params.rc_params.h265_cbr_params.intra_period,
+                hctx->vpu_ctx.video_enc_params.rc_params.h265_cbr_params.bit_rate);
+
+    pthread_mutex_destroy(&drv.mutex);
+    return dynamic_update_applied && static_update_rejected;
 }
 
 static int test_hevc_sps_conformance_window_crop(void)
@@ -2981,6 +4820,7 @@ static int test_h264_encoder_slice_constraints(void)
     hctx->is_encoder = 1;
     hctx->encoder_picture_active = 1;
     hctx->profile = VAProfileH264Main;
+    hctx->rate_control = VA_RC_CBR;
     hctx->width = 640;
     hctx->height = 368;
 
@@ -3003,6 +4843,7 @@ static int test_h264_encoder_slice_constraints(void)
     }
 
     slice.num_macroblocks--;
+    hctx->h264_encode_slice_valid = 0;
     status = hobot_vaRenderPicture(&va_ctx, 1, &slice_id, 1);
     if (status != VA_STATUS_ERROR_ATTR_NOT_SUPPORTED) {
         fprintf(stderr, "partial-frame H.264 slice was not rejected: status=%d\n", status);
@@ -3012,6 +4853,7 @@ static int test_h264_encoder_slice_constraints(void)
     slice.num_macroblocks++;
 
     slice.macroblock_address = 1;
+    hctx->h264_encode_slice_valid = 0;
     status = hobot_vaRenderPicture(&va_ctx, 1, &slice_id, 1);
     if (status != VA_STATUS_ERROR_ATTR_NOT_SUPPORTED) {
         fprintf(stderr, "nonzero H.264 slice start was not rejected: status=%d\n", status);
@@ -3021,6 +4863,7 @@ static int test_h264_encoder_slice_constraints(void)
     slice.macroblock_address = 0;
 
     slice.macroblock_info = 2;
+    hctx->h264_encode_slice_valid = 0;
     status = hobot_vaRenderPicture(&va_ctx, 1, &slice_id, 1);
     if (status != VA_STATUS_ERROR_ATTR_NOT_SUPPORTED) {
         fprintf(stderr, "H.264 macroblock map was not rejected: status=%d\n", status);
@@ -3030,6 +4873,7 @@ static int test_h264_encoder_slice_constraints(void)
     slice.macroblock_info = VA_INVALID_ID;
 
     slice.slice_type = 3;
+    hctx->h264_encode_slice_valid = 0;
     status = hobot_vaRenderPicture(&va_ctx, 1, &slice_id, 1);
     if (status != VA_STATUS_ERROR_INVALID_PARAMETER) {
         fprintf(stderr, "invalid H.264 slice type was accepted: status=%d\n", status);
@@ -3039,6 +4883,7 @@ static int test_h264_encoder_slice_constraints(void)
     slice.slice_type = 2;
 
     slice.slice_type = 1;
+    hctx->h264_encode_slice_valid = 0;
     status = hobot_vaRenderPicture(&va_ctx, 1, &slice_id, 1);
     if (status != VA_STATUS_ERROR_ATTR_NOT_SUPPORTED) {
         fprintf(stderr, "unsupported B-slice request was accepted: status=%d\n", status);
@@ -3084,6 +4929,101 @@ static int test_h264_encoder_slice_constraints(void)
     return 1;
 }
 
+static int test_h264_cqp_uses_effective_slice_qp(void)
+{
+    HobotDriverData drv = {0};
+    struct VADriverContext va_ctx = {0};
+    VAEncPictureParameterBufferH264 picture = {0};
+    VAEncSliceParameterBufferH264 slice = {0};
+    uint8_t coded_data[64] = {0};
+    if (pthread_mutex_init(&drv.mutex, NULL) != 0)
+        return 0;
+    va_ctx.pDriverData = &drv;
+
+    HobotContext *hctx = &drv.contexts[1];
+    hctx->allocated = 1;
+    hctx->id = 1;
+    hctx->vpu_running = 1;
+    hctx->is_encoder = 1;
+    hctx->encoder_picture_active = 1;
+    hctx->profile = VAProfileH264High;
+    hctx->rate_control = VA_RC_CQP;
+    hctx->width = 640;
+    hctx->height = 368;
+    hctx->current_render_target = 1;
+    hctx->vpu_ctx.codec_id = MEDIA_CODEC_ID_H264;
+    drv.surfaces[1].allocated = 1;
+    drv.surfaces[1].width = 640;
+    drv.surfaces[1].height = 368;
+
+    for (size_t i = 0; i < sizeof(picture.ReferenceFrames) /
+                            sizeof(picture.ReferenceFrames[0]); i++) {
+        picture.ReferenceFrames[i].picture_id = VA_INVALID_SURFACE;
+        picture.ReferenceFrames[i].flags = VA_PICTURE_H264_INVALID;
+    }
+    picture.CurrPic.picture_id = 1;
+    picture.coded_buf = 3;
+    picture.pic_init_qp = 26;
+    slice.num_macroblocks = 40u * 23u;
+    slice.macroblock_info = VA_INVALID_ID;
+    slice.slice_type = 0;
+    slice.slice_qp_delta = 11;
+    drv.buffers[1] = (HobotBuffer){
+        .id = 1, .allocated = 1, .type = VAEncPictureParameterBufferType,
+        .size = sizeof(picture), .capacity = sizeof(picture),
+        .element_size = sizeof(picture), .num_elements = 1, .data = &picture
+    };
+    drv.buffers[2] = (HobotBuffer){
+        .id = 2, .allocated = 1, .type = VAEncSliceParameterBufferType,
+        .size = sizeof(slice), .capacity = sizeof(slice),
+        .element_size = sizeof(slice), .num_elements = 1, .data = &slice
+    };
+    drv.buffers[3] = (HobotBuffer){
+        .id = 3, .allocated = 1, .type = VAEncCodedBufferType,
+        .size = sizeof(coded_data), .capacity = sizeof(coded_data),
+        .data = coded_data
+    };
+
+    VABufferID ids[] = {1, 2};
+    mock_rate_control_result = 0;
+    int calls_before = mock_rate_control_calls;
+    VAStatus status = hobot_vaRenderPicture(&va_ctx, 1, ids, 2);
+    if (status != VA_STATUS_SUCCESS ||
+        mock_rate_control_calls != calls_before + 1 ||
+        hctx->vpu_ctx.video_enc_params.rc_params.mode != MC_AV_RC_MODE_H264FIXQP ||
+        hctx->vpu_ctx.video_enc_params.rc_params.h264_fixqp_params.force_qp_I != 37 ||
+        hctx->vpu_ctx.video_enc_params.rc_params.h264_fixqp_params.force_qp_P != 37 ||
+        hctx->vpu_ctx.video_enc_params.rc_params.h264_fixqp_params.force_qp_B != 37) {
+        fprintf(stderr, "H.264 CQP did not apply pic_init_qp + slice_qp_delta: status=%d calls=%d qp=%u/%u/%u\n",
+                status, mock_rate_control_calls - calls_before,
+                hctx->vpu_ctx.video_enc_params.rc_params.h264_fixqp_params.force_qp_I,
+                hctx->vpu_ctx.video_enc_params.rc_params.h264_fixqp_params.force_qp_P,
+                hctx->vpu_ctx.video_enc_params.rc_params.h264_fixqp_params.force_qp_B);
+        pthread_mutex_destroy(&drv.mutex);
+        return 0;
+    }
+
+    picture.pic_init_qp = 50;
+    slice.slice_qp_delta = 2;
+    hctx->h264_encode_slice_valid = 0;
+    hctx->h264_encode_pic_qp_valid = 0;
+    hctx->enc_coded_buf = 0;
+    calls_before = mock_rate_control_calls;
+    status = hobot_vaRenderPicture(&va_ctx, 1, ids, 2);
+    if (status != VA_STATUS_ERROR_INVALID_PARAMETER ||
+        mock_rate_control_calls != calls_before ||
+        hctx->vpu_ctx.video_enc_params.rc_params.h264_fixqp_params.force_qp_P != 37) {
+        fprintf(stderr, "out-of-range H.264 CQP was not rejected transactionally: status=%d calls=%d qp=%u\n",
+                status, mock_rate_control_calls - calls_before,
+                hctx->vpu_ctx.video_enc_params.rc_params.h264_fixqp_params.force_qp_P);
+        pthread_mutex_destroy(&drv.mutex);
+        return 0;
+    }
+
+    pthread_mutex_destroy(&drv.mutex);
+    return 1;
+}
+
 static int test_h264_hrd_vbv_window(void)
 {
     HobotDriverData drv = {0};
@@ -3104,6 +5044,7 @@ static int test_h264_hrd_vbv_window(void)
     hctx->is_encoder = 1;
     hctx->encoder_picture_active = 1;
     hctx->profile = VAProfileH264High;
+    hctx->rate_control = VA_RC_CBR;
     hctx->vpu_ctx.video_enc_params.rc_params.mode = MC_AV_RC_MODE_H264CBR;
     hctx->vpu_ctx.video_enc_params.rc_params.h264_cbr_params.bit_rate = 5000;
     hctx->vpu_ctx.video_enc_params.rc_params.h264_cbr_params.vbv_buffer_size = 321;
@@ -3209,6 +5150,7 @@ static int test_encoder_control_errors_are_propagated(void)
     hctx->is_encoder = 1;
     hctx->encoder_picture_active = 1;
     hctx->profile = VAProfileH264Main;
+    hctx->rate_control = VA_RC_CBR;
     hctx->width = 640;
     hctx->height = 368;
     hctx->current_render_target = 1;
@@ -3223,6 +5165,8 @@ static int test_encoder_control_errors_are_propagated(void)
     sequence.picture_width_in_mbs = 40;
     sequence.picture_height_in_mbs = 23;
     sequence.level_idc = MC_H264_LEVEL4_1;
+    sequence.ip_period = 1;
+    sequence.max_num_ref_frames = 1;
     sequence.seq_fields.bits.chroma_format_idc = 1;
     sequence.seq_fields.bits.frame_mbs_only_flag = 1;
     hctx->h264_sequence = sequence;
@@ -3236,6 +5180,8 @@ static int test_encoder_control_errors_are_propagated(void)
     drv.buffers[1].type = VAEncSequenceParameterBufferType;
     drv.buffers[1].data = &sequence;
     drv.buffers[1].size = sizeof(sequence);
+    drv.buffers[1].element_size = sizeof(sequence);
+    drv.buffers[1].num_elements = 1;
     VABufferID sequence_id = 1;
 
     mock_rate_control_calls = 0;
@@ -3332,12 +5278,20 @@ static int test_encoder_control_errors_are_propagated(void)
     }
 
     VAEncPictureParameterBufferH264 picture = {0};
+    for (size_t i = 0; i < sizeof(picture.ReferenceFrames) /
+                            sizeof(picture.ReferenceFrames[0]); i++) {
+        picture.ReferenceFrames[i].picture_id = VA_INVALID_SURFACE;
+        picture.ReferenceFrames[i].flags = VA_PICTURE_H264_INVALID;
+    }
+    picture.CurrPic.picture_id = 1;
     picture.coded_buf = 3;
     picture.pic_fields.bits.idr_pic_flag = 1;
     drv.buffers[2].allocated = 1;
     drv.buffers[2].type = VAEncPictureParameterBufferType;
     drv.buffers[2].data = &picture;
     drv.buffers[2].size = sizeof(picture);
+    drv.buffers[2].element_size = sizeof(picture);
+    drv.buffers[2].num_elements = 1;
     drv.buffers[3].allocated = 1;
     drv.buffers[3].type = VAEncCodedBufferType;
     drv.buffers[3].data = coded_data;
@@ -3385,6 +5339,7 @@ static int test_h264_sequence_parameters_are_transactional(void)
     hctx->is_encoder = 1;
     hctx->encoder_picture_active = 1;
     hctx->profile = VAProfileH264Main;
+    hctx->rate_control = VA_RC_CBR;
     hctx->width = 640;
     hctx->height = 368;
     hctx->current_render_target = 1;
@@ -3400,6 +5355,8 @@ static int test_h264_sequence_parameters_are_transactional(void)
     sequence.level_idc = MC_H264_LEVEL4_1;
     sequence.bits_per_second = 5000000;
     sequence.intra_period = 45;
+    sequence.ip_period = 1;
+    sequence.max_num_ref_frames = 1;
     sequence.picture_width_in_mbs = 40;
     sequence.picture_height_in_mbs = 23;
     sequence.seq_fields.bits.chroma_format_idc = 1;
@@ -3412,11 +5369,35 @@ static int test_h264_sequence_parameters_are_transactional(void)
     drv.buffers[1].type = VAEncSequenceParameterBufferType;
     drv.buffers[1].data = &sequence;
     drv.buffers[1].size = sizeof(sequence);
+    drv.buffers[1].element_size = sizeof(sequence);
+    drv.buffers[1].num_elements = 1;
     VABufferID sequence_id = 1;
     mock_rate_control_calls = 0;
     mock_rate_control_result = 0;
 
+    sequence.ip_period = 2;
     VAStatus status = hobot_vaRenderPicture(&va_ctx, 1, &sequence_id, 1);
+    if (status != VA_STATUS_ERROR_ATTR_NOT_SUPPORTED || hctx->h264_sequence_valid ||
+        mock_rate_control_calls != 0) {
+        fprintf(stderr, "unsupported H.264 B-frame period was accepted: status=%d valid=%d calls=%d\n",
+                status, hctx->h264_sequence_valid, mock_rate_control_calls);
+        pthread_mutex_destroy(&drv.mutex);
+        return 0;
+    }
+
+    sequence.ip_period = 1;
+    sequence.max_num_ref_frames = 2;
+    status = hobot_vaRenderPicture(&va_ctx, 1, &sequence_id, 1);
+    if (status != VA_STATUS_ERROR_ATTR_NOT_SUPPORTED || hctx->h264_sequence_valid ||
+        mock_rate_control_calls != 0) {
+        fprintf(stderr, "unsupported H.264 multi-reference sequence was accepted: status=%d valid=%d calls=%d\n",
+                status, hctx->h264_sequence_valid, mock_rate_control_calls);
+        pthread_mutex_destroy(&drv.mutex);
+        return 0;
+    }
+    sequence.max_num_ref_frames = 1;
+
+    status = hobot_vaRenderPicture(&va_ctx, 1, &sequence_id, 1);
     if (status != VA_STATUS_ERROR_INVALID_PARAMETER || hctx->h264_sequence_valid ||
         hctx->vpu_ctx.video_enc_params.h264_enc_config.h264_level != 0 ||
         hctx->vpu_ctx.video_enc_params.rc_params.h264_cbr_params.bit_rate != 2500 ||
@@ -3452,6 +5433,8 @@ static int test_h264_sequence_parameters_are_transactional(void)
     drv.buffers[2].type = VAEncSequenceParameterBufferType;
     drv.buffers[2].data = &duplicate_sequence;
     drv.buffers[2].size = sizeof(duplicate_sequence);
+    drv.buffers[2].element_size = sizeof(duplicate_sequence);
+    drv.buffers[2].num_elements = 1;
     VABufferID sequence_ids[] = {1, 2};
     status = hobot_vaRenderPicture(&va_ctx, 1, sequence_ids, 2);
     if (status != VA_STATUS_ERROR_INVALID_PARAMETER || hctx->h264_sequence_valid ||
@@ -3480,6 +5463,20 @@ static int test_h264_sequence_parameters_are_transactional(void)
         return 0;
     }
 
+    sequence.max_num_ref_frames = 0;
+    status = hobot_vaRenderPicture(&va_ctx, 1, &sequence_id, 1);
+    if (status != VA_STATUS_ERROR_ATTR_NOT_SUPPORTED ||
+        hctx->h264_sequence.max_num_ref_frames != 1 ||
+        hctx->vpu_ctx.video_enc_params.rc_params.h264_cbr_params.bit_rate != 5000 ||
+        mock_rate_control_calls != 0) {
+        fprintf(stderr, "changed H.264 reference configuration was accepted: status=%d refs=%u calls=%d\n",
+                status, hctx->h264_sequence.max_num_ref_frames,
+                mock_rate_control_calls);
+        pthread_mutex_destroy(&drv.mutex);
+        return 0;
+    }
+    sequence.max_num_ref_frames = 1;
+
     mc_rate_control_params_t committed_rc = hctx->vpu_ctx.video_enc_params.rc_params;
     hctx->h264_sequence_valid = 0;
     hctx->encoder_init_deferred = 0;
@@ -3494,6 +5491,164 @@ static int test_h264_sequence_parameters_are_transactional(void)
     if (!passed)
         fprintf(stderr, "late first H.264 sequence was accepted or mutated state: status=%d valid=%d calls=%d\n",
                 status, hctx->h264_sequence_valid, mock_rate_control_calls);
+
+    pthread_mutex_destroy(&drv.mutex);
+    return passed;
+}
+
+static int test_h264_zero_reference_requires_intra_slice(void)
+{
+    HobotDriverData drv = {0};
+    struct VADriverContext va_ctx = {0};
+    if (pthread_mutex_init(&drv.mutex, NULL) != 0)
+        return 0;
+    va_ctx.pDriverData = &drv;
+
+    HobotContext *hctx = &drv.contexts[1];
+    hctx->allocated = 1;
+    hctx->id = 1;
+    hctx->encoder_init_deferred = 1;
+    hctx->is_encoder = 1;
+    hctx->encoder_picture_active = 1;
+    hctx->profile = VAProfileH264Main;
+    hctx->rate_control = VA_RC_CBR;
+    hctx->width = 640;
+    hctx->height = 368;
+    hctx->current_render_target = 1;
+    hctx->vpu_ctx.codec_id = MEDIA_CODEC_ID_H264;
+    hctx->vpu_ctx.video_enc_params.rc_params.h264_cbr_params.bit_rate = 2500;
+    hctx->vpu_ctx.video_enc_params.rc_params.h264_cbr_params.frame_rate = 24;
+    hctx->vpu_ctx.video_enc_params.rc_params.h264_cbr_params.intra_period = 7;
+
+    drv.surfaces[1].allocated = 1;
+    drv.surfaces[1].width = 640;
+    drv.surfaces[1].height = 368;
+    VAEncSequenceParameterBufferH264 sequence = {0};
+    sequence.level_idc = MC_H264_LEVEL4_1;
+    sequence.ip_period = 1;
+    sequence.max_num_ref_frames = 0;
+    sequence.picture_width_in_mbs = 40;
+    sequence.picture_height_in_mbs = 23;
+    sequence.seq_fields.bits.chroma_format_idc = 1;
+    sequence.seq_fields.bits.frame_mbs_only_flag = 1;
+    VAEncSliceParameterBufferH264 slice = {0};
+    slice.slice_type = 0;
+    slice.num_macroblocks = 40 * 23;
+    slice.macroblock_info = VA_INVALID_ID;
+
+    drv.buffers[1].allocated = 1;
+    drv.buffers[1].type = VAEncSequenceParameterBufferType;
+    drv.buffers[1].data = &sequence;
+    drv.buffers[1].size = sizeof(sequence);
+    drv.buffers[1].element_size = sizeof(sequence);
+    drv.buffers[1].num_elements = 1;
+    drv.buffers[2].allocated = 1;
+    drv.buffers[2].type = VAEncSliceParameterBufferType;
+    drv.buffers[2].data = &slice;
+    drv.buffers[2].size = sizeof(slice);
+    drv.buffers[2].element_size = sizeof(slice);
+    drv.buffers[2].num_elements = 1;
+
+    mock_rate_control_calls = 0;
+    mock_rate_control_result = 0;
+    VABufferID sequence_then_slice[] = {1, 2};
+    VABufferID slice_then_sequence[] = {2, 1};
+    VABufferID sequence_id = 1;
+    VABufferID slice_id = 2;
+    VAStatus status = hobot_vaRenderPicture(&va_ctx, 1, sequence_then_slice, 2);
+    if (status != VA_STATUS_ERROR_ATTR_NOT_SUPPORTED || hctx->h264_sequence_valid ||
+        mock_rate_control_calls != 0) {
+        fprintf(stderr, "zero-reference H.264 P slice was not rejected before sequence commit: status=%d valid=%d calls=%d\n",
+                status, hctx->h264_sequence_valid, mock_rate_control_calls);
+        pthread_mutex_destroy(&drv.mutex);
+        return 0;
+    }
+    status = hobot_vaRenderPicture(&va_ctx, 1, slice_then_sequence, 2);
+    if (status != VA_STATUS_ERROR_ATTR_NOT_SUPPORTED || hctx->h264_sequence_valid ||
+        mock_rate_control_calls != 0) {
+        fprintf(stderr, "zero-reference H.264 P-slice rejection depended on buffer order: status=%d valid=%d calls=%d\n",
+                status, hctx->h264_sequence_valid, mock_rate_control_calls);
+        pthread_mutex_destroy(&drv.mutex);
+        return 0;
+    }
+
+    status = hobot_vaRenderPicture(&va_ctx, 1, &slice_id, 1);
+    if (status != VA_STATUS_SUCCESS || !hctx->h264_encode_slice_valid ||
+        hctx->h264_sequence_valid) {
+        fprintf(stderr, "staged H.264 P slice was not recorded for later sequence validation: status=%d slice=%d sequence=%d\n",
+                status, hctx->h264_encode_slice_valid, hctx->h264_sequence_valid);
+        pthread_mutex_destroy(&drv.mutex);
+        return 0;
+    }
+    status = hobot_vaRenderPicture(&va_ctx, 1, &slice_id, 1);
+    if (status != VA_STATUS_ERROR_ATTR_NOT_SUPPORTED) {
+        fprintf(stderr, "H.264 encoder accepted another slice from a separate RenderPicture call: status=%d\n",
+                status);
+        pthread_mutex_destroy(&drv.mutex);
+        return 0;
+    }
+    status = hobot_vaRenderPicture(&va_ctx, 1, &sequence_id, 1);
+    if (status != VA_STATUS_ERROR_ATTR_NOT_SUPPORTED || hctx->h264_sequence_valid ||
+        mock_rate_control_calls != 0) {
+        fprintf(stderr, "zero-reference sequence accepted a P slice submitted in an earlier RenderPicture call: status=%d valid=%d calls=%d\n",
+                status, hctx->h264_sequence_valid, mock_rate_control_calls);
+        pthread_mutex_destroy(&drv.mutex);
+        return 0;
+    }
+
+    hobot_finish_encoder_picture(hctx, 0);
+    status = hobot_vaBeginPicture(&va_ctx, 1, 1);
+    if (status != VA_STATUS_SUCCESS) {
+        pthread_mutex_destroy(&drv.mutex);
+        return 0;
+    }
+    slice.slice_type = 2;
+    status = hobot_vaRenderPicture(&va_ctx, 1, &slice_id, 1);
+    if (status != VA_STATUS_SUCCESS || !hctx->h264_encode_slice_valid ||
+        hctx->h264_sequence_valid) {
+        fprintf(stderr, "staged H.264 I slice was not retained before its sequence: status=%d slice=%d sequence=%d\n",
+                status, hctx->h264_encode_slice_valid, hctx->h264_sequence_valid);
+        pthread_mutex_destroy(&drv.mutex);
+        return 0;
+    }
+    status = hobot_vaRenderPicture(&va_ctx, 1, &sequence_id, 1);
+    if (status != VA_STATUS_SUCCESS || !hctx->h264_sequence_valid ||
+        hctx->h264_sequence.max_num_ref_frames != 0) {
+        fprintf(stderr, "zero-reference H.264 I-slice sequence was rejected: status=%d valid=%d refs=%u\n",
+                status, hctx->h264_sequence_valid,
+                hctx->h264_sequence.max_num_ref_frames);
+        pthread_mutex_destroy(&drv.mutex);
+        return 0;
+    }
+
+    hobot_finish_encoder_picture(hctx, 0);
+    status = hobot_vaBeginPicture(&va_ctx, 1, 1);
+    if (status != VA_STATUS_SUCCESS) {
+        pthread_mutex_destroy(&drv.mutex);
+        return 0;
+    }
+    status = hobot_vaEndPicture(&va_ctx, 1);
+    if (status != VA_STATUS_ERROR_INVALID_PARAMETER) {
+        fprintf(stderr, "H.264 encoder allowed a picture with no slice parameter: status=%d\n",
+                status);
+        pthread_mutex_destroy(&drv.mutex);
+        return 0;
+    }
+
+    hobot_finish_encoder_picture(hctx, 0);
+    status = hobot_vaBeginPicture(&va_ctx, 1, 1);
+    if (status != VA_STATUS_SUCCESS) {
+        pthread_mutex_destroy(&drv.mutex);
+        return 0;
+    }
+    slice.slice_type = 0;
+    status = hobot_vaRenderPicture(&va_ctx, 1, &slice_id, 1);
+    int passed = status == VA_STATUS_ERROR_ATTR_NOT_SUPPORTED &&
+                 hctx->h264_sequence_valid && !hctx->h264_encode_slice_valid &&
+                 mock_rate_control_calls == 0;
+    if (!passed)
+        fprintf(stderr, "stored zero-reference H.264 configuration accepted a P slice: status=%d calls=%d\n",
+                status, mock_rate_control_calls);
 
     pthread_mutex_destroy(&drv.mutex);
     return passed;
@@ -3559,6 +5714,8 @@ static int test_jpeg_picture_quality_updates_vpu_and_rolls_back_on_error(void)
     drv.buffers[1].type = VAEncPictureParameterBufferType;
     drv.buffers[1].data = &picture;
     drv.buffers[1].size = sizeof(picture);
+    drv.buffers[1].element_size = sizeof(picture);
+    drv.buffers[1].num_elements = 1;
     drv.buffers[2].allocated = 1;
     drv.buffers[2].type = VAEncCodedBufferType;
     drv.buffers[2].data = coded_data;
@@ -3568,10 +5725,13 @@ static int test_jpeg_picture_quality_updates_vpu_and_rolls_back_on_error(void)
     drv.buffers[4].type = VAQMatrixBufferType;
     drv.buffers[4].data = &qmatrix;
     drv.buffers[4].size = sizeof(qmatrix);
+    drv.buffers[4].element_size = sizeof(qmatrix);
+    drv.buffers[4].num_elements = 1;
     drv.buffers[5].allocated = 1;
     drv.buffers[5].type = VAEncSliceParameterBufferType;
     drv.buffers[5].data = &slice;
     drv.buffers[5].size = sizeof(slice);
+    drv.buffers[5].element_size = sizeof(slice);
     drv.buffers[5].num_elements = 1;
     VABufferID picture_ids[] = {1, 4, 5};
 
@@ -3783,6 +5943,72 @@ static int test_jpeg_decode_header_is_bounded_baseline_420(void)
         return 0;
     }
 
+    const uint32_t rotations[] = {
+        VA_ROTATION_NONE, VA_ROTATION_90,
+        VA_ROTATION_180, VA_ROTATION_270
+    };
+    for (size_t i = 0; i < sizeof(rotations) / sizeof(rotations[0]); i++) {
+        picture.rotation = rotations[i];
+        int swapped = rotations[i] == VA_ROTATION_90 ||
+                      rotations[i] == VA_ROTATION_270;
+        status = hobot_jpeg_build_decode_header(
+            &picture, &qmatrix, &huffman, &slice,
+            swapped ? 16 : 32, swapped ? 32 : 16,
+            header, sizeof(header), &header_size);
+        if (status != VA_STATUS_SUCCESS) {
+            fprintf(stderr, "JPEG rotation %u rejected with swapped geometry: status=%d\n",
+                    rotations[i], status);
+            return 0;
+        }
+    }
+    picture.rotation = VA_ROTATION_NONE;
+    if (hobot_jpeg_build_decode_header(
+            &picture, &qmatrix, &huffman, &slice, 16, 32,
+            header, sizeof(header), &header_size) !=
+        VA_STATUS_ERROR_INVALID_PARAMETER) {
+        fprintf(stderr, "JPEG rotation geometry mismatch was accepted\n");
+        return 0;
+    }
+    picture.rotation = 4;
+    if (hobot_jpeg_build_decode_header(
+            &picture, &qmatrix, &huffman, &slice, 32, 16,
+            header, sizeof(header), &header_size) !=
+        VA_STATUS_ERROR_ATTR_NOT_SUPPORTED) {
+        fprintf(stderr, "unsupported JPEG rotation value was accepted\n");
+        return 0;
+    }
+    picture.rotation = VA_ROTATION_NONE;
+
+    picture.components[0].v_sampling_factor = 1;
+    slice.num_mcus = 4;
+    if (hobot_jpeg_build_decode_header(
+            &picture, &qmatrix, &huffman, &slice, 32, 16,
+            header, sizeof(header), &header_size) != VA_STATUS_ERROR_ATTR_NOT_SUPPORTED) {
+        fprintf(stderr, "JPEG 4:2:2 sampling was not rejected\n");
+        return 0;
+    }
+    picture.components[0].v_sampling_factor = 2;
+    picture.components[1].v_sampling_factor = 2;
+    picture.components[2].v_sampling_factor = 2;
+    slice.num_mcus = 2;
+    if (hobot_jpeg_build_decode_header(
+            &picture, &qmatrix, &huffman, &slice, 32, 16,
+            header, sizeof(header), &header_size) != VA_STATUS_ERROR_ATTR_NOT_SUPPORTED) {
+        fprintf(stderr, "normalized JPEG 4:2:2 sampling was not rejected\n");
+        return 0;
+    }
+    picture.components[0].h_sampling_factor = 1;
+    if (hobot_jpeg_build_decode_header(
+            &picture, &qmatrix, &huffman, &slice, 32, 16,
+            header, sizeof(header), &header_size) != VA_STATUS_ERROR_ATTR_NOT_SUPPORTED) {
+        fprintf(stderr, "JPEG 4:4:4 sampling was not rejected\n");
+        return 0;
+    }
+    picture.components[0].h_sampling_factor = 2;
+    picture.components[1].v_sampling_factor = 1;
+    picture.components[2].v_sampling_factor = 1;
+    slice.num_mcus = 2;
+
     for (unsigned int component = 0; component < 3; component++) {
         picture.components[component].component_id = (uint8_t)component;
         picture.components[component].quantiser_table_selector = 0;
@@ -3799,14 +6025,6 @@ static int test_jpeg_decode_header_is_bounded_baseline_420(void)
         return 0;
     }
 
-    picture.components[0].h_sampling_factor = 1;
-    if (hobot_jpeg_build_decode_header(
-            &picture, &qmatrix, &huffman, &slice, 32, 16,
-            header, sizeof(header), &header_size) != VA_STATUS_ERROR_ATTR_NOT_SUPPORTED) {
-        fprintf(stderr, "unsupported JPEG sampling was not rejected\n");
-        return 0;
-    }
-    picture.components[0].h_sampling_factor = 2;
     slice.num_mcus++;
     if (hobot_jpeg_build_decode_header(
             &picture, &qmatrix, &huffman, &slice, 32, 16,
@@ -3830,6 +6048,215 @@ static int test_jpeg_decode_header_is_bounded_baseline_420(void)
         fprintf(stderr, "undersized JPEG header output was not rejected\n");
         return 0;
     }
+    return 1;
+}
+
+static int test_jpeg_decode_rejected_parameters_do_not_mutate_cache(void)
+{
+    HobotDriverData drv = {0};
+    struct VADriverContext va_ctx = {0};
+    VAPictureParameterBufferJPEGBaseline picture = {0};
+    VAIQMatrixBufferJPEGBaseline qmatrix = {0};
+    VAHuffmanTableBufferJPEGBaseline huffman = {0};
+    if (pthread_mutex_init(&drv.mutex, NULL) != 0)
+        return 0;
+    va_ctx.pDriverData = &drv;
+
+    HobotContext *hctx = &drv.contexts[1];
+    hctx->allocated = 1;
+    hctx->profile = VAProfileJPEGBaseline;
+    hctx->width = 32;
+    hctx->height = 16;
+    hctx->jpeg_init_deferred = 1;
+    hctx->decode_picture_active = 1;
+
+    qmatrix.load_quantiser_table[0] = 1;
+    memset(qmatrix.quantiser_table[0], 7, sizeof(qmatrix.quantiser_table[0]));
+    qmatrix.load_quantiser_table[1] = 2;
+    drv.buffers[1] = (HobotBuffer){
+        .id = 1, .allocated = 1, .type = VAIQMatrixBufferType,
+        .size = sizeof(qmatrix), .capacity = sizeof(qmatrix),
+        .element_size = sizeof(qmatrix), .num_elements = 1, .data = &qmatrix
+    };
+    drv.buffers[2] = (HobotBuffer){
+        .id = 2, .allocated = 1, .type = VAPictureParameterBufferType,
+        .size = sizeof(picture), .capacity = sizeof(picture),
+        .element_size = sizeof(picture), .num_elements = 1, .data = &picture
+    };
+
+    VABufferID buffer_ids[] = {2, 1};
+    VAStatus status = hobot_vaRenderPicture(&va_ctx, 1, buffer_ids, 2);
+    int passed = status == VA_STATUS_ERROR_INVALID_PARAMETER &&
+        !hctx->jpeg_decode_picture_valid &&
+        !hctx->jpeg_decode_qmatrix_valid[0] &&
+        hctx->jpeg_decode_qmatrix.quantiser_table[0][0] == 0;
+    if (!passed)
+        fprintf(stderr, "rejected JPEG parameters changed cached state: status=%d picture=%d qvalid=%u qvalue=%u\n",
+                status, hctx->jpeg_decode_picture_valid,
+                hctx->jpeg_decode_qmatrix_valid[0],
+                hctx->jpeg_decode_qmatrix.quantiser_table[0][0]);
+
+    huffman.load_huffman_table[0] = 1;
+    memcpy(huffman.huffman_table[0].num_dc_codes,
+           jpeg_default_dc_bits[0], 16);
+    memcpy(huffman.huffman_table[0].dc_values,
+           jpeg_default_dc_values[0], 12);
+    memcpy(huffman.huffman_table[0].num_ac_codes,
+           jpeg_default_ac_bits[0], 16);
+    memcpy(huffman.huffman_table[0].ac_values,
+           jpeg_default_ac_values[0], 162);
+    huffman.load_huffman_table[1] = 2;
+    drv.buffers[1] = (HobotBuffer){
+        .id = 1, .allocated = 1, .type = VAHuffmanTableBufferType,
+        .size = sizeof(huffman), .capacity = sizeof(huffman),
+        .element_size = sizeof(huffman), .num_elements = 1, .data = &huffman
+    };
+    VABufferID huffman_id = 1;
+    status = hobot_vaRenderPicture(&va_ctx, 1, &huffman_id, 1);
+    passed = passed && status == VA_STATUS_ERROR_INVALID_PARAMETER &&
+        !hctx->jpeg_decode_huffman_valid[0];
+    if (!passed)
+        fprintf(stderr, "rejected JPEG Huffman buffer changed cached table 0: status=%d valid=%u\n",
+                status, hctx->jpeg_decode_huffman_valid[0]);
+
+    pthread_mutex_destroy(&drv.mutex);
+    return passed;
+}
+
+static int test_jpeg_rotation_mapping_and_deferred_start(void)
+{
+    const struct {
+        uint32_t va_rotation;
+        mc_rotate_degree_t sdk_rotation;
+    } cases[] = {
+        {VA_ROTATION_NONE, MC_CCW_0},
+        {VA_ROTATION_90, MC_CCW_270},
+        {VA_ROTATION_180, MC_CCW_180},
+        {VA_ROTATION_270, MC_CCW_90}
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        mc_rotate_degree_t sdk_rotation;
+        if (!hobot_jpeg_rotation_to_sdk(cases[i].va_rotation, &sdk_rotation) ||
+            sdk_rotation != cases[i].sdk_rotation) {
+            fprintf(stderr, "JPEG VA-to-SDK rotation mapping failed for %u\n",
+                    cases[i].va_rotation);
+            return 0;
+        }
+    }
+    mc_rotate_degree_t unused_rotation;
+    if (hobot_jpeg_rotation_to_sdk(4, &unused_rotation)) {
+        fprintf(stderr, "unsupported JPEG rotation mapped to SDK\n");
+        return 0;
+    }
+
+    HobotDriverData drv = {0};
+    if (pthread_mutex_init(&drv.mutex, NULL) != 0)
+        return 0;
+    struct VADriverContext va_ctx = {0};
+    va_ctx.pDriverData = &drv;
+    drv.configs[1].allocated = 1;
+    drv.configs[1].profile = VAProfileJPEGBaseline;
+    drv.configs[1].entrypoint = VAEntrypointVLD;
+
+    int saved_initialize_result = mock_initialize_result;
+    int saved_initialize_calls = mock_initialize_calls;
+    int saved_configure_result = mock_configure_result;
+    int saved_configure_calls = mock_configure_calls;
+    int saved_start_result = mock_start_result;
+    int saved_start_calls = mock_start_calls;
+    int saved_stop_result = mock_stop_result;
+    int saved_stop_calls = mock_stop_calls;
+    int saved_release_result = mock_release_result;
+    int saved_release_calls = mock_release_calls;
+    mock_initialize_result = 0;
+    mock_configure_result = 0;
+    mock_start_result = 0;
+    mock_stop_result = 0;
+    mock_release_result = 0;
+
+    VAContextID context = VA_INVALID_ID;
+    VAStatus status = hobot_vaCreateContext(&va_ctx, 1, 640, 480, 0,
+                                            NULL, 0, &context);
+    if (status != VA_STATUS_SUCCESS || context <= 0 ||
+        !drv.contexts[context].jpeg_init_deferred ||
+        drv.contexts[context].vpu_initialized || drv.contexts[context].vpu_running ||
+        mock_initialize_calls != saved_initialize_calls ||
+        mock_configure_calls != saved_configure_calls ||
+        mock_start_calls != saved_start_calls) {
+        fprintf(stderr, "JPEG context did not defer VPU startup: status=%d context=%u init=%d/%d\n",
+                status, context, drv.contexts[context].jpeg_init_deferred,
+                mock_initialize_calls - saved_initialize_calls);
+        pthread_mutex_destroy(&drv.mutex);
+        return 0;
+    }
+
+    HobotContext *hctx = &drv.contexts[context];
+    if (hobot_start_deferred_jpeg_decoder(hctx, VA_ROTATION_90) != 0 ||
+        !hctx->vpu_initialized || !hctx->vpu_running ||
+        hctx->jpeg_init_deferred || !hctx->jpeg_rotation_fixed ||
+        hctx->jpeg_rotation != VA_ROTATION_90 ||
+        hctx->vpu_ctx.video_dec_params.jpeg_dec_config.rot_degree != MC_CCW_270 ||
+        mock_initialize_calls != saved_initialize_calls + 1 ||
+        mock_configure_calls != saved_configure_calls + 1 ||
+        mock_start_calls != saved_start_calls + 1 ||
+        hobot_start_deferred_jpeg_decoder(hctx, VA_ROTATION_90) != 0 ||
+        hobot_start_deferred_jpeg_decoder(hctx, VA_ROTATION_270) == 0 ||
+        mock_initialize_calls != saved_initialize_calls + 1) {
+        fprintf(stderr, "deferred JPEG startup or fixed-angle contract failed\n");
+        pthread_mutex_destroy(&drv.mutex);
+        return 0;
+    }
+    status = hobot_vaDestroyContext(&va_ctx, context);
+    if (status != VA_STATUS_SUCCESS || drv.contexts[context].allocated) {
+        fprintf(stderr, "rotated JPEG context teardown failed: status=%d\n", status);
+        pthread_mutex_destroy(&drv.mutex);
+        return 0;
+    }
+
+    context = VA_INVALID_ID;
+    status = hobot_vaCreateContext(&va_ctx, 1, 640, 480, 0,
+                                   NULL, 0, &context);
+    if (status != VA_STATUS_SUCCESS || context <= 0) {
+        fprintf(stderr, "JPEG context recreation failed: status=%d\n", status);
+        pthread_mutex_destroy(&drv.mutex);
+        return 0;
+    }
+    hctx = &drv.contexts[context];
+    mock_configure_result = -7;
+    mock_release_result = -11;
+    int releases_before_failure = mock_release_calls;
+    if (hobot_start_deferred_jpeg_decoder(hctx, VA_ROTATION_270) != -7 ||
+        hctx->jpeg_init_deferred || hctx->vpu_running || !hctx->vpu_initialized ||
+        !hctx->decode_failed || mock_release_calls != releases_before_failure + 1) {
+        fprintf(stderr, "JPEG start failure did not preserve initialized ownership\n");
+        pthread_mutex_destroy(&drv.mutex);
+        return 0;
+    }
+    if (hobot_vaDestroyContext(&va_ctx, context) != VA_STATUS_ERROR_OPERATION_FAILED ||
+        !hctx->allocated || !hctx->vpu_initialized) {
+        fprintf(stderr, "JPEG release failure was not preserved for retry\n");
+        pthread_mutex_destroy(&drv.mutex);
+        return 0;
+    }
+    mock_release_result = 0;
+    if (hobot_vaDestroyContext(&va_ctx, context) != VA_STATUS_SUCCESS ||
+        hctx->allocated || hctx->vpu_initialized) {
+        fprintf(stderr, "JPEG release retry failed\n");
+        pthread_mutex_destroy(&drv.mutex);
+        return 0;
+    }
+
+    mock_initialize_result = saved_initialize_result;
+    mock_initialize_calls = saved_initialize_calls;
+    mock_configure_result = saved_configure_result;
+    mock_configure_calls = saved_configure_calls;
+    mock_start_result = saved_start_result;
+    mock_start_calls = saved_start_calls;
+    mock_stop_result = saved_stop_result;
+    mock_stop_calls = saved_stop_calls;
+    mock_release_result = saved_release_result;
+    mock_release_calls = saved_release_calls;
+    pthread_mutex_destroy(&drv.mutex);
     return 1;
 }
 
@@ -4097,6 +6524,175 @@ fail:
     return 0;
 }
 
+static int test_external_encoder_consumed_callback_is_single_flight(void)
+{
+    HobotContext hctx = {0};
+    media_codec_buffer_t buffer = {0};
+    uintptr_t first_generation = hobot_next_external_input_token();
+    uintptr_t second_generation = hobot_next_external_input_token();
+    if (first_generation == 0 || second_generation == 0 ||
+        first_generation == second_generation) {
+        fprintf(stderr, "external input callback tokens are not unique\n");
+        return 0;
+    }
+    atomic_init(&hctx.enc_external_input_pending, 17);
+    buffer.user_ptr = (hb_ptr)(uintptr_t)16;
+    buffer.vframe_buf.src_idx = 3;
+
+    hobot_encoder_input_consumed(&hctx, &buffer);
+    if (atomic_load_explicit(&hctx.enc_external_input_pending,
+                             memory_order_acquire) != 17) {
+        fprintf(stderr, "stale input callback released a newer owner\n");
+        return 0;
+    }
+
+    buffer.user_ptr = (hb_ptr)(uintptr_t)17;
+    hobot_encoder_input_consumed(&hctx, &buffer);
+    if (atomic_load_explicit(&hctx.enc_external_input_pending,
+                             memory_order_acquire) != 0) {
+        fprintf(stderr, "matching input callback did not release its owner\n");
+        return 0;
+    }
+
+    atomic_store_explicit(&hctx.enc_external_input_pending, 23,
+                          memory_order_release);
+    buffer.user_ptr = NULL;
+    hobot_encoder_input_consumed(&hctx, &buffer);
+    buffer.user_ptr = (hb_ptr)(uintptr_t)17;
+    hobot_encoder_input_consumed(&hctx, &buffer);
+    if (atomic_load_explicit(&hctx.enc_external_input_pending,
+                             memory_order_acquire) != 23) {
+        fprintf(stderr, "missing or stale callback cleared external ownership\n");
+        return 0;
+    }
+
+    buffer.user_ptr = (hb_ptr)(uintptr_t)23;
+    hobot_encoder_input_consumed(&hctx, &buffer);
+    if (atomic_load_explicit(&hctx.enc_external_input_pending,
+                             memory_order_acquire) != 0) {
+        fprintf(stderr, "new matching callback did not release external ownership\n");
+        return 0;
+    }
+    return 1;
+}
+
+static int test_external_encoder_output_error_preserves_surface_ownership(void)
+{
+    HobotDriverData drv = {0};
+    struct VADriverContext va_ctx = {0};
+    uint8_t coded_data[16] = {0};
+    if (pthread_mutex_init(&drv.mutex, NULL) != 0)
+        return 0;
+    va_ctx.pDriverData = &drv;
+
+    HobotContext *hctx = &drv.contexts[1];
+    hctx->id = 1;
+    hctx->allocated = 1;
+    hctx->is_encoder = 1;
+    hctx->profile = VAProfileJPEGBaseline;
+    hctx->vpu_initialized = 1;
+    hctx->vpu_running = 1;
+    hctx->enc_external_enabled = 1;
+    hctx->enc_external_surface = VA_INVALID_SURFACE;
+    hctx->encoder_picture_active = 1;
+    hctx->current_render_target = 1;
+    hctx->enc_coded_buf = 2;
+    hctx->vpu_ctx.codec_id = MEDIA_CODEC_ID_JPEG;
+    hctx->vpu_ctx.video_enc_params.width = 2;
+    hctx->vpu_ctx.video_enc_params.height = 2;
+    hctx->vpu_ctx.video_enc_params.frame_buf_count = 1;
+    atomic_init(&hctx->enc_external_input_pending, 0);
+
+    HobotSurface *surface = &drv.surfaces[1];
+    surface->allocated = 1;
+    surface->id = 1;
+    surface->width = 2;
+    surface->height = 2;
+    surface->stride = 4;
+    surface->raw_data = mock_graph_data;
+    surface->raw_data_size = 12;
+    surface->raw_data_valid = 1;
+    surface->has_preallocated = 1;
+    surface->preallocated_gbuf.fd[0] = 7;
+    for (size_t i = 1; i < MAX_GRAPHIC_BUF_COMP; i++)
+        surface->preallocated_gbuf.fd[i] = -1;
+    surface->preallocated_gbuf.stride = 4;
+    surface->preallocated_gbuf.vstride = 2;
+    surface->preallocated_gbuf.size[0] = 12;
+    surface->preallocated_gbuf.offset[1] = 8;
+    surface->preallocated_gbuf.is_contig = 1;
+    surface->preallocated_gbuf.virt_addr[0] = mock_graph_data;
+    surface->preallocated_gbuf.virt_addr[1] = mock_graph_data + 8;
+    surface->preallocated_gbuf.phys_addr[0] = 0x1000;
+    surface->preallocated_gbuf.phys_addr[1] = 0x1008;
+
+    HobotBuffer *coded = &drv.buffers[2];
+    coded->allocated = 1;
+    coded->type = VAEncCodedBufferType;
+    coded->data = coded_data;
+    coded->size = sizeof(coded_data);
+    coded->capacity = sizeof(coded_data);
+
+    memset(&mock_input_listener, 0, sizeof(mock_input_listener));
+    mock_input_listener.on_input_buffer_consumed = hobot_encoder_input_consumed;
+    mock_input_listener_userdata = hctx;
+    mock_encoder_io = 1;
+    mock_encoder_input_size = 12;
+    mock_encoder_input_stride = 4;
+    mock_encoder_input_vstride = 4;
+    mock_dequeue_input_result = 0;
+    mock_queue_input_result = 0;
+    mock_dequeue_result = -1;
+    mock_dequeue_output_calls = 0;
+    mock_queue_input_calls = 0;
+    mock_queue_output_calls = 0;
+    mock_suppress_input_callback = 0;
+
+    VAStatus status = hobot_vaEndPicture(&va_ctx, 1);
+    int callback_released_owner =
+        status == VA_STATUS_ERROR_OPERATION_FAILED && hctx->encoder_failed &&
+        !hctx->encoder_picture_active &&
+        atomic_load_explicit(&hctx->enc_external_input_pending,
+                             memory_order_acquire) == 0 &&
+        hctx->enc_external_surface == VA_INVALID_SURFACE &&
+        !hobot_surface_has_active_encoder(&drv, 1) &&
+        mock_queue_input_calls == 1 && mock_dequeue_output_calls == 1;
+
+    hctx->encoder_failed = 0;
+    hctx->encoder_picture_active = 1;
+    hctx->current_render_target = 1;
+    hctx->enc_coded_buf = 2;
+    hctx->enc_external_surface = VA_INVALID_SURFACE;
+    coded->coded_segment.size = 0;
+    mock_suppress_input_callback = 1;
+    status = hobot_vaEndPicture(&va_ctx, 1);
+    uintptr_t pending = atomic_load_explicit(
+        &hctx->enc_external_input_pending, memory_order_acquire);
+    int timeout_preserved_owner = status == VA_STATUS_ERROR_TIMEDOUT && pending != 0 &&
+        hctx->encoder_failed && !hctx->encoder_picture_active &&
+        hctx->enc_external_surface == 1 &&
+        hobot_surface_has_active_encoder(&drv, 1);
+
+    if (!callback_released_owner || !timeout_preserved_owner)
+        fprintf(stderr, "external encoder output-error ownership failed: callback=%d timeout=%d status=%d pending=%lu surface=%u active=%d\n",
+                callback_released_owner, timeout_preserved_owner, status,
+                (unsigned long)pending, hctx->enc_external_surface,
+                hobot_surface_has_active_encoder(&drv, 1));
+
+    mock_suppress_input_callback = 0;
+    mock_input_listener_userdata = NULL;
+    memset(&mock_input_listener, 0, sizeof(mock_input_listener));
+    mock_encoder_io = 0;
+    mock_encoder_input_size = sizeof(mock_encoder_y) + sizeof(mock_encoder_uv);
+    mock_encoder_input_stride = 8;
+    mock_encoder_input_vstride = 8;
+    mock_dequeue_input_result = 0;
+    mock_queue_input_result = 0;
+    mock_dequeue_result = 0;
+    pthread_mutex_destroy(&drv.mutex);
+    return callback_released_owner && timeout_preserved_owner;
+}
+
 static int test_encoder_input_queue_failure_preserves_ownership(void)
 {
     HobotDriverData drv = {0};
@@ -4244,6 +6840,79 @@ fail:
     return 0;
 }
 
+static int test_decoder_terminate_retries_retained_output(void)
+{
+    HobotDriverData *drv = calloc(1, sizeof(*drv));
+    struct VADriverContext va_ctx = {0};
+    if (!drv)
+        return 0;
+    if (pthread_mutex_init(&drv->mutex, NULL) != 0) {
+        free(drv);
+        return 0;
+    }
+    va_ctx.pDriverData = drv;
+
+    HobotContext *hctx = &drv->contexts[1];
+    hctx->allocated = 1;
+    hctx->vpu_initialized = 1;
+    hctx->vpu_running = 1;
+    HobotSurface *surf = &drv->surfaces[1];
+    surf->allocated = 1;
+    surf->has_decoded_frame = 1;
+    surf->output_context_id = 1;
+    surf->vpu_out_buf.vframe_buf.phy_ptr[0] = 1;
+    surf->vpu_out_buf.vframe_buf.size = sizeof(mock_frame);
+    surf->vpu_out_buf.vframe_buf.fd[0] = 7;
+
+    mock_queue_output_calls = 0;
+    mock_queue_output_result = -1;
+    mock_stop_calls = 0;
+    mock_release_calls = 0;
+    mock_stop_result = 0;
+    mock_release_result = 0;
+    int close_calls_before = mock_mem_module_close_calls;
+
+    VAStatus status = hobot_vaTerminate(&va_ctx);
+    if (status != VA_STATUS_ERROR_OPERATION_FAILED || va_ctx.pDriverData != drv ||
+        !hctx->allocated || !hctx->vpu_initialized || !hctx->vpu_running ||
+        !surf->allocated || !surf->has_decoded_frame ||
+        surf->output_context_id != 1 ||
+        surf->vpu_out_buf.vframe_buf.phy_ptr[0] != 1 ||
+        mock_queue_output_calls != 2 || mock_stop_calls != 0 ||
+        mock_release_calls != 0 ||
+        mock_mem_module_close_calls != close_calls_before) {
+        fprintf(stderr, "vaTerminate discarded decoder output ownership after recycle failure: status=%d driver=%p surface=%d owner=%u queue=%d stop=%d release=%d close=%d/%d\n",
+                status, va_ctx.pDriverData, surf->has_decoded_frame,
+                surf->output_context_id, mock_queue_output_calls,
+                mock_stop_calls, mock_release_calls,
+                mock_mem_module_close_calls, close_calls_before);
+        goto fail;
+    }
+
+    mock_queue_output_result = 0;
+    status = hobot_vaTerminate(&va_ctx);
+    int passed = status == VA_STATUS_SUCCESS && va_ctx.pDriverData == NULL &&
+                 mock_queue_output_calls == 3 && mock_stop_calls == 1 &&
+                 mock_release_calls == 1 &&
+                 mock_mem_module_close_calls == close_calls_before + 1;
+    if (!passed)
+        fprintf(stderr, "vaTerminate failed to recover retained decoder output: status=%d driver=%p queue=%d stop=%d release=%d close=%d/%d\n",
+                status, va_ctx.pDriverData, mock_queue_output_calls,
+                mock_stop_calls, mock_release_calls,
+                mock_mem_module_close_calls, close_calls_before);
+
+    mock_queue_output_result = 0;
+    return passed;
+
+fail:
+    mock_queue_output_result = 0;
+    mock_stop_result = 0;
+    mock_release_result = 0;
+    if (va_ctx.pDriverData)
+        hobot_vaTerminate(&va_ctx);
+    return 0;
+}
+
 static int test_buffer_mapping_lifecycle(void)
 {
     HobotDriverData *drv = calloc(1, sizeof(*drv));
@@ -4320,6 +6989,57 @@ fail:
     return 0;
 }
 
+static int test_active_encoder_retains_coded_buffer(void)
+{
+    HobotDriverData drv = {0};
+    struct VADriverContext va_ctx = {0};
+    if (pthread_mutex_init(&drv.mutex, NULL) != 0)
+        return 0;
+    va_ctx.pDriverData = &drv;
+
+    VABufferID buffer = VA_INVALID_ID;
+    if (hobot_vaCreateBuffer(&va_ctx, 0, VAEncCodedBufferType, 128, 1,
+                             NULL, &buffer) != VA_STATUS_SUCCESS ||
+        buffer <= 0 || buffer >= MAX_BUFFERS) {
+        fprintf(stderr, "could not create coded buffer for active-picture lifetime test\n");
+        pthread_mutex_destroy(&drv.mutex);
+        return 0;
+    }
+
+    HobotContext *encoder = &drv.contexts[1];
+    encoder->allocated = 1;
+    encoder->is_encoder = 1;
+    encoder->encoder_picture_active = 1;
+    encoder->enc_coded_buf = buffer;
+
+    void *data = drv.buffers[buffer].data;
+    if (!data || drv.buffers[buffer].type != VAEncCodedBufferType ||
+        hobot_vaDestroyBuffer(&va_ctx, buffer) != VA_STATUS_ERROR_OPERATION_FAILED ||
+        !drv.buffers[buffer].allocated || drv.buffers[buffer].data != data) {
+        fprintf(stderr, "active encoder did not retain its coded buffer\n");
+        encoder->encoder_picture_active = 0;
+        encoder->enc_coded_buf = 0;
+        if (drv.buffers[buffer].allocated)
+            hobot_vaDestroyBuffer(&va_ctx, buffer);
+        pthread_mutex_destroy(&drv.mutex);
+        return 0;
+    }
+
+    encoder->encoder_picture_active = 0;
+    encoder->enc_coded_buf = 0;
+    if (hobot_vaDestroyBuffer(&va_ctx, buffer) != VA_STATUS_SUCCESS ||
+        drv.buffers[buffer].allocated || drv.buffers[buffer].data != NULL) {
+        fprintf(stderr, "coded buffer could not be destroyed after encoder picture completion\n");
+        if (drv.buffers[buffer].allocated)
+            hobot_vaDestroyBuffer(&va_ctx, buffer);
+        pthread_mutex_destroy(&drv.mutex);
+        return 0;
+    }
+
+    pthread_mutex_destroy(&drv.mutex);
+    return 1;
+}
+
 static int test_render_picture_prevalidates_all_buffers(void)
 {
     HobotDriverData drv = {0};
@@ -4353,6 +7073,16 @@ static int test_render_picture_prevalidates_all_buffers(void)
     drv.buffers[1].type = VAPictureParameterBufferType;
     drv.buffers[1].data = parameter_data;
     drv.buffers[1].size = sizeof(VAPictureParameterBufferH264);
+    drv.buffers[1].element_size = sizeof(VAPictureParameterBufferH264);
+    drv.buffers[1].num_elements = 1;
+    VAPictureParameterBufferH264 *decode_picture =
+        (VAPictureParameterBufferH264 *)parameter_data;
+    for (size_t i = 0; i < sizeof(decode_picture->ReferenceFrames) /
+                            sizeof(decode_picture->ReferenceFrames[0]); i++) {
+        decode_picture->ReferenceFrames[i].picture_id = VA_INVALID_SURFACE;
+        decode_picture->ReferenceFrames[i].flags = VA_PICTURE_H264_INVALID;
+    }
+    decode_picture->CurrPic.picture_id = 5;
     ((VAPictureParameterBufferH264 *)parameter_data)->picture_width_in_mbs_minus1 = 39;
     ((VAPictureParameterBufferH264 *)parameter_data)->picture_height_in_mbs_minus1 = 22;
     ((VAPictureParameterBufferH264 *)parameter_data)->seq_fields.bits.frame_mbs_only_flag = 1;
@@ -4408,6 +7138,8 @@ static int test_render_picture_prevalidates_all_buffers(void)
     drv.buffers[1].type = VAEncSequenceParameterBufferType;
     drv.buffers[1].data = &sequence;
     drv.buffers[1].size = sizeof(sequence);
+    drv.buffers[1].element_size = sizeof(sequence);
+    drv.buffers[1].num_elements = 1;
     drv.buffers[4].allocated = 1;
     drv.buffers[4].type = VAImageBufferType;
     uint8_t unrelated_data = 0;
@@ -4415,11 +7147,19 @@ static int test_render_picture_prevalidates_all_buffers(void)
     drv.buffers[4].size = sizeof(unrelated_data);
 
     VAEncPictureParameterBufferH264 picture = {0};
+    for (size_t i = 0; i < sizeof(picture.ReferenceFrames) /
+                            sizeof(picture.ReferenceFrames[0]); i++) {
+        picture.ReferenceFrames[i].picture_id = VA_INVALID_SURFACE;
+        picture.ReferenceFrames[i].flags = VA_PICTURE_H264_INVALID;
+    }
+    picture.CurrPic.picture_id = 5;
     picture.coded_buf = 4;
     drv.buffers[2].allocated = 1;
     drv.buffers[2].type = VAEncPictureParameterBufferType;
     drv.buffers[2].data = &picture;
     drv.buffers[2].size = sizeof(picture);
+    drv.buffers[2].element_size = sizeof(picture);
+    drv.buffers[2].num_elements = 1;
 
     status = hobot_vaRenderPicture(&va_ctx, 1, encoder_buffers, 2);
     if (status != VA_STATUS_ERROR_INVALID_BUFFER ||
@@ -4446,9 +7186,15 @@ static void test_h264_set_slice_groups(VAPictureParameterBufferH264 *picture,
 #pragma GCC diagnostic pop
 }
 
-static void test_h264_set_context_sized_geometry(
+static void test_h264_init_context_picture(
     VAPictureParameterBufferH264 *picture)
 {
+    for (size_t i = 0; i < sizeof(picture->ReferenceFrames) /
+                            sizeof(picture->ReferenceFrames[0]); i++) {
+        picture->ReferenceFrames[i].picture_id = VA_INVALID_SURFACE;
+        picture->ReferenceFrames[i].flags = VA_PICTURE_H264_INVALID;
+    }
+    picture->CurrPic.picture_id = 1;
     picture->picture_width_in_mbs_minus1 = 39;
     picture->picture_height_in_mbs_minus1 = 22;
     picture->seq_fields.bits.frame_mbs_only_flag = 1;
@@ -4471,14 +7217,18 @@ static int test_h264_parameter_synthesis_rejects_unrepresentable_sps(void)
     hctx->profile = VAProfileH264High;
     hctx->width = 640;
     hctx->height = 360;
+    hctx->current_render_target = 1;
+    drv.surfaces[1].allocated = 1;
     drv.buffers[1].allocated = 1;
     drv.buffers[1].type = VAPictureParameterBufferType;
     drv.buffers[1].data = &picture;
     drv.buffers[1].size = sizeof(picture);
+    drv.buffers[1].element_size = sizeof(picture);
+    drv.buffers[1].num_elements = 1;
     VABufferID picture_id = 1;
     mock_dequeue_input_calls = 0;
 
-    test_h264_set_context_sized_geometry(&picture);
+    test_h264_init_context_picture(&picture);
     VAStatus status = hobot_vaRenderPicture(&va_ctx, 1, &picture_id, 1);
     if (status != VA_STATUS_SUCCESS || hctx->cached_sps_len <= 0 ||
         hctx->cached_pps_len <= 0 || hctx->cached_sps[1] != 100 ||
@@ -4489,9 +7239,9 @@ static int test_h264_parameter_synthesis_rejects_unrepresentable_sps(void)
         return 0;
     }
 
-    for (int invalid_case = 0; invalid_case < 12; invalid_case++) {
+    for (int invalid_case = 0; invalid_case < 21; invalid_case++) {
         memset(&picture, 0, sizeof(picture));
-        test_h264_set_context_sized_geometry(&picture);
+        test_h264_init_context_picture(&picture);
         switch (invalid_case) {
         case 0:
             picture.seq_fields.bits.pic_order_cnt_type = 1;
@@ -4529,6 +7279,33 @@ static int test_h264_parameter_synthesis_rejects_unrepresentable_sps(void)
         case 11:
             picture.num_ref_frames = 17;
             break;
+        case 12:
+            picture.pic_init_qp_minus26 = -27;
+            break;
+        case 13:
+            picture.pic_init_qp_minus26 = 26;
+            break;
+        case 14:
+            picture.pic_init_qs_minus26 = -27;
+            break;
+        case 15:
+            picture.pic_init_qs_minus26 = 26;
+            break;
+        case 16:
+            picture.chroma_qp_index_offset = -13;
+            break;
+        case 17:
+            picture.chroma_qp_index_offset = 13;
+            break;
+        case 18:
+            picture.second_chroma_qp_index_offset = -13;
+            break;
+        case 19:
+            picture.second_chroma_qp_index_offset = 13;
+            break;
+        case 20:
+            picture.pic_fields.bits.weighted_bipred_idc = 3;
+            break;
         }
         hctx->cached_sps_len = 1;
         hctx->cached_pps_len = 1;
@@ -4549,7 +7326,7 @@ static int test_h264_parameter_synthesis_rejects_unrepresentable_sps(void)
     }
 
     memset(&picture, 0, sizeof(picture));
-    test_h264_set_context_sized_geometry(&picture);
+    test_h264_init_context_picture(&picture);
     picture.seq_fields.bits.pic_order_cnt_type = 2;
     status = hobot_vaRenderPicture(&va_ctx, 1, &picture_id, 1);
     int passed = status == VA_STATUS_SUCCESS && hctx->cached_sps_len > 0 &&
@@ -4558,7 +7335,7 @@ static int test_h264_parameter_synthesis_rejects_unrepresentable_sps(void)
         fprintf(stderr, "valid H264 POC-2 picture parameters were rejected: status=%d\n", status);
 
     memset(&picture, 0, sizeof(picture));
-    test_h264_set_context_sized_geometry(&picture);
+    test_h264_init_context_picture(&picture);
     hctx->profile = VAProfileH264Main;
     status = hobot_vaRenderPicture(&va_ctx, 1, &picture_id, 1);
     passed = passed && status == VA_STATUS_SUCCESS && hctx->cached_sps_len > 0 &&
@@ -4568,7 +7345,7 @@ static int test_h264_parameter_synthesis_rejects_unrepresentable_sps(void)
         fprintf(stderr, "valid H264 Main 4:2:0 defaults were rejected: status=%d\n", status);
 
     memset(&picture, 0, sizeof(picture));
-    test_h264_set_context_sized_geometry(&picture);
+    test_h264_init_context_picture(&picture);
     hctx->profile = VAProfileH264ConstrainedBaseline;
     status = hobot_vaRenderPicture(&va_ctx, 1, &picture_id, 1);
     passed = passed && status == VA_STATUS_SUCCESS && hctx->cached_sps_len > 3 &&
@@ -4579,7 +7356,7 @@ static int test_h264_parameter_synthesis_rejects_unrepresentable_sps(void)
 
     for (int invalid_case = 0; invalid_case < 5; invalid_case++) {
         memset(&picture, 0, sizeof(picture));
-        test_h264_set_context_sized_geometry(&picture);
+        test_h264_init_context_picture(&picture);
         switch (invalid_case) {
         case 0:
             picture.seq_fields.bits.frame_mbs_only_flag = 0;
@@ -4623,6 +7400,7 @@ static int test_h264_profile_sps_headers(void)
     };
     VAPictureParameterBufferH264 picture = {0};
     picture.seq_fields.bits.chroma_format_idc = 1;
+    picture.seq_fields.bits.frame_mbs_only_flag = 1;
     uint8_t sps[256] = {0};
 
     for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
@@ -4643,12 +7421,94 @@ static int test_h264_profile_sps_headers(void)
     return 1;
 }
 
+static int build_h264_ref_test_slice(
+    const VAPictureParameterBufferH264 *picture,
+    VASliceParameterBufferH264 *slice,
+    uint8_t nal_header,
+    unsigned int slice_type,
+    int override_refs,
+    unsigned int active_l0,
+    unsigned int active_l1,
+    uint8_t *stream,
+    size_t capacity,
+    size_t *stream_size);
+
+static int test_h264_interlaced_picture_parameters(void)
+{
+    VAPictureParameterBufferH264 picture = {0};
+    picture.picture_width_in_mbs_minus1 = 39;
+    picture.picture_height_in_mbs_minus1 = 29;
+    picture.seq_fields.bits.chroma_format_idc = 1;
+    picture.seq_fields.bits.pic_order_cnt_type = 2;
+    picture.seq_fields.bits.mb_adaptive_frame_field_flag = 1;
+    VAProfile profiles[] = {
+        VAProfileH264ConstrainedBaseline,
+        VAProfileH264Main,
+        VAProfileH264High,
+    };
+    uint8_t sps[256] = {0};
+    for (size_t i = 0; i < sizeof(profiles) / sizeof(profiles[0]); i++) {
+        if (hobot_h264_picture_parameters_supported(
+                &picture, profiles[i], 640, 480) ||
+            generate_h264_sps(&picture, profiles[i], sps, sizeof(sps)) != 0) {
+            fprintf(stderr, "H264 interlaced/MBAFF mode accepted for profile %d\n",
+                    profiles[i]);
+            return 0;
+        }
+    }
+
+    picture.pic_fields.bits.field_pic_flag = 1;
+    picture.CurrPic.flags = VA_PICTURE_H264_TOP_FIELD;
+    VASliceParameterBufferH264 slice = {0};
+    uint8_t stream[64] = {0};
+    size_t stream_size = 0;
+    if (!build_h264_ref_test_slice(
+            &picture, &slice, 0x65, 2, 0, 0, 0,
+            stream, sizeof(stream), &stream_size))
+        return 0;
+    HobotBuffer data = {
+        .allocated = 1,
+        .type = VASliceDataBufferType,
+        .size = (unsigned int)stream_size,
+        .data = stream,
+    };
+    unsigned int slice_type;
+    uint32_t l0_override, l1_override;
+    if (hobot_h264_slice_ref_override_flags(
+            &picture, &slice, &data, &slice_type,
+            &l0_override, &l1_override)) {
+        fprintf(stderr, "H264 field-picture slice reached the supported parser\n");
+        return 0;
+    }
+
+    picture.seq_fields.bits.frame_mbs_only_flag = 1;
+    picture.pic_fields.bits.field_pic_flag = 0;
+    picture.CurrPic.flags = 0;
+    if (!hobot_h264_picture_parameters_supported(
+            &picture, VAProfileH264Main, 640, 480)) {
+        fprintf(stderr, "progressive 640x480 H264 Main parameters rejected\n");
+        return 0;
+    }
+
+    picture.seq_fields.bits.chroma_format_idc = 0;
+    for (size_t i = 0; i < sizeof(profiles) / sizeof(profiles[0]); i++) {
+        if (hobot_h264_picture_parameters_supported(
+                &picture, profiles[i], 640, 480) ||
+            generate_h264_sps(&picture, profiles[i], sps, sizeof(sps)) != 0) {
+            fprintf(stderr, "H264 monochrome mode accepted for profile %d\n",
+                    profiles[i]);
+            return 0;
+        }
+    }
+    return 1;
+}
+
 static int test_h264_constrained_baseline_output_headers(void)
 {
     VAPictureParameterBufferH264 picture = {0};
     picture.seq_fields.bits.chroma_format_idc = 1;
     uint8_t pps[256] = {0};
-    int pps_size = generate_h264_pps(&picture, 0, pps, sizeof(pps));
+    int pps_size = generate_h264_pps(&picture, 0, 0, pps, sizeof(pps));
     if (pps_size < 2)
         return 0;
 
@@ -4703,7 +7563,7 @@ static int test_h264_constrained_baseline_output_headers(void)
 
     uint8_t bad_pps[256] = {0};
     picture.pic_fields.bits.transform_8x8_mode_flag = 1;
-    int bad_pps_size = generate_h264_pps(&picture, 0, bad_pps, sizeof(bad_pps));
+    int bad_pps_size = generate_h264_pps(&picture, 0, 0, bad_pps, sizeof(bad_pps));
     if (bad_pps_size < 2 ||
         hobot_h264_strip_constrained_baseline_pps_extension(
             bad_pps, (size_t)bad_pps_size, &rewritten_pps,
@@ -4714,7 +7574,7 @@ static int test_h264_constrained_baseline_output_headers(void)
     }
     picture.pic_fields.bits.transform_8x8_mode_flag = 0;
     picture.second_chroma_qp_index_offset = 1;
-    bad_pps_size = generate_h264_pps(&picture, 0, bad_pps, sizeof(bad_pps));
+    bad_pps_size = generate_h264_pps(&picture, 0, 0, bad_pps, sizeof(bad_pps));
     if (bad_pps_size < 2 ||
         hobot_h264_strip_constrained_baseline_pps_extension(
             bad_pps, (size_t)bad_pps_size, &rewritten_pps,
@@ -4724,6 +7584,374 @@ static int test_h264_constrained_baseline_output_headers(void)
         return 0;
     }
     return 1;
+}
+
+static int build_h264_ref_test_slice(
+    const VAPictureParameterBufferH264 *picture,
+    VASliceParameterBufferH264 *slice,
+    uint8_t nal_header,
+    unsigned int slice_type,
+    int override_refs,
+    unsigned int active_l0,
+    unsigned int active_l1,
+    uint8_t *stream,
+    size_t capacity,
+    size_t *stream_size)
+{
+    if (!picture || !slice || !stream || !stream_size ||
+        *stream_size >= capacity || slice_type > 9u ||
+        active_l0 > 31u || active_l1 > 31u)
+        return 0;
+
+    uint8_t rbsp[64] = {0};
+    BitWriter bw = {rbsp, 0};
+    bw_put_ue(&bw, 0); /* first_mb_in_slice */
+    bw_put_ue(&bw, slice_type);
+    bw_put_ue(&bw, 0); /* pic_parameter_set_id */
+    bw_put_bits(&bw, 0, picture->seq_fields.bits.log2_max_frame_num_minus4 + 4u);
+    if (!picture->seq_fields.bits.frame_mbs_only_flag) {
+        bw_put_bit(&bw, picture->pic_fields.bits.field_pic_flag);
+        if (picture->pic_fields.bits.field_pic_flag) {
+            bw_put_bit(&bw, !!(picture->CurrPic.flags &
+                               VA_PICTURE_H264_BOTTOM_FIELD));
+        }
+    }
+    if ((nal_header & 0x1fu) == 5u)
+        bw_put_ue(&bw, 0); /* idr_pic_id */
+    if (picture->seq_fields.bits.pic_order_cnt_type == 0) {
+        bw_put_bits(&bw, 0,
+                    picture->seq_fields.bits.log2_max_pic_order_cnt_lsb_minus4 + 4u);
+        if (picture->pic_fields.bits.pic_order_present_flag)
+            bw_put_se(&bw, 0);
+    }
+
+    unsigned int normalized_type = slice_type % 5u;
+    uint8_t direct_spatial_mv_pred_flag = 0;
+    if (normalized_type == 1u) {
+        bw_put_bit(&bw, 1); /* direct_spatial_mv_pred_flag */
+        direct_spatial_mv_pred_flag = 1;
+    }
+    if (normalized_type == 0u || normalized_type == 1u) {
+        bw_put_bit(&bw, override_refs);
+        if (override_refs) {
+            bw_put_ue(&bw, active_l0);
+            if (normalized_type == 1u)
+                bw_put_ue(&bw, active_l1);
+        }
+    }
+
+    size_t nal_size = 1u + ((size_t)bw.bit_pos + 7u) / 8u;
+    if (nal_size > capacity - *stream_size || nal_size > UINT32_MAX ||
+        (size_t)8u + (size_t)bw.bit_pos > UINT16_MAX)
+        return 0;
+    memset(slice, 0, sizeof(*slice));
+    slice->slice_data_offset = (uint32_t)*stream_size;
+    slice->slice_data_size = (uint32_t)nal_size;
+    slice->slice_data_flag = VA_SLICE_DATA_FLAG_ALL;
+    slice->slice_data_bit_offset = (uint16_t)(8u + (size_t)bw.bit_pos);
+    slice->slice_type = (uint8_t)slice_type;
+    slice->direct_spatial_mv_pred_flag = direct_spatial_mv_pred_flag;
+    slice->num_ref_idx_l0_active_minus1 = (uint8_t)active_l0;
+    slice->num_ref_idx_l1_active_minus1 = (uint8_t)active_l1;
+    stream[*stream_size] = nal_header;
+    memcpy(stream + *stream_size + 1u, rbsp, nal_size - 1u);
+    *stream_size += nal_size;
+    return 1;
+}
+
+static int test_h264_pps_reference_defaults_from_slice_parameters(void)
+{
+    HobotDriverData drv = {0};
+    VAPictureParameterBufferH264 picture = {0};
+    picture.seq_fields.bits.frame_mbs_only_flag = 1;
+    picture.seq_fields.bits.pic_order_cnt_type = 2;
+    VASliceParameterBufferH264 slices[4] = {0};
+    uint8_t stream[256] = {0};
+    size_t stream_size = 0;
+    if (!build_h264_ref_test_slice(&picture, &slices[0], 0x01, 0, 0, 2, 0,
+                                   stream, sizeof(stream), &stream_size) ||
+        !build_h264_ref_test_slice(&picture, &slices[1], 0x41, 1, 0, 2, 1,
+                                   stream, sizeof(stream), &stream_size) ||
+        !build_h264_ref_test_slice(&picture, &slices[2], 0x41, 1, 1, 3, 0,
+                                   stream, sizeof(stream), &stream_size) ||
+        !build_h264_ref_test_slice(&picture, &slices[3], 0x41, 1, 0, 2, 1,
+                                   stream, sizeof(stream), &stream_size))
+        return 0;
+
+    const VABufferID ids[] = {1};
+    const VABufferID data_ids[] = {2};
+    drv.buffers[1] = (HobotBuffer){
+        .id = 1, .allocated = 1, .type = VASliceParameterBufferType,
+        .size = sizeof(slices), .element_size = sizeof(slices[0]),
+        .num_elements = 4, .data = slices
+    };
+    drv.buffers[2] = (HobotBuffer){
+        .id = 2, .allocated = 1, .type = VASliceDataBufferType,
+        .size = (unsigned int)stream_size, .data = stream
+    };
+
+    unsigned int l0 = UINT_MAX;
+    unsigned int l1 = UINT_MAX;
+    int headers_present = 0;
+    if (!hobot_h264_default_reference_counts(
+            &drv, &picture, ids, 1, data_ids, 1,
+            &l0, &l1, &headers_present) ||
+        !headers_present || l0 != 2 || l1 != 1) {
+        fprintf(stderr, "H.264 PPS defaults did not ignore per-slice explicit overrides: L0=%u L1=%u headers=%d\n",
+                l0, l1, headers_present);
+        return 0;
+    }
+
+    const VABufferID invalid_ids[] = {0};
+    if (hobot_h264_default_reference_counts(
+            &drv, &picture, invalid_ids, 1, data_ids, 1,
+            &l0, &l1, &headers_present)) {
+        fprintf(stderr, "H.264 PPS helper accepted the reserved buffer ID zero\n");
+        return 0;
+    }
+
+    VAPictureParameterBufferH264 pps_picture = {0};
+    uint8_t pps[256] = {0};
+    int pps_size = generate_h264_pps(&pps_picture, l0, l1, pps, sizeof(pps));
+    uint8_t pps_rbsp[256];
+    size_t pps_rbsp_size = 0;
+    if (pps_size < 2 ||
+        !hobot_hevc_unescape_rbsp(pps + 1, (size_t)pps_size - 1u,
+                                  pps_rbsp, sizeof(pps_rbsp), &pps_rbsp_size))
+        return 0;
+    BitReader pps_br = {pps_rbsp, pps_rbsp_size * 8u, 0};
+    uint32_t ignored, pps_l0, pps_l1;
+    if (!br_read_ue(&pps_br, &ignored, NULL, NULL) ||
+        !br_read_ue(&pps_br, &ignored, NULL, NULL) ||
+        !br_skip_bits(&pps_br, 2) ||
+        !br_read_ue(&pps_br, &ignored, NULL, NULL) ||
+        !br_read_ue(&pps_br, &pps_l0, NULL, NULL) ||
+        !br_read_ue(&pps_br, &pps_l1, NULL, NULL) ||
+        pps_l0 != 2 || pps_l1 != 1) {
+        fprintf(stderr, "H.264 PPS did not encode the derived L0/L1 defaults\n");
+        return 0;
+    }
+
+    slices[3].num_ref_idx_l1_active_minus1 = 0;
+    if (hobot_h264_default_reference_counts(
+            &drv, &picture, ids, 1, data_ids, 1,
+            &l0, &l1, &headers_present)) {
+        fprintf(stderr, "conflicting inherited H.264 PPS defaults were accepted\n");
+        return 0;
+    }
+
+    memset(slices, 0, sizeof(slices));
+    memset(stream, 0, sizeof(stream));
+    stream_size = 0;
+    if (!build_h264_ref_test_slice(&picture, &slices[0], 0x01, 0, 1, 0, 0,
+                                   stream, sizeof(stream), &stream_size) ||
+        !build_h264_ref_test_slice(&picture, &slices[1], 0x41, 1, 1, 2, 1,
+                                   stream, sizeof(stream), &stream_size) ||
+        !build_h264_ref_test_slice(&picture, &slices[2], 0x41, 1, 1, 4, 0,
+                                   stream, sizeof(stream), &stream_size) ||
+        !build_h264_ref_test_slice(&picture, &slices[3], 0x01, 0, 1, 1, 0,
+                                   stream, sizeof(stream), &stream_size))
+        return 0;
+    drv.buffers[2].size = (unsigned int)stream_size;
+    if (!hobot_h264_default_reference_counts(
+            &drv, &picture, ids, 1, data_ids, 1,
+            &l0, &l1, &headers_present) ||
+        !headers_present || l0 != 0 || l1 != 0) {
+        fprintf(stderr, "all-overridden H.264 slices did not permit unused zero PPS defaults: L0=%u L1=%u\n",
+                l0, l1);
+        return 0;
+    }
+
+    return 1;
+}
+
+static int read_h264_pps_reference_defaults(const HobotContext *hctx,
+                                           unsigned int *l0,
+                                           unsigned int *l1)
+{
+    if (!hctx || !l0 || !l1 || hctx->cached_pps_len <= 1)
+        return 0;
+    uint8_t rbsp[256];
+    size_t rbsp_size = 0;
+    if (!hobot_hevc_unescape_rbsp(hctx->cached_pps + 1,
+                                  (size_t)hctx->cached_pps_len - 1u,
+                                  rbsp, sizeof(rbsp), &rbsp_size))
+        return 0;
+    BitReader br = {rbsp, rbsp_size * 8u, 0};
+    uint32_t ignored, parsed_l0, parsed_l1;
+    if (!br_read_ue(&br, &ignored, NULL, NULL) ||
+        !br_read_ue(&br, &ignored, NULL, NULL) ||
+        !br_skip_bits(&br, 2) ||
+        !br_read_ue(&br, &ignored, NULL, NULL) ||
+        !br_read_ue(&br, &parsed_l0, NULL, NULL) ||
+        !br_read_ue(&br, &parsed_l1, NULL, NULL))
+        return 0;
+    *l0 = parsed_l0;
+    *l1 = parsed_l1;
+    return 1;
+}
+
+static int h264_input_contains_pps(const HobotContext *hctx,
+                                   const media_codec_buffer_t *input)
+{
+    if (!hctx || !input || !input->vstream_buf.vir_ptr ||
+        hctx->cached_pps_len <= 0 || hctx->dec_in_buf_offset < 0)
+        return 0;
+    const uint8_t *bytes = (const uint8_t *)input->vstream_buf.vir_ptr;
+    size_t size = (size_t)hctx->dec_in_buf_offset;
+    for (size_t i = 0; i + 4u + (size_t)hctx->cached_pps_len <= size; i++) {
+        if (bytes[i] == 0 && bytes[i + 1u] == 0 &&
+            bytes[i + 2u] == 0 && bytes[i + 3u] == 1 &&
+            memcmp(bytes + i + 4u, hctx->cached_pps,
+                   (size_t)hctx->cached_pps_len) == 0)
+            return 1;
+    }
+    return 0;
+}
+
+static int test_h264_pps_defaults_with_picture_and_slices_in_one_render(void)
+{
+    HobotDriverData drv = {0};
+    struct VADriverContext va_ctx = {0};
+    VAPictureParameterBufferH264 picture = {0};
+    VASliceParameterBufferH264 slice = {0};
+    uint8_t stream[64] = {0};
+    size_t stream_size = 0;
+    if (pthread_mutex_init(&drv.mutex, NULL) != 0)
+        return 0;
+    va_ctx.pDriverData = &drv;
+
+    HobotContext *hctx = &drv.contexts[1];
+    hctx->id = 1;
+    hctx->profile = VAProfileH264High;
+    hctx->width = 640;
+    hctx->height = 360;
+    hctx->vpu_ctx.video_dec_params.bitstream_buf_size = sizeof(mock_input);
+    hctx->allocated = 1;
+    hctx->vpu_running = 1;
+    hctx->current_render_target = 29;
+    hctx->decode_picture_active = 1;
+    hctx->submitted_surfaces[hctx->sub_tail++ % 128] = 29;
+    drv.surfaces[29].allocated = 1;
+    drv.surfaces[29].context_id = hctx->id;
+    drv.surfaces[29].decode_pending = 1;
+
+    test_h264_init_context_picture(&picture);
+    picture.CurrPic.picture_id = hctx->current_render_target;
+    picture.seq_fields.bits.pic_order_cnt_type = 2;
+    picture.num_ref_frames = 1;
+    if (!build_h264_ref_test_slice(&picture, &slice, 0x41, 1, 0, 2, 1,
+                                   stream, sizeof(stream), &stream_size)) {
+        pthread_mutex_destroy(&drv.mutex);
+        return 0;
+    }
+
+    drv.buffers[1] = (HobotBuffer){
+        .id = 1, .allocated = 1, .type = VAPictureParameterBufferType,
+        .size = sizeof(picture), .capacity = sizeof(picture),
+        .element_size = sizeof(picture), .num_elements = 1, .data = &picture
+    };
+    drv.buffers[2] = (HobotBuffer){
+        .id = 2, .allocated = 1, .type = VASliceParameterBufferType,
+        .size = sizeof(slice), .capacity = sizeof(slice),
+        .element_size = sizeof(slice), .num_elements = 1, .data = &slice
+    };
+    drv.buffers[3] = (HobotBuffer){
+        .id = 3, .allocated = 1, .type = VASliceDataBufferType,
+        .size = (unsigned int)stream_size, .capacity = (unsigned int)stream_size,
+        .data = stream
+    };
+    VABufferID ids[] = {1, 2, 3};
+
+    VAStatus status = hobot_vaRenderPicture(&va_ctx, 1, ids, 3);
+    unsigned int pps_l0 = UINT_MAX;
+    unsigned int pps_l1 = UINT_MAX;
+    int pps_valid = read_h264_pps_reference_defaults(hctx, &pps_l0, &pps_l1);
+    int passed = status == VA_STATUS_SUCCESS && pps_valid &&
+        pps_l0 == 2 && pps_l1 == 1 && hctx->dec_in_buf_valid;
+    if (!passed)
+        fprintf(stderr, "same-call H.264 PPS defaults were not synthesized: status=%d valid=%d L0=%u L1=%u input=%d\n",
+                status, pps_valid, pps_l0, pps_l1, hctx->dec_in_buf_valid);
+
+    pthread_mutex_destroy(&drv.mutex);
+    return passed;
+}
+
+static int test_h264_pps_defaults_when_picture_and_slices_are_separate(void)
+{
+    HobotDriverData drv = {0};
+    struct VADriverContext va_ctx = {0};
+    VAPictureParameterBufferH264 picture = {0};
+    VASliceParameterBufferH264 slice = {0};
+    uint8_t stream[64] = {0};
+    size_t stream_size = 0;
+    if (pthread_mutex_init(&drv.mutex, NULL) != 0)
+        return 0;
+    va_ctx.pDriverData = &drv;
+
+    HobotContext *hctx = &drv.contexts[1];
+    hctx->id = 1;
+    hctx->profile = VAProfileH264High;
+    hctx->width = 640;
+    hctx->height = 360;
+    hctx->vpu_ctx.video_dec_params.bitstream_buf_size = sizeof(mock_input);
+    hctx->allocated = 1;
+    hctx->vpu_running = 1;
+    hctx->current_render_target = 29;
+    hctx->decode_picture_active = 1;
+    hctx->submitted_surfaces[hctx->sub_tail++ % 128] = 29;
+    drv.surfaces[29].allocated = 1;
+    drv.surfaces[29].context_id = hctx->id;
+    drv.surfaces[29].decode_pending = 1;
+
+    test_h264_init_context_picture(&picture);
+    picture.CurrPic.picture_id = hctx->current_render_target;
+    picture.seq_fields.bits.pic_order_cnt_type = 2;
+    picture.num_ref_frames = 3;
+    if (!build_h264_ref_test_slice(&picture, &slice, 0x41, 1, 0, 2, 1,
+                                   stream, sizeof(stream), &stream_size)) {
+        pthread_mutex_destroy(&drv.mutex);
+        return 0;
+    }
+
+    drv.buffers[1] = (HobotBuffer){
+        .id = 1, .allocated = 1, .type = VAPictureParameterBufferType,
+        .size = sizeof(picture), .capacity = sizeof(picture),
+        .element_size = sizeof(picture), .num_elements = 1, .data = &picture
+    };
+    drv.buffers[2] = (HobotBuffer){
+        .id = 2, .allocated = 1, .type = VASliceParameterBufferType,
+        .size = sizeof(slice), .capacity = sizeof(slice),
+        .element_size = sizeof(slice), .num_elements = 1, .data = &slice
+    };
+    drv.buffers[3] = (HobotBuffer){
+        .id = 3, .allocated = 1, .type = VASliceDataBufferType,
+        .size = (unsigned int)stream_size, .capacity = (unsigned int)stream_size,
+        .data = stream
+    };
+
+    VABufferID picture_ids[] = {1};
+    VAStatus status = hobot_vaRenderPicture(&va_ctx, 1, picture_ids, 1);
+    unsigned int pps_l0 = UINT_MAX;
+    unsigned int pps_l1 = UINT_MAX;
+    int initial_pps_valid = status == VA_STATUS_SUCCESS &&
+        read_h264_pps_reference_defaults(hctx, &pps_l0, &pps_l1) &&
+        pps_l0 == 2 && pps_l1 == 0;
+
+    VABufferID slice_ids[] = {2, 3};
+    status = hobot_vaRenderPicture(&va_ctx, 1, slice_ids, 2);
+    int updated_pps_valid = status == VA_STATUS_SUCCESS &&
+        read_h264_pps_reference_defaults(hctx, &pps_l0, &pps_l1) &&
+        pps_l0 == 2 && pps_l1 == 1 && hctx->dec_in_buf_valid &&
+        h264_input_contains_pps(hctx, &hctx->dec_in_buf);
+    int passed = initial_pps_valid && updated_pps_valid;
+    if (!passed)
+        fprintf(stderr, "separate-call H.264 PPS defaults failed: initial=%d updated=%d status=%d L0=%u L1=%u input=%d headers=%d\n",
+                initial_pps_valid, updated_pps_valid, status,
+                pps_l0, pps_l1, hctx->dec_in_buf_valid, hctx->headers_sent);
+
+    pthread_mutex_destroy(&drv.mutex);
+    return passed;
 }
 
 static int test_h264_constrained_baseline_header_rejection(void)
@@ -5044,6 +8272,7 @@ static int test_va_lock_surface_lifetime(void)
     surf->dma_fd = 9;
     surf->has_preallocated = 1;
     surf->context_id = 1;
+    surf->raw_data_valid = 1;
     surf->preallocated_gbuf.fd[0] = 9;
     surf->preallocated_gbuf.fd[1] = -1;
     surf->preallocated_gbuf.stride = 64;
@@ -5052,6 +8281,7 @@ static int test_va_lock_surface_lifetime(void)
     surf->preallocated_gbuf.size[0] = 64u * 64u * 3u / 2u;
     surf->preallocated_gbuf.offset[1] = 64u * 64u;
     surf->preallocated_gbuf.virt_addr[0] = mock_graph_data;
+    surf->preallocated_gbuf.virt_addr[1] = mock_graph_data + 64u * 64u;
     surf->raw_data_size = 64u * 64u * 3u / 2u;
     drv.images[1].allocated = 1;
     drv.images[1].buf_id = 1;
@@ -5069,15 +8299,39 @@ static int test_va_lock_surface_lifetime(void)
     unsigned int uv_offset = 0;
     unsigned int buffer_name = 0;
     void *buffer = NULL;
+    mock_mem_invalidate_calls = 0;
+    mock_mem_flush_calls = 0;
+    mock_mem_invalidate_result = 0;
+    mock_mem_flush_result = 0;
     VAStatus status = hobot_vaLockSurface(&va_ctx, 1, &fourcc, &stride,
                                           NULL, NULL, NULL, &uv_offset,
                                           NULL, &buffer_name, &buffer);
     if (status != VA_STATUS_SUCCESS || surf->lock_count != 1 ||
+        surf->va_lock_count != 1 || surf->cpu_access_count != 1 ||
         fourcc != VA_FOURCC_NV12 || stride != 64 || uv_offset != 4096 ||
-        buffer_name != 9 || buffer != mock_graph_data) {
+        buffer_name != 9 || buffer != mock_graph_data ||
+        mock_mem_invalidate_calls != 1 || mock_mem_invalidate_fd != 9) {
         fprintf(stderr, "vaLockSurface failed to acquire backing lifetime: status=%d locks=%u fourcc=0x%x stride=%u uv=%u fd=%u ptr=%p\n",
                 status, surf->lock_count, fourcc, stride, uv_offset,
                 buffer_name, buffer);
+        pthread_mutex_destroy(&drv.mutex);
+        return 0;
+    }
+    if (hobot_vaUnlockSurface(&va_ctx, 1) != VA_STATUS_SUCCESS ||
+        surf->lock_count != 0 || surf->va_lock_count != 0 ||
+        surf->cpu_access_count != 0 || surf->raw_data_valid ||
+        mock_mem_flush_calls != 1 ||
+        hobot_vaUnlockSurface(&va_ctx, 1) != VA_STATUS_ERROR_OPERATION_FAILED) {
+        fprintf(stderr, "vaUnlockSurface did not balance CPU access ownership\n");
+        pthread_mutex_destroy(&drv.mutex);
+        return 0;
+    }
+    status = hobot_vaLockSurface(&va_ctx, 1, &fourcc, &stride,
+                                 NULL, NULL, NULL, &uv_offset,
+                                 NULL, &buffer_name, &buffer);
+    if (status != VA_STATUS_SUCCESS || surf->lock_count != 1 ||
+        surf->va_lock_count != 1 || surf->cpu_access_count != 1) {
+        fprintf(stderr, "vaLockSurface could not reacquire after unlock: status=%d\n", status);
         pthread_mutex_destroy(&drv.mutex);
         return 0;
     }
@@ -5085,6 +8339,7 @@ static int test_va_lock_surface_lifetime(void)
     status = hobot_vaLockSurface(&va_ctx, 1, NULL, NULL, NULL, NULL,
                                  NULL, NULL, NULL, NULL, &buffer);
     if (status != VA_STATUS_SUCCESS || surf->lock_count != 2 ||
+        surf->va_lock_count != 2 || surf->cpu_access_count != 2 ||
         hobot_vaBeginPicture(&va_ctx, 1, 1) != VA_STATUS_ERROR_SURFACE_BUSY ||
         hobot_vaPutImage(&va_ctx, 1, 1, 0, 0, 64, 64, 0, 0, 64, 64) !=
             VA_STATUS_ERROR_SURFACE_BUSY) {
@@ -5117,32 +8372,206 @@ static int test_va_lock_surface_lifetime(void)
     }
 
     if (hobot_vaUnlockSurface(&va_ctx, 1) != VA_STATUS_SUCCESS ||
-        surf->lock_count != 1 ||
+        surf->lock_count != 1 || surf->va_lock_count != 1 ||
+        surf->cpu_access_count != 1 ||
         hobot_vaBeginPicture(&va_ctx, 1, 1) != VA_STATUS_ERROR_SURFACE_BUSY ||
         hobot_vaUnlockSurface(&va_ctx, 1) != VA_STATUS_SUCCESS ||
-        surf->lock_count != 0) {
+        surf->lock_count != 0 || surf->va_lock_count != 0 ||
+        surf->cpu_access_count != 0) {
         fprintf(stderr, "surface lock reference count did not release correctly: locks=%u\n",
                 surf->lock_count);
         pthread_mutex_destroy(&drv.mutex);
         return 0;
     }
 
+    surf->preallocated_gbuf.fd[1] = 10;
+    surf->preallocated_gbuf.size[0] = 64u * 64u;
+    surf->preallocated_gbuf.size[1] = 64u * 32u;
+    surf->preallocated_gbuf.offset[1] = 0;
+    int cache_calls_before = mock_mem_invalidate_calls;
+    status = hobot_vaLockSurface(&va_ctx, 1, NULL, NULL, NULL, NULL,
+                                 NULL, NULL, NULL, NULL, &buffer);
+    if (status != VA_STATUS_ERROR_OPERATION_FAILED || surf->lock_count != 0 ||
+        surf->va_lock_count != 0 || surf->cpu_access_count != 0 ||
+        mock_mem_invalidate_calls != cache_calls_before) {
+        fprintf(stderr,
+                "vaLockSurface misrepresented separate-FD NV12 planes: status=%d locks=%u\n",
+                status, surf->lock_count);
+        pthread_mutex_destroy(&drv.mutex);
+        return 0;
+    }
+
+    surf->has_preallocated = 0;
+    surf->has_decoded_frame = 1;
+    surf->dma_fd = 9;
+    surf->vpu_out_buf.vframe_buf.fd[0] = 9;
+    surf->vpu_out_buf.vframe_buf.fd[1] = 10;
+    surf->vpu_out_buf.vframe_buf.vir_ptr[0] = mock_graph_data;
+    surf->vpu_out_buf.vframe_buf.vir_ptr[1] = mock_graph_data + 64u * 64u;
+    surf->vpu_out_buf.vframe_buf.stride = 64;
+    surf->vpu_out_buf.vframe_buf.vstride = 64;
+    surf->vpu_out_buf.vframe_buf.size = 64u * 64u * 3u / 2u;
+    status = hobot_vaLockSurface(&va_ctx, 1, NULL, NULL, NULL, NULL,
+                                 NULL, NULL, NULL, NULL, &buffer);
+    if (status != VA_STATUS_ERROR_UNSUPPORTED_MEMORY_TYPE ||
+        surf->lock_count != 0 || surf->va_lock_count != 0 ||
+        surf->cpu_access_count != 0 ||
+        mock_mem_invalidate_calls != cache_calls_before) {
+        fprintf(stderr,
+                "vaLockSurface accepted decoded multi-FD NV12 planes: status=%d locks=%u\n",
+                status, surf->lock_count);
+        pthread_mutex_destroy(&drv.mutex);
+        return 0;
+    }
+    surf->has_decoded_frame = 0;
+    surf->has_preallocated = 1;
+
+    surf->preallocated_gbuf.fd[1] = -1;
+    surf->preallocated_gbuf.size[0] = 64u * 64u * 3u / 2u;
+    surf->preallocated_gbuf.size[1] = 0;
+    surf->preallocated_gbuf.offset[1] = 64u * 64u;
+
+    surf->has_decoded_frame = 0;
+    surf->cpu_cache_flush_pending = 1;
+    mock_mem_flush_result = -1;
+    mock_mem_flush_calls = 0;
     status = hobot_vaBeginPicture(&va_ctx, 1, 1);
-    if (status != VA_STATUS_SUCCESS) {
-        fprintf(stderr, "surface remained unavailable after final unlock: status=%d\n", status);
+    if (status != VA_STATUS_ERROR_OPERATION_FAILED ||
+        !surf->cpu_cache_flush_pending || hctx->decode_picture_active) {
+        fprintf(stderr, "decoder began with a pending CPU cache flush: status=%d\n", status);
+        pthread_mutex_destroy(&drv.mutex);
+        return 0;
+    }
+    mock_mem_flush_result = 0;
+    status = hobot_vaBeginPicture(&va_ctx, 1, 1);
+    if (status != VA_STATUS_SUCCESS || surf->cpu_cache_flush_pending ||
+        mock_mem_flush_calls != 2) {
+        fprintf(stderr, "surface remained unavailable after cache flush retry: status=%d\n", status);
         pthread_mutex_destroy(&drv.mutex);
         return 0;
     }
     pthread_mutex_lock(&drv.mutex);
     hobot_abort_pending_decode_picture(&drv, hctx);
     pthread_mutex_unlock(&drv.mutex);
+    int saved_stop_result = mock_stop_result;
+    mock_stop_result = 0;
+    VAStatus context_status = hobot_vaDestroyContext(&va_ctx, 1);
     status = hobot_vaDestroySurfaces(&va_ctx, &surface_id, 1);
-    int passed = status == VA_STATUS_SUCCESS && !surf->allocated;
+    int passed = context_status == VA_STATUS_SUCCESS &&
+                 surf->context_usage_mask == 0 &&
+                 status == VA_STATUS_SUCCESS && !surf->allocated;
     if (!passed)
-        fprintf(stderr, "surface cleanup after unlock failed: status=%d allocated=%d\n",
-                status, surf->allocated);
+        fprintf(stderr, "surface cleanup after context teardown failed: context=%d status=%d allocated=%d usage=0x%x\n",
+                context_status, status, surf->allocated,
+                surf->context_usage_mask);
+    mock_stop_result = saved_stop_result;
     pthread_mutex_destroy(&drv.mutex);
     return passed;
+}
+
+static int test_active_encoder_surface_excludes_competing_access(void)
+{
+    HobotDriverData drv = {0};
+    struct VADriverContext va_ctx = {0};
+    if (pthread_mutex_init(&drv.mutex, NULL) != 0)
+        return 0;
+    va_ctx.pDriverData = &drv;
+
+    HobotContext *encoder = &drv.contexts[1];
+    encoder->allocated = 1;
+    encoder->is_encoder = 1;
+    encoder->encoder_picture_active = 1;
+    encoder->current_render_target = 1;
+    atomic_init(&encoder->enc_external_input_pending, 0);
+
+    HobotContext *decoder = &drv.contexts[2];
+    decoder->allocated = 1;
+    decoder->vpu_running = 1;
+    decoder->profile = VAProfileH264Main;
+    decoder->width = 64;
+    decoder->height = 64;
+
+    HobotSurface *surf = &drv.surfaces[1];
+    surf->allocated = 1;
+    surf->width = 64;
+    surf->height = 64;
+    surf->stride = 64;
+    surf->context_id = 2;
+    surf->output_context_id = 2;
+    drv.images[1].allocated = 1;
+
+    unsigned int stride = 0;
+    void *pixels = NULL;
+    struct hobot_surface_info surface_info;
+    VADRMPRIMESurfaceDescriptor prime = {0};
+    VASurfaceID surface_id = 1;
+    VAStatus begin_status = hobot_vaBeginPicture(&va_ctx, 2, 1);
+    VAStatus sync_status = hobot_vaSyncSurface(&va_ctx, 1);
+    VAStatus get_image_status = hobot_vaGetImage(&va_ctx, 1, 0, 0, 2, 2, 1);
+    VAStatus put_image_status = hobot_vaPutImage(&va_ctx, 1, 1, 0, 0,
+                                                 2, 2, 0, 0, 2, 2);
+    VAStatus lock_status = hobot_vaLockSurface(&va_ctx, 1, NULL, &stride,
+                                               NULL, NULL, NULL, NULL,
+                                               NULL, NULL, &pixels);
+    VAStatus info_status = hobot_fill_surface_info(&va_ctx, 1, &surface_info);
+    VAStatus export_status = hobot_vaExportSurfaceHandle(
+        &va_ctx, 1, VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2, 0, &prime);
+    mock_stop_calls = 0;
+    VAStatus destroy_context_status = hobot_vaDestroyContext(&va_ctx, 2);
+    VAStatus destroy_surface_status = hobot_vaDestroySurfaces(&va_ctx,
+                                                              &surface_id, 1);
+    VASurfaceStatus query_status_value = VASurfaceReady;
+    VAStatus query_status = hobot_vaQuerySurfaceStatus(&va_ctx, 1,
+                                                       &query_status_value);
+
+    int blocked = begin_status == VA_STATUS_ERROR_SURFACE_BUSY &&
+                  sync_status == VA_STATUS_ERROR_SURFACE_BUSY &&
+                  get_image_status == VA_STATUS_ERROR_SURFACE_BUSY &&
+                  put_image_status == VA_STATUS_ERROR_SURFACE_BUSY &&
+                  lock_status == VA_STATUS_ERROR_SURFACE_BUSY &&
+                  info_status == VA_STATUS_ERROR_SURFACE_BUSY &&
+                  export_status == VA_STATUS_ERROR_SURFACE_BUSY &&
+                  destroy_context_status == VA_STATUS_ERROR_SURFACE_BUSY &&
+                  destroy_surface_status == VA_STATUS_ERROR_SURFACE_BUSY &&
+                  query_status == VA_STATUS_SUCCESS &&
+                  query_status_value == VASurfaceRendering &&
+                  mock_stop_calls == 0 && decoder->allocated && surf->allocated;
+    if (!blocked) {
+        fprintf(stderr,
+                "active encoder surface access was not consistently blocked: begin=%d sync=%d get=%d put=%d lock=%d info=%d export=%d destroy_ctx=%d destroy_surf=%d query=%d/%d stop=%d\n",
+                begin_status, sync_status, get_image_status, put_image_status,
+                lock_status, info_status, export_status, destroy_context_status,
+                destroy_surface_status, query_status, query_status_value,
+                mock_stop_calls);
+        pthread_mutex_destroy(&drv.mutex);
+        return 0;
+    }
+
+    encoder->encoder_picture_active = 0;
+    encoder->current_render_target = VA_INVALID_SURFACE;
+    encoder->enc_external_surface = 1;
+    atomic_store_explicit(&encoder->enc_external_input_pending, 1,
+                          memory_order_release);
+    if (hobot_vaDestroyContext(&va_ctx, 2) != VA_STATUS_ERROR_SURFACE_BUSY ||
+        !decoder->allocated || !surf->allocated) {
+        fprintf(stderr, "decoder context teardown raced an outstanding encoder input callback\n");
+        atomic_store_explicit(&encoder->enc_external_input_pending, 0,
+                              memory_order_release);
+        pthread_mutex_destroy(&drv.mutex);
+        return 0;
+    }
+    atomic_store_explicit(&encoder->enc_external_input_pending, 0,
+                          memory_order_release);
+    encoder->enc_external_surface = VA_INVALID_SURFACE;
+    decoder->vpu_running = 0;
+    int released = hobot_vaDestroyContext(&va_ctx, 2) == VA_STATUS_SUCCESS &&
+                   !decoder->allocated &&
+                   hobot_vaDestroySurfaces(&va_ctx, &surface_id, 1) ==
+                       VA_STATUS_SUCCESS && !surf->allocated;
+    if (!released)
+        fprintf(stderr, "surface/context remained busy after encoder picture completion\n");
+    pthread_mutex_destroy(&drv.mutex);
+    return released;
 }
 
 static int test_fatal_dequeue_poison_requires_context_teardown(void)
@@ -5586,6 +9015,48 @@ static int test_decoder_h264_slice_parameters(void)
     hctx->id = 1;
     hctx->profile = VAProfileH264High;
     hctx->vpu_ctx.video_dec_params.bitstream_buf_size = sizeof(mock_input);
+    setup_pending_picture(&drv, hctx, 27);
+    source[2] = 0x61;
+    slices[0] = (VASliceParameterBufferH264){
+        .slice_data_offset = 2, .slice_data_size = 3,
+        .slice_data_flag = VA_SLICE_DATA_FLAG_ALL,
+        .slice_type = 1
+    };
+    drv.buffers[1].size = sizeof(VASliceParameterBufferH264);
+    drv.buffers[1].capacity = sizeof(VASliceParameterBufferH264);
+    drv.buffers[1].num_elements = 1;
+    mock_dequeue_input_calls = 0;
+    status = hobot_vaRenderPicture(&va_ctx, 1, ids, 2);
+    if (status != VA_STATUS_SUCCESS || mock_dequeue_input_calls != 1 ||
+        hobot_vaEndPicture(&va_ctx, 1) != VA_STATUS_SUCCESS) {
+        fprintf(stderr, "reference H.264 B slice was rejected before VPU submission: status=%d deq=%d\n",
+                status, mock_dequeue_input_calls);
+        pthread_mutex_destroy(&drv.mutex);
+        return 0;
+    }
+
+    memset(hctx, 0, sizeof(*hctx));
+    hctx->id = 1;
+    hctx->profile = VAProfileH264High;
+    hctx->vpu_ctx.video_dec_params.bitstream_buf_size = sizeof(mock_input);
+    setup_pending_picture(&drv, hctx, 28);
+    source[2] = 0x01;
+    slices[0].slice_type = 1;
+    mock_dequeue_input_calls = 0;
+    status = hobot_vaRenderPicture(&va_ctx, 1, ids, 2);
+    if (status != VA_STATUS_SUCCESS || mock_dequeue_input_calls != 1 ||
+        hobot_vaEndPicture(&va_ctx, 1) != VA_STATUS_SUCCESS) {
+        fprintf(stderr, "non-reference H.264 B slice was rejected: status=%d deq=%d\n",
+                status, mock_dequeue_input_calls);
+        pthread_mutex_destroy(&drv.mutex);
+        return 0;
+    }
+    source[2] = 0x65;
+
+    memset(hctx, 0, sizeof(*hctx));
+    hctx->id = 1;
+    hctx->profile = VAProfileH264High;
+    hctx->vpu_ctx.video_dec_params.bitstream_buf_size = sizeof(mock_input);
     setup_pending_picture(&drv, hctx, 21);
     slices[0] = (VASliceParameterBufferH264){
         .slice_data_offset = 2, .slice_data_size = 2,
@@ -5807,6 +9278,223 @@ static int test_decoder_h264_slice_parameters(void)
     return 1;
 }
 
+static void setup_mock_prime2_nv12(VADRMPRIMESurfaceDescriptor *descriptor,
+                                  int fd)
+{
+    const uint32_t width = 640;
+    const uint32_t height = 360;
+    const uint32_t stride = 640;
+    const uint32_t vstride = 384;
+    const uint64_t y_size = (uint64_t)stride * vstride;
+    const uint64_t uv_size = (uint64_t)stride * (vstride / 2u);
+
+    memset(&mock_external_graph_buf, 0, sizeof(mock_external_graph_buf));
+    for (size_t i = 0; i < MAX_GRAPHIC_BUF_COMP; i++)
+        mock_external_graph_buf.fd[i] = -1;
+    mock_external_graph_buf.fd[0] = fd;
+    mock_external_graph_buf.plane_cnt = 2;
+    mock_external_graph_buf.format = MEM_PIX_FMT_NV12;
+    mock_external_graph_buf.width = (int32_t)width;
+    mock_external_graph_buf.height = (int32_t)height;
+    mock_external_graph_buf.stride = (int32_t)stride;
+    mock_external_graph_buf.vstride = (int32_t)vstride;
+    mock_external_graph_buf.is_contig = 1;
+    mock_external_graph_buf.size[0] = y_size;
+    mock_external_graph_buf.size[1] = uv_size;
+    mock_external_graph_buf.virt_addr[0] = mock_graph_data;
+    mock_external_graph_buf.virt_addr[1] = mock_graph_data + y_size;
+    mock_external_graph_buf.phys_addr[0] = 0x100000;
+    mock_external_graph_buf.phys_addr[1] = 0x100000 + y_size;
+
+    memset(descriptor, 0, sizeof(*descriptor));
+    descriptor->fourcc = VA_FOURCC_NV12;
+    descriptor->width = width;
+    descriptor->height = height;
+    descriptor->num_objects = 1;
+    descriptor->objects[0].fd = fd;
+    descriptor->objects[0].size = (uint32_t)(y_size + uv_size);
+    descriptor->objects[0].drm_format_modifier = DRM_FORMAT_MOD_LINEAR;
+    descriptor->num_layers = 1;
+    descriptor->layers[0].drm_format = DRM_FORMAT_NV12;
+    descriptor->layers[0].num_planes = 2;
+    descriptor->layers[0].object_index[0] = 0;
+    descriptor->layers[0].object_index[1] = 0;
+    descriptor->layers[0].offset[0] = 0;
+    descriptor->layers[0].offset[1] = (uint32_t)y_size;
+    descriptor->layers[0].pitch[0] = stride;
+    descriptor->layers[0].pitch[1] = stride;
+}
+
+static int test_prime2_surface_import(void)
+{
+    HobotDriverData drv = {0};
+    struct VADriverContext va_ctx = {0};
+    if (pthread_mutex_init(&drv.mutex, NULL) != 0)
+        return 0;
+    va_ctx.pDriverData = &drv;
+
+    mock_mem_get_graph_buf_result = 0;
+    mock_mem_import_graph_buf_result = 0;
+    mock_mem_import_bad_metadata = 0;
+    mock_mem_free_result = 0;
+    mock_mem_import_next_fd = 200;
+    VADRMPRIMESurfaceDescriptor descriptor;
+    setup_mock_prime2_nv12(&descriptor, STDERR_FILENO);
+
+    VASurfaceAttrib attrs[2] = {0};
+    attrs[0].type = VASurfaceAttribMemoryType;
+    attrs[0].flags = VA_SURFACE_ATTRIB_SETTABLE;
+    attrs[0].value.type = VAGenericValueTypeInteger;
+    attrs[0].value.value.i = VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2;
+    attrs[1].type = VASurfaceAttribExternalBufferDescriptor;
+    attrs[1].flags = VA_SURFACE_ATTRIB_SETTABLE;
+    attrs[1].value.type = VAGenericValueTypePointer;
+    attrs[1].value.value.p = &descriptor;
+
+    VASurfaceID surface = VA_INVALID_SURFACE;
+    descriptor.objects[0].drm_format_modifier = 1;
+    VAStatus status = hobot_vaCreateSurfaces2(&va_ctx, VA_RT_FORMAT_YUV420,
+                                               640, 360, &surface, 1, attrs, 2);
+    if (status != VA_STATUS_ERROR_UNSUPPORTED_MEMORY_TYPE ||
+        drv.surfaces[1].allocated || mock_mem_import_graph_buf_calls != 0) {
+        fprintf(stderr, "non-linear PRIME2 import was not rejected before import: status=%d\n",
+                status);
+        pthread_mutex_destroy(&drv.mutex);
+        return 0;
+    }
+    descriptor.objects[0].drm_format_modifier = DRM_FORMAT_MOD_LINEAR;
+
+    mock_mem_import_graph_buf_result = -1;
+    status = hobot_vaCreateSurfaces2(&va_ctx, VA_RT_FORMAT_YUV420,
+                                     640, 360, &surface, 1, attrs, 2);
+    if (status != VA_STATUS_ERROR_OPERATION_FAILED || drv.surfaces[1].allocated) {
+        fprintf(stderr, "HBmem import failure was not propagated: status=%d\n", status);
+        pthread_mutex_destroy(&drv.mutex);
+        return 0;
+    }
+    mock_mem_import_graph_buf_result = 0;
+
+    int free_calls_before = mock_mem_free_calls;
+    status = hobot_vaCreateSurfaces2(&va_ctx, VA_RT_FORMAT_YUV420,
+                                     640, 360, &surface, 1, attrs, 2);
+    if (status != VA_STATUS_SUCCESS || surface <= 0 || surface >= MAX_SURFACES ||
+        !drv.surfaces[surface].allocated || !drv.surfaces[surface].has_preallocated ||
+        drv.surfaces[surface].preallocated_gbuf.fd[0] != 200 ||
+        drv.surfaces[surface].dma_fd != 200 ||
+        drv.surfaces[surface].stride != 640 ||
+        drv.surfaces[surface].raw_data_size != 368640 ||
+        mock_mem_get_graph_buf_fd != STDERR_FILENO ||
+        fcntl(STDERR_FILENO, F_GETFD) < 0 ||
+        mock_mem_free_calls != free_calls_before) {
+        fprintf(stderr, "valid PRIME2 import failed: status=%d id=%u owned_fd=%d stride=%d size=%u\n",
+                status, surface,
+                surface < MAX_SURFACES ? drv.surfaces[surface].preallocated_gbuf.fd[0] : -1,
+                surface < MAX_SURFACES ? drv.surfaces[surface].stride : -1,
+                surface < MAX_SURFACES ? drv.surfaces[surface].raw_data_size : 0);
+        pthread_mutex_destroy(&drv.mutex);
+        return 0;
+    }
+    status = hobot_vaDestroySurfaces(&va_ctx, &surface, 1);
+    if (status != VA_STATUS_SUCCESS || drv.surfaces[surface].allocated ||
+        mock_mem_free_calls != free_calls_before + 1 || mock_mem_free_fd != 200) {
+        fprintf(stderr, "PRIME2 destroy did not release only its imported reference: status=%d free_fd=%d\n",
+                status, mock_mem_free_fd);
+        pthread_mutex_destroy(&drv.mutex);
+        return 0;
+    }
+
+    VADRMPRIMESurfaceDescriptor batch[2];
+    setup_mock_prime2_nv12(&batch[0], STDERR_FILENO);
+    setup_mock_prime2_nv12(&batch[1], STDERR_FILENO);
+    batch[1].num_objects = 2;
+    attrs[1].value.value.p = batch;
+    free_calls_before = mock_mem_free_calls;
+    VASurfaceID batch_surfaces[2] = {VA_INVALID_SURFACE, VA_INVALID_SURFACE};
+    status = hobot_vaCreateSurfaces2(&va_ctx, VA_RT_FORMAT_YUV420,
+                                     640, 360, batch_surfaces, 2, attrs, 2);
+    if (status != VA_STATUS_ERROR_UNSUPPORTED_MEMORY_TYPE ||
+        drv.surfaces[1].allocated || mock_mem_free_calls != free_calls_before + 1 ||
+        mock_mem_free_fd != 201) {
+        fprintf(stderr, "partial PRIME2 batch import was not rolled back: status=%d free_fd=%d\n",
+                status, mock_mem_free_fd);
+        pthread_mutex_destroy(&drv.mutex);
+        return 0;
+    }
+
+    setup_mock_prime2_nv12(&batch[0], STDERR_FILENO);
+    setup_mock_prime2_nv12(&batch[1], STDERR_FILENO);
+    batch[1].num_objects = 2;
+    mock_mem_free_result = -1;
+    status = hobot_vaCreateSurfaces2(&va_ctx, VA_RT_FORMAT_YUV420,
+                                     640, 360, batch_surfaces, 2, attrs, 2);
+    if (status != VA_STATUS_ERROR_OPERATION_FAILED ||
+        drv.orphaned_import_count != 1 || drv.orphaned_import_fds[0] != 202) {
+        fprintf(stderr, "failed PRIME rollback did not retain its owned FD: status=%d count=%u fd=%d\n",
+                status, drv.orphaned_import_count,
+                drv.orphaned_import_count ? drv.orphaned_import_fds[0] : -1);
+        pthread_mutex_destroy(&drv.mutex);
+        return 0;
+    }
+
+    setup_mock_prime2_nv12(&descriptor, STDERR_FILENO);
+    attrs[1].value.value.p = &descriptor;
+    mock_mem_import_bad_metadata = 1;
+    status = hobot_vaCreateSurfaces2(&va_ctx, VA_RT_FORMAT_YUV420,
+                                     640, 360, &surface, 1, attrs, 2);
+    mock_mem_import_bad_metadata = 0;
+    if (status != VA_STATUS_ERROR_OPERATION_FAILED ||
+        drv.orphaned_import_count != 2 ||
+        drv.orphaned_import_fds[0] != 202 ||
+        drv.orphaned_import_fds[1] != 203) {
+        fprintf(stderr,
+                "invalid imported metadata failure lost its owned FD: status=%d count=%u fds=%d/%d\n",
+                status, drv.orphaned_import_count,
+                drv.orphaned_import_count > 0 ? drv.orphaned_import_fds[0] : -1,
+                drv.orphaned_import_count > 1 ? drv.orphaned_import_fds[1] : -1);
+        pthread_mutex_destroy(&drv.mutex);
+        return 0;
+    }
+
+    HobotDriverData *orphan_drv = calloc(1, sizeof(*orphan_drv));
+    struct VADriverContext orphan_ctx = {0};
+    if (!orphan_drv || pthread_mutex_init(&orphan_drv->mutex, NULL) != 0) {
+        free(orphan_drv);
+        pthread_mutex_destroy(&drv.mutex);
+        return 0;
+    }
+    orphan_drv->orphaned_import_count = drv.orphaned_import_count;
+    memcpy(orphan_drv->orphaned_import_fds, drv.orphaned_import_fds,
+           drv.orphaned_import_count * sizeof(drv.orphaned_import_fds[0]));
+    drv.orphaned_import_count = 0;
+    drv.orphaned_import_fds[0] = -1;
+    drv.orphaned_import_fds[1] = -1;
+    orphan_ctx.pDriverData = orphan_drv;
+    mock_mem_module_close_result = 0;
+    if (hobot_vaTerminate(&orphan_ctx) != VA_STATUS_ERROR_OPERATION_FAILED ||
+        orphan_ctx.pDriverData != orphan_drv ||
+        orphan_drv->orphaned_import_count != 2 ||
+        orphan_drv->orphaned_import_fds[0] != 202 ||
+        orphan_drv->orphaned_import_fds[1] != 203) {
+        fprintf(stderr, "vaTerminate discarded an unreleased PRIME import FD\n");
+        pthread_mutex_destroy(&drv.mutex);
+        return 0;
+    }
+    mock_mem_free_result = 0;
+    int orphan_free_calls_before = mock_mem_free_calls;
+    status = hobot_vaTerminate(&orphan_ctx);
+    if (status != VA_STATUS_SUCCESS || orphan_ctx.pDriverData != NULL ||
+        mock_mem_free_calls != orphan_free_calls_before + 2 ||
+        mock_mem_free_fd != 203) {
+        fprintf(stderr, "vaTerminate did not retry retained PRIME import FD: status=%d fd=%d\n",
+                status, mock_mem_free_fd);
+        pthread_mutex_destroy(&drv.mutex);
+        return 0;
+    }
+
+    pthread_mutex_destroy(&drv.mutex);
+    return 1;
+}
+
 static int test_surface_creation_validation(void)
 {
     HobotDriverData drv = {0};
@@ -5849,8 +9537,17 @@ static int test_surface_creation_validation(void)
     attr.value.value.i = VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2;
     status = hobot_vaCreateSurfaces2(&va_ctx, VA_RT_FORMAT_YUV420, 1280, 720,
                                      &surface, 1, &attr, 1);
+    if (status != VA_STATUS_ERROR_INVALID_PARAMETER || drv.surfaces[1].allocated) {
+        fprintf(stderr, "PRIME2 without external descriptor was not rejected: status=%d allocated=%d\n",
+                status, drv.surfaces[1].allocated);
+        pthread_mutex_destroy(&drv.mutex);
+        return 0;
+    }
+    attr.value.value.i = VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME;
+    status = hobot_vaCreateSurfaces2(&va_ctx, VA_RT_FORMAT_YUV420, 1280, 720,
+                                     &surface, 1, &attr, 1);
     if (status != VA_STATUS_ERROR_UNSUPPORTED_MEMORY_TYPE || drv.surfaces[1].allocated) {
-        fprintf(stderr, "unsupported external surface memory accepted: status=%d allocated=%d\n",
+        fprintf(stderr, "legacy DRM PRIME memory type was not rejected: status=%d allocated=%d\n",
                 status, drv.surfaces[1].allocated);
         pthread_mutex_destroy(&drv.mutex);
         return 0;
@@ -5876,21 +9573,29 @@ static int test_surface_creation_validation(void)
         return 0;
     }
 
-    VASurfaceAttrib queried[6] = {0};
-    unsigned int queried_count = 6;
+    VASurfaceAttrib queried[7] = {0};
+    unsigned int queried_count = 7;
     status = hobot_vaQuerySurfaceAttributes(&va_ctx, 1, queried, &queried_count);
     int reports_va_memory = 0;
     int reports_prime_import = 0;
+    int reports_external_descriptor = 0;
     for (unsigned int i = 0; i < queried_count; i++) {
         if (queried[i].type == VASurfaceAttribMemoryType) {
-            reports_va_memory = queried[i].value.value.i == VA_SURFACE_ATTRIB_MEM_TYPE_VA;
+            reports_va_memory =
+                (queried[i].value.value.i & VA_SURFACE_ATTRIB_MEM_TYPE_VA) != 0;
             reports_prime_import =
                 (queried[i].value.value.i & VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2) != 0;
+        } else if (queried[i].type == VASurfaceAttribExternalBufferDescriptor) {
+            reports_external_descriptor =
+                queried[i].flags == VA_SURFACE_ATTRIB_SETTABLE &&
+                queried[i].value.type == VAGenericValueTypePointer;
         }
     }
-    if (status != VA_STATUS_SUCCESS || !reports_va_memory || reports_prime_import) {
-        fprintf(stderr, "surface memory capabilities are inconsistent: status=%d count=%u va=%d prime=%d\n",
-                status, queried_count, reports_va_memory, reports_prime_import);
+    if (status != VA_STATUS_SUCCESS || !reports_va_memory || !reports_prime_import ||
+        !reports_external_descriptor) {
+        fprintf(stderr, "surface memory capabilities are inconsistent: status=%d count=%u va=%d prime=%d descriptor=%d\n",
+                status, queried_count, reports_va_memory, reports_prime_import,
+                reports_external_descriptor);
         pthread_mutex_destroy(&drv.mutex);
         return 0;
     }
@@ -5941,6 +9646,510 @@ static int test_context_target_count_is_bounded(void)
     return passed;
 }
 
+static int test_context_flags_are_validated(void)
+{
+    HobotDriverData drv = {0};
+    struct VADriverContext va_ctx = {0};
+    if (pthread_mutex_init(&drv.mutex, NULL) != 0)
+        return 0;
+    va_ctx.pDriverData = &drv;
+    drv.configs[1].allocated = 1;
+    drv.configs[1].profile = VAProfileH264High;
+    drv.configs[1].entrypoint = VAEntrypointVLD;
+
+    int saved_initialize_result = mock_initialize_result;
+    int saved_initialize_calls = mock_initialize_calls;
+    int saved_configure_result = mock_configure_result;
+    int saved_configure_calls = mock_configure_calls;
+    int saved_start_result = mock_start_result;
+    int saved_start_calls = mock_start_calls;
+    int saved_stop_result = mock_stop_result;
+    int saved_stop_calls = mock_stop_calls;
+    int saved_release_result = mock_release_result;
+    int saved_release_calls = mock_release_calls;
+    mock_initialize_result = 0;
+    mock_configure_result = 0;
+    mock_start_result = 0;
+    mock_stop_result = 0;
+    mock_release_result = 0;
+
+    VAContextID context = VA_INVALID_ID;
+    VAStatus status = hobot_vaCreateContext(
+        &va_ctx, 1, 1280, 720, VA_PROGRESSIVE | 0x2, NULL, 0, &context);
+    int passed = status == VA_STATUS_ERROR_INVALID_PARAMETER &&
+                 context == VA_INVALID_ID && !drv.contexts[1].allocated &&
+                 mock_initialize_calls == saved_initialize_calls &&
+                 mock_configure_calls == saved_configure_calls &&
+                 mock_start_calls == saved_start_calls;
+    if (!passed)
+        fprintf(stderr, "unsupported context flags were not rejected before VPU setup: status=%d context=%u init=%d configure=%d start=%d\n",
+                status, context, mock_initialize_calls - saved_initialize_calls,
+                mock_configure_calls - saved_configure_calls,
+                mock_start_calls - saved_start_calls);
+    if (context > 0 && context < MAX_CONTEXTS && drv.contexts[context].allocated) {
+        if (hobot_vaDestroyContext(&va_ctx, context) != VA_STATUS_SUCCESS)
+            passed = 0;
+    }
+
+    if (passed) {
+        context = VA_INVALID_ID;
+        status = hobot_vaCreateContext(&va_ctx, 1, 1280, 720, VA_PROGRESSIVE,
+                                       NULL, 0, &context);
+        passed = status == VA_STATUS_SUCCESS && context > 0 &&
+                 context < MAX_CONTEXTS && drv.contexts[context].allocated &&
+                 drv.contexts[context].vpu_ctx.video_dec_params.
+                     h264_dec_config.bandwidth_Opt == 1;
+        if (!passed)
+            fprintf(stderr, "H.264 decoder context config was rejected: status=%d context=%u\n",
+                    status, context);
+        if (context > 0 && context < MAX_CONTEXTS && drv.contexts[context].allocated &&
+            hobot_vaDestroyContext(&va_ctx, context) != VA_STATUS_SUCCESS) {
+            fprintf(stderr, "context-flag test teardown failed\n");
+            passed = 0;
+        }
+    }
+
+    if (passed) {
+        drv.configs[1].profile = VAProfileHEVCMain;
+        context = VA_INVALID_ID;
+        status = hobot_vaCreateContext(&va_ctx, 1, 1280, 720, VA_PROGRESSIVE,
+                                       NULL, 0, &context);
+        passed = status == VA_STATUS_SUCCESS && context > 0 &&
+                 context < MAX_CONTEXTS && drv.contexts[context].allocated &&
+                 drv.contexts[context].vpu_ctx.video_dec_params.
+                     h265_dec_config.bandwidth_Opt == 1;
+        if (!passed)
+            fprintf(stderr, "HEVC decoder bandwidth optimization was not enabled: status=%d context=%u\n",
+                    status, context);
+        if (context > 0 && context < MAX_CONTEXTS && drv.contexts[context].allocated &&
+            hobot_vaDestroyContext(&va_ctx, context) != VA_STATUS_SUCCESS) {
+            fprintf(stderr, "HEVC context teardown failed\n");
+            passed = 0;
+        }
+    }
+
+    mock_initialize_result = saved_initialize_result;
+    mock_initialize_calls = saved_initialize_calls;
+    mock_configure_result = saved_configure_result;
+    mock_configure_calls = saved_configure_calls;
+    mock_start_result = saved_start_result;
+    mock_start_calls = saved_start_calls;
+    mock_stop_result = saved_stop_result;
+    mock_stop_calls = saved_stop_calls;
+    mock_release_result = saved_release_result;
+    mock_release_calls = saved_release_calls;
+    pthread_mutex_destroy(&drv.mutex);
+    return passed;
+}
+
+static int test_context_render_target_lifetime(void)
+{
+    HobotDriverData drv = {0};
+    struct VADriverContext va_ctx = {0};
+    if (pthread_mutex_init(&drv.mutex, NULL) != 0)
+        return 0;
+    va_ctx.pDriverData = &drv;
+    drv.configs[1].allocated = 1;
+    drv.configs[1].profile = VAProfileH264High;
+    drv.configs[1].entrypoint = VAEntrypointVLD;
+    for (VASurfaceID surface = 1; surface <= 2; surface++) {
+        drv.surfaces[surface].allocated = 1;
+        drv.surfaces[surface].width = 1280;
+        drv.surfaces[surface].height = 720;
+        drv.surfaces[surface].dma_fd = -1;
+    }
+
+    int saved_initialize_result = mock_initialize_result;
+    int saved_configure_result = mock_configure_result;
+    int saved_start_result = mock_start_result;
+    int saved_stop_result = mock_stop_result;
+    int saved_release_result = mock_release_result;
+    mock_initialize_result = 0;
+    mock_configure_result = 0;
+    mock_start_result = 0;
+    mock_stop_result = 0;
+    mock_release_result = 0;
+
+    VAContextID context = VA_INVALID_ID;
+    VAStatus status = hobot_vaCreateContext(&va_ctx, 1, 1280, 720, 0,
+                                            NULL, 0, &context);
+    int passed = status == VA_STATUS_SUCCESS && context > 0 &&
+                 hobot_vaBeginPicture(&va_ctx, context, 1) == VA_STATUS_SUCCESS;
+    VAPictureParameterBufferH264 picture = {0};
+    picture.CurrPic.picture_id = 1;
+    for (size_t i = 0; i < sizeof(picture.ReferenceFrames) /
+                            sizeof(picture.ReferenceFrames[0]); i++) {
+        picture.ReferenceFrames[i].picture_id = VA_INVALID_SURFACE;
+        picture.ReferenceFrames[i].flags = VA_PICTURE_H264_INVALID;
+    }
+    picture.ReferenceFrames[0].picture_id = 2;
+    picture.ReferenceFrames[0].flags = VA_PICTURE_H264_SHORT_TERM_REFERENCE;
+    picture.picture_width_in_mbs_minus1 = 79;
+    picture.picture_height_in_mbs_minus1 = 44;
+    picture.seq_fields.bits.frame_mbs_only_flag = 1;
+    picture.seq_fields.bits.chroma_format_idc = 1;
+    drv.buffers[1].allocated = 1;
+    drv.buffers[1].id = 1;
+    drv.buffers[1].type = VAPictureParameterBufferType;
+    drv.buffers[1].data = &picture;
+    drv.buffers[1].size = sizeof(picture);
+    drv.buffers[1].element_size = sizeof(picture);
+    drv.buffers[1].num_elements = 1;
+    VABufferID picture_buffer = 1;
+    if (passed) {
+        picture.CurrPic.picture_id = 2;
+        passed = hobot_vaRenderPicture(&va_ctx, context, &picture_buffer, 1) ==
+                     VA_STATUS_ERROR_INVALID_SURFACE &&
+                 drv.surfaces[1].context_usage_mask ==
+                     hobot_context_usage_bit(context) &&
+                 drv.surfaces[2].context_usage_mask == 0 &&
+                 !drv.contexts[context].h264_decode_picture_valid;
+    }
+    picture.CurrPic.picture_id = 1;
+    if (passed) {
+        picture.ReferenceFrames[0].picture_id = 0;
+        passed = hobot_vaRenderPicture(&va_ctx, context, &picture_buffer, 1) ==
+                     VA_STATUS_ERROR_INVALID_SURFACE &&
+                 drv.surfaces[2].context_usage_mask == 0 &&
+                 !drv.contexts[context].h264_decode_picture_valid;
+    }
+    if (passed) {
+        picture.ReferenceFrames[0].picture_id = 3;
+        passed = hobot_vaRenderPicture(&va_ctx, context, &picture_buffer, 1) ==
+                     VA_STATUS_ERROR_INVALID_SURFACE &&
+                 drv.surfaces[2].context_usage_mask == 0 &&
+                 !drv.contexts[context].h264_decode_picture_valid;
+    }
+    if (passed) {
+        picture.ReferenceFrames[0].picture_id = MAX_SURFACES;
+        passed = hobot_vaRenderPicture(&va_ctx, context, &picture_buffer, 1) ==
+                     VA_STATUS_ERROR_INVALID_SURFACE &&
+                 drv.surfaces[2].context_usage_mask == 0 &&
+                 !drv.contexts[context].h264_decode_picture_valid;
+    }
+    picture.ReferenceFrames[0].picture_id = 2;
+    if (passed)
+        passed = hobot_vaRenderPicture(&va_ctx, context, &picture_buffer, 1) ==
+                     VA_STATUS_SUCCESS &&
+                 drv.surfaces[2].context_usage_mask ==
+                     hobot_context_usage_bit(context) &&
+                 hobot_vaDestroySurfaces(&va_ctx, (VASurfaceID[]){2}, 1) ==
+                     VA_STATUS_ERROR_SURFACE_BUSY;
+    VAContextID peer_context = VA_INVALID_ID;
+    VASurfaceID peer_target = 1;
+    if (passed) {
+        status = hobot_vaCreateContext(&va_ctx, 1, 1280, 720, 0,
+                                       &peer_target, 1, &peer_context);
+        passed = status == VA_STATUS_SUCCESS && peer_context > 0;
+    }
+    if (passed) {
+        passed = drv.surfaces[1].context_usage_mask ==
+                     (hobot_context_usage_bit(context) |
+                      hobot_context_usage_bit(peer_context)) &&
+                 hobot_vaDestroySurfaces(&va_ctx, (VASurfaceID[]){1}, 1) ==
+                     VA_STATUS_ERROR_SURFACE_BUSY;
+    }
+    if (peer_context > 0 && drv.contexts[peer_context].allocated) {
+        VAStatus peer_destroy = hobot_vaDestroyContext(&va_ctx, peer_context);
+        passed = passed && peer_destroy == VA_STATUS_SUCCESS &&
+                 drv.surfaces[1].context_usage_mask ==
+                     hobot_context_usage_bit(context) &&
+                 drv.surfaces[2].context_usage_mask ==
+                     hobot_context_usage_bit(context) &&
+                 hobot_vaDestroySurfaces(&va_ctx, (VASurfaceID[]){1}, 1) ==
+                     VA_STATUS_ERROR_SURFACE_BUSY;
+    }
+    if (context > 0 && drv.contexts[context].allocated) {
+        if (drv.contexts[context].decode_picture_active) {
+            pthread_mutex_lock(&drv.mutex);
+            hobot_abort_pending_decode_picture(&drv, &drv.contexts[context]);
+            pthread_mutex_unlock(&drv.mutex);
+        }
+        passed = hobot_vaDestroyContext(&va_ctx, context) == VA_STATUS_SUCCESS &&
+                 drv.surfaces[1].context_usage_mask == 0 &&
+                 drv.surfaces[2].context_usage_mask == 0 && passed;
+    }
+    passed = passed && hobot_vaDestroySurfaces(&va_ctx, (VASurfaceID[]){1}, 1) ==
+                          VA_STATUS_SUCCESS &&
+             hobot_vaDestroySurfaces(&va_ctx, (VASurfaceID[]){2}, 1) ==
+                          VA_STATUS_SUCCESS;
+    if (!passed)
+        fprintf(stderr, "context surface references did not follow context lifetime: create=%d context=%u peer=%u mask=%u\n",
+                status, context, peer_context, drv.surfaces[1].context_usage_mask);
+
+    mock_initialize_result = saved_initialize_result;
+    mock_configure_result = saved_configure_result;
+    mock_start_result = saved_start_result;
+    mock_stop_result = saved_stop_result;
+    mock_release_result = saved_release_result;
+    pthread_mutex_destroy(&drv.mutex);
+    return passed;
+}
+
+static int test_encoder_picture_reference_lifetime(void)
+{
+    HobotDriverData drv = {0};
+    struct VADriverContext va_ctx = {0};
+    unsigned char coded_data[2] = {0};
+    if (pthread_mutex_init(&drv.mutex, NULL) != 0)
+        return 0;
+    va_ctx.pDriverData = &drv;
+    for (VASurfaceID surface = 1; surface <= 4; surface++) {
+        drv.surfaces[surface].allocated = 1;
+        drv.surfaces[surface].width = 640;
+        drv.surfaces[surface].height = 360;
+        drv.surfaces[surface].dma_fd = -1;
+    }
+
+    HobotContext *h264_context = &drv.contexts[1];
+    h264_context->allocated = 1;
+    h264_context->is_encoder = 1;
+    h264_context->profile = VAProfileH264Main;
+    h264_context->width = 640;
+    h264_context->height = 360;
+    h264_context->encoder_init_deferred = 1;
+    h264_context->encoder_picture_active = 1;
+    HobotContext *hevc_context = &drv.contexts[2];
+    hevc_context->allocated = 1;
+    hevc_context->is_encoder = 1;
+    hevc_context->profile = VAProfileHEVCMain;
+    hevc_context->width = 640;
+    hevc_context->height = 360;
+    hevc_context->encoder_init_deferred = 1;
+    hevc_context->encoder_picture_active = 1;
+
+    VAEncPictureParameterBufferH264 h264_picture = {0};
+    h264_picture.CurrPic.picture_id = 1;
+    for (size_t i = 0; i < sizeof(h264_picture.ReferenceFrames) /
+                            sizeof(h264_picture.ReferenceFrames[0]); i++) {
+        h264_picture.ReferenceFrames[i].picture_id = VA_INVALID_SURFACE;
+        h264_picture.ReferenceFrames[i].flags = VA_PICTURE_H264_INVALID;
+    }
+    h264_picture.ReferenceFrames[0].picture_id = 2;
+    h264_picture.ReferenceFrames[0].flags = VA_PICTURE_H264_SHORT_TERM_REFERENCE;
+    h264_picture.coded_buf = 5;
+    drv.buffers[1] = (HobotBuffer){
+        .id = 1,
+        .allocated = 1,
+        .type = VAEncPictureParameterBufferType,
+        .size = sizeof(h264_picture),
+        .capacity = sizeof(h264_picture),
+        .element_size = sizeof(h264_picture),
+        .num_elements = 1,
+        .data = &h264_picture
+    };
+
+    VAEncSequenceParameterBufferHEVC hevc_sequence = {0};
+    hevc_sequence.general_profile_idc = 1;
+    hevc_sequence.general_level_idc = MC_H265_LEVEL4_1;
+    hevc_sequence.intra_period = 30;
+    hevc_sequence.intra_idr_period = 30;
+    hevc_sequence.ip_period = 1;
+    hevc_sequence.bits_per_second = 4000000;
+    hevc_sequence.pic_width_in_luma_samples = 640;
+    hevc_sequence.pic_height_in_luma_samples = 360;
+    hevc_sequence.seq_fields.bits.chroma_format_idc = 1;
+    hevc_sequence.log2_diff_max_min_luma_coding_block_size = 3;
+    hevc_sequence.log2_diff_max_min_transform_block_size = 3;
+
+    VAEncPictureParameterBufferHEVC hevc_picture = {0};
+    hevc_picture.decoded_curr_pic.picture_id = 3;
+    for (size_t i = 0; i < sizeof(hevc_picture.reference_frames) /
+                            sizeof(hevc_picture.reference_frames[0]); i++) {
+        hevc_picture.reference_frames[i].picture_id = VA_INVALID_SURFACE;
+        hevc_picture.reference_frames[i].flags = VA_PICTURE_HEVC_INVALID;
+    }
+    hevc_picture.reference_frames[0].picture_id = 4;
+    hevc_picture.reference_frames[0].flags = VA_PICTURE_HEVC_RPS_ST_CURR_BEFORE;
+    hevc_picture.coded_buf = 6;
+    hevc_picture.pic_init_qp = 26;
+    hevc_picture.pic_fields.bits.coding_type = 1;
+    drv.buffers[2] = (HobotBuffer){
+        .id = 2,
+        .allocated = 1,
+        .type = VAEncSequenceParameterBufferType,
+        .size = sizeof(hevc_sequence),
+        .capacity = sizeof(hevc_sequence),
+        .element_size = sizeof(hevc_sequence),
+        .num_elements = 1,
+        .data = &hevc_sequence
+    };
+    drv.buffers[3] = (HobotBuffer){
+        .id = 3,
+        .allocated = 1,
+        .type = VAEncPictureParameterBufferType,
+        .size = sizeof(hevc_picture),
+        .capacity = sizeof(hevc_picture),
+        .element_size = sizeof(hevc_picture),
+        .num_elements = 1,
+        .data = &hevc_picture
+    };
+    VAEncSliceParameterBufferHEVC hevc_slice = {0};
+    hevc_slice.num_ctu_in_slice = 60;
+    hevc_slice.slice_type = 2;
+    hevc_slice.max_num_merge_cand = 5;
+    hevc_slice.slice_fields.bits.last_slice_of_pic_flag = 1;
+    drv.buffers[4] = (HobotBuffer){
+        .id = 4,
+        .allocated = 1,
+        .type = VAEncSliceParameterBufferType,
+        .size = sizeof(hevc_slice),
+        .capacity = sizeof(hevc_slice),
+        .element_size = sizeof(hevc_slice),
+        .num_elements = 1,
+        .data = &hevc_slice
+    };
+    for (VABufferID coded_id = 5; coded_id <= 6; coded_id++) {
+        drv.buffers[coded_id] = (HobotBuffer){
+            .id = coded_id,
+            .allocated = 1,
+            .type = VAEncCodedBufferType,
+            .size = 1,
+            .capacity = 1,
+            .element_size = 1,
+            .num_elements = 1,
+            .data = &coded_data[coded_id - 5]
+        };
+    }
+
+    VABufferID h264_buffer = 1;
+    VABufferID hevc_buffers[] = {2, 3, 4};
+    h264_picture.CurrPic.picture_id = 5;
+    VAStatus invalid_h264_current_status = hobot_vaRenderPicture(
+        &va_ctx, 1, &h264_buffer, 1);
+    h264_picture.CurrPic.picture_id = 1;
+    hevc_picture.decoded_curr_pic.picture_id = 5;
+    VAStatus invalid_hevc_current_status = hobot_vaRenderPicture(
+        &va_ctx, 2, hevc_buffers, 3);
+    hevc_picture.decoded_curr_pic.picture_id = 3;
+    h264_picture.ReferenceFrames[0].picture_id = 5;
+    VAStatus invalid_h264_status = hobot_vaRenderPicture(
+        &va_ctx, 1, &h264_buffer, 1);
+    h264_picture.ReferenceFrames[0].picture_id = 2;
+    hevc_picture.reference_frames[0].picture_id = 5;
+    VAStatus invalid_hevc_status = hobot_vaRenderPicture(
+        &va_ctx, 2, hevc_buffers, 3);
+    int invalid_preserved_state =
+        drv.surfaces[2].context_usage_mask == 0 &&
+        drv.surfaces[4].context_usage_mask == 0;
+    hevc_picture.reference_frames[0].picture_id = 4;
+    VAStatus h264_status = hobot_vaRenderPicture(&va_ctx, 1, &h264_buffer, 1);
+    VAStatus hevc_status = hobot_vaRenderPicture(&va_ctx, 2, hevc_buffers, 3);
+    int passed = invalid_h264_status == VA_STATUS_ERROR_INVALID_SURFACE &&
+        invalid_hevc_status == VA_STATUS_ERROR_INVALID_SURFACE &&
+        invalid_h264_current_status == VA_STATUS_ERROR_INVALID_SURFACE &&
+        invalid_hevc_current_status == VA_STATUS_ERROR_INVALID_SURFACE &&
+        invalid_preserved_state &&
+        h264_status == VA_STATUS_SUCCESS &&
+        hevc_status == VA_STATUS_SUCCESS &&
+        drv.surfaces[1].context_usage_mask == hobot_context_usage_bit(1) &&
+        drv.surfaces[2].context_usage_mask == hobot_context_usage_bit(1) &&
+        drv.surfaces[3].context_usage_mask == hobot_context_usage_bit(2) &&
+        drv.surfaces[4].context_usage_mask == hobot_context_usage_bit(2) &&
+        hobot_vaDestroySurfaces(&va_ctx, (VASurfaceID[]){2}, 1) ==
+            VA_STATUS_ERROR_SURFACE_BUSY &&
+        hobot_vaDestroySurfaces(&va_ctx, (VASurfaceID[]){4}, 1) ==
+            VA_STATUS_ERROR_SURFACE_BUSY;
+
+    VAStatus h264_destroy = hobot_vaDestroyContext(&va_ctx, 1);
+    VAStatus hevc_destroy = hobot_vaDestroyContext(&va_ctx, 2);
+    passed = passed && h264_destroy == VA_STATUS_SUCCESS &&
+        hevc_destroy == VA_STATUS_SUCCESS;
+    for (VASurfaceID surface = 1; surface <= 4; surface++)
+        passed = passed && drv.surfaces[surface].context_usage_mask == 0;
+    passed = passed && hobot_vaDestroySurfaces(
+        &va_ctx, (VASurfaceID[]){1, 2, 3, 4}, 4) == VA_STATUS_SUCCESS;
+
+    if (!passed)
+        fprintf(stderr, "encoder picture surfaces did not follow H.264/HEVC context lifetime: invalid=%d/%d current=%d/%d render=%d/%d destroy=%d/%d masks=%u/%u/%u/%u\n",
+                invalid_h264_status, invalid_hevc_status,
+                invalid_h264_current_status, invalid_hevc_current_status,
+                h264_status, hevc_status, h264_destroy, hevc_destroy,
+                drv.surfaces[1].context_usage_mask,
+                drv.surfaces[2].context_usage_mask,
+                drv.surfaces[3].context_usage_mask,
+                drv.surfaces[4].context_usage_mask);
+    pthread_mutex_destroy(&drv.mutex);
+    return passed;
+}
+
+static int test_hevc_decoder_rejects_unallocated_reference_surface(void)
+{
+    HobotDriverData drv = {0};
+    struct VADriverContext va_ctx = {0};
+    VAPictureParameterBufferHEVC picture = {0};
+    if (pthread_mutex_init(&drv.mutex, NULL) != 0)
+        return 0;
+    va_ctx.pDriverData = &drv;
+
+    HobotContext *hctx = &drv.contexts[1];
+    hctx->allocated = 1;
+    hctx->vpu_running = 1;
+    hctx->decode_picture_active = 1;
+    hctx->profile = VAProfileHEVCMain;
+    hctx->width = 64;
+    hctx->height = 64;
+    hctx->current_render_target = 1;
+    drv.surfaces[1].allocated = 1;
+    picture.CurrPic.picture_id = 1;
+    for (size_t i = 0; i < sizeof(picture.ReferenceFrames) /
+                            sizeof(picture.ReferenceFrames[0]); i++) {
+        picture.ReferenceFrames[i].picture_id = VA_INVALID_SURFACE;
+        picture.ReferenceFrames[i].flags = VA_PICTURE_HEVC_INVALID;
+    }
+    picture.ReferenceFrames[0].picture_id = 2;
+    picture.ReferenceFrames[0].flags = 0;
+    drv.buffers[1] = (HobotBuffer){
+        .id = 1,
+        .allocated = 1,
+        .type = VAPictureParameterBufferType,
+        .size = sizeof(picture),
+        .capacity = sizeof(picture),
+        .element_size = sizeof(picture),
+        .num_elements = 1,
+        .data = &picture
+    };
+
+    VABufferID picture_id = 1;
+    picture.CurrPic.picture_id = 2;
+    VAStatus invalid_current_status = hobot_vaRenderPicture(
+        &va_ctx, 1, &picture_id, 1);
+    picture.CurrPic.picture_id = 1;
+    VAStatus status = hobot_vaRenderPicture(&va_ctx, 1, &picture_id, 1);
+    int passed = invalid_current_status == VA_STATUS_ERROR_INVALID_SURFACE &&
+                 status == VA_STATUS_ERROR_INVALID_SURFACE &&
+                 !hctx->hevc_decode_picture_valid &&
+                 drv.surfaces[2].context_usage_mask == 0;
+    if (!passed)
+        fprintf(stderr, "HEVC decoder accepted an invalid current/reference surface: current=%d reference=%d valid=%d mask=%u\n",
+                invalid_current_status, status, hctx->hevc_decode_picture_valid,
+                drv.surfaces[2].context_usage_mask);
+
+    picture.pic_width_in_luma_samples = 64;
+    picture.pic_height_in_luma_samples = 64;
+    picture.pic_fields.bits.chroma_format_idc = 1;
+    picture.log2_diff_max_min_luma_coding_block_size = 1;
+    picture.ReferenceFrames[0].flags = VA_PICTURE_HEVC_RPS_ST_CURR_BEFORE;
+    drv.surfaces[2].allocated = 1;
+    status = hobot_vaRenderPicture(&va_ctx, 1, &picture_id, 1);
+    int retained = status == VA_STATUS_SUCCESS &&
+        hctx->hevc_decode_picture_valid &&
+        drv.surfaces[1].context_usage_mask == hobot_context_usage_bit(1) &&
+        drv.surfaces[2].context_usage_mask == hobot_context_usage_bit(1);
+    VAStatus destroy_reference = hobot_vaDestroySurfaces(
+        &va_ctx, (VASurfaceID[]){2}, 1);
+    passed = passed && retained &&
+             destroy_reference == VA_STATUS_ERROR_SURFACE_BUSY;
+    if (!retained || destroy_reference != VA_STATUS_ERROR_SURFACE_BUSY)
+        fprintf(stderr, "HEVC decoder picture did not retain reference surface: status=%d valid=%d current_mask=%u ref_mask=%u destroy=%d\n",
+                status, hctx->hevc_decode_picture_valid,
+                drv.surfaces[1].context_usage_mask,
+                drv.surfaces[2].context_usage_mask, destroy_reference);
+
+    pthread_mutex_destroy(&drv.mutex);
+    return passed;
+}
+
 static int test_api_array_counts_are_bounded(void)
 {
     HobotDriverData drv = {0};
@@ -5955,11 +10164,26 @@ static int test_api_array_counts_are_bounded(void)
         &va_ctx, 1, &only_one_buffer, MAX_BUFFERS);
     VAStatus destroy_status = hobot_vaDestroySurfaces(
         &va_ctx, &only_one_surface, MAX_SURFACES);
+    VASurfaceAttrib only_one_attribute = {
+        .type = VASurfaceAttribPixelFormat,
+        .value = {
+            .type = VAGenericValueTypeInteger,
+            .value.i = VA_FOURCC_NV12
+        }
+    };
+    VASurfaceID created_surface = VA_INVALID_SURFACE;
+    VAStatus surface_attribute_status = hobot_vaCreateSurfaces2(
+        &va_ctx, VA_RT_FORMAT_YUV420, 1280, 720, &created_surface, 1,
+        &only_one_attribute, UINT_MAX);
     int passed = render_status == VA_STATUS_ERROR_INVALID_PARAMETER &&
-                 destroy_status == VA_STATUS_ERROR_INVALID_PARAMETER;
+                 destroy_status == VA_STATUS_ERROR_INVALID_PARAMETER &&
+                 surface_attribute_status == VA_STATUS_ERROR_INVALID_PARAMETER &&
+                 created_surface == VA_INVALID_SURFACE &&
+                 !drv.surfaces[1].allocated;
     if (!passed)
-        fprintf(stderr, "oversized VA-API arrays were not rejected: render=%d destroy=%d\n",
-                render_status, destroy_status);
+        fprintf(stderr, "oversized VA-API arrays were not rejected: render=%d destroy=%d surface_attrs=%d surface=%u\n",
+                render_status, destroy_status, surface_attribute_status,
+                created_surface);
 
     pthread_mutex_destroy(&drv.mutex);
     return passed;
@@ -6028,7 +10252,7 @@ static int test_begin_picture_rejects_undersized_surface(void)
     return passed;
 }
 
-static int test_query_surface_status_tracks_pending_decode(void)
+static int test_query_surface_status_tracks_pending_work(void)
 {
     HobotDriverData drv = {0};
     struct VADriverContext va_ctx = {0};
@@ -6056,6 +10280,36 @@ static int test_query_surface_status_tracks_pending_decode(void)
     }
 
     drv.surfaces[1].decode_pending = 0;
+    HobotContext *encoder = &drv.contexts[1];
+    atomic_init(&encoder->enc_external_input_pending, 0);
+    encoder->allocated = 1;
+    encoder->is_encoder = 1;
+    encoder->encoder_picture_active = 1;
+    encoder->current_render_target = 1;
+    status = hobot_vaQuerySurfaceStatus(&va_ctx, 1, &status_value);
+    if (status != VA_STATUS_SUCCESS || status_value != VASurfaceRendering) {
+        fprintf(stderr, "surface used by an active encoder did not report rendering: status=%d surface_status=%d\n",
+                status, status_value);
+        pthread_mutex_destroy(&drv.mutex);
+        return 0;
+    }
+
+    encoder->encoder_picture_active = 0;
+    encoder->enc_external_enabled = 1;
+    encoder->enc_external_surface = 1;
+    atomic_store_explicit(&encoder->enc_external_input_pending, 7,
+                          memory_order_release);
+    status = hobot_vaQuerySurfaceStatus(&va_ctx, 1, &status_value);
+    if (status != VA_STATUS_SUCCESS || status_value != VASurfaceRendering) {
+        fprintf(stderr, "surface awaiting external encoder consumption did not report rendering: status=%d surface_status=%d\n",
+                status, status_value);
+        pthread_mutex_destroy(&drv.mutex);
+        return 0;
+    }
+
+    atomic_store_explicit(&encoder->enc_external_input_pending, 0,
+                          memory_order_release);
+    encoder->enc_external_surface = VA_INVALID_SURFACE;
     drv.surfaces[1].has_decoded_frame = 1;
     status = hobot_vaQuerySurfaceStatus(&va_ctx, 1, &status_value);
     if (status != VA_STATUS_SUCCESS || status_value != VASurfaceReady ||
@@ -6068,112 +10322,426 @@ static int test_query_surface_status_tracks_pending_decode(void)
         pthread_mutex_destroy(&drv.mutex);
         return 0;
     }
-
     pthread_mutex_destroy(&drv.mutex);
     return 1;
 }
 
-static int test_derived_image_reports_staging_layout(void)
+static int test_query_surface_error_is_explicitly_unimplemented(void)
 {
     HobotDriverData drv = {0};
     struct VADriverContext va_ctx = {0};
     if (pthread_mutex_init(&drv.mutex, NULL) != 0)
         return 0;
     va_ctx.pDriverData = &drv;
+    drv.surfaces[1].allocated = 1;
+
+    void *error_info = (void *)(uintptr_t)1;
+    VAStatus status = hobot_vaQuerySurfaceError(
+        &va_ctx, 1, VA_STATUS_ERROR_DECODING_ERROR, &error_info);
+    int passed = status == VA_STATUS_ERROR_UNIMPLEMENTED && error_info == NULL &&
+                 hobot_vaQuerySurfaceError(&va_ctx, 2,
+                     VA_STATUS_ERROR_DECODING_ERROR, &error_info) ==
+                     VA_STATUS_ERROR_INVALID_SURFACE &&
+                 hobot_vaQuerySurfaceError(&va_ctx, 1,
+                     VA_STATUS_ERROR_DECODING_ERROR, NULL) ==
+                     VA_STATUS_ERROR_INVALID_PARAMETER &&
+                 hobot_vaQuerySurfaceError(&va_ctx, 1, VA_STATUS_SUCCESS,
+                     &error_info) == VA_STATUS_ERROR_INVALID_PARAMETER &&
+                 hobot_vaQuerySurfaceError(NULL, 1,
+                     VA_STATUS_ERROR_DECODING_ERROR, &error_info) ==
+                     VA_STATUS_ERROR_INVALID_CONTEXT;
+    if (!passed)
+        fprintf(stderr, "vaQuerySurfaceError did not report its unsupported contract: status=%d info=%p\n",
+                status, error_info);
+    pthread_mutex_destroy(&drv.mutex);
+    return passed;
+}
+
+static int test_derived_image_maps_surface_storage(void)
+{
+    enum { WIDTH = 130, HEIGHT = 66, STRIDE = 160, VSTRIDE = 80,
+           Y_SIZE = STRIDE * VSTRIDE, UV_SIZE = STRIDE * (VSTRIDE / 2),
+           FRAME_SIZE = Y_SIZE + UV_SIZE, IMAGE_SIZE = Y_SIZE + STRIDE * (HEIGHT / 2),
+           PEER_STRIDE = 192, PEER_VSTRIDE = 128,
+           PEER_SIZE = PEER_STRIDE * PEER_VSTRIDE * 3 / 2 };
+    HobotDriverData drv = {0};
+    struct VADriverContext va_ctx = {0};
+    uint8_t frame[FRAME_SIZE];
+    uint8_t peer_data[PEER_SIZE];
+    for (size_t i = 0; i < sizeof(frame); i++)
+        frame[i] = (uint8_t)(i * 17u + 3u);
+    for (size_t i = 0; i < sizeof(peer_data); i++)
+        peer_data[i] = (uint8_t)(i * 29u + 11u);
+    if (pthread_mutex_init(&drv.mutex, NULL) != 0)
+        return 0;
+    va_ctx.pDriverData = &drv;
 
     VASurfaceID surface = VA_INVALID_SURFACE;
     VAStatus status = hobot_vaCreateSurfaces2(&va_ctx, VA_RT_FORMAT_YUV420,
-                                               130, 66, &surface, 1, NULL, 0);
+                                               WIDTH, HEIGHT, &surface, 1, NULL, 0);
     if (status != VA_STATUS_SUCCESS) {
         pthread_mutex_destroy(&drv.mutex);
         return 0;
     }
-
-    unsigned char src_y[160 * 80];
-    unsigned char src_uv[160 * 40];
-    for (unsigned int y = 0; y < 80; y++) {
-        for (unsigned int x = 0; x < 160; x++)
-            src_y[y * 160 + x] = (unsigned char)(y + x);
-    }
-    for (unsigned int y = 0; y < 40; y++) {
-        for (unsigned int x = 0; x < 160; x++)
-            src_uv[y * 160 + x] = (unsigned char)(3 * y + x);
-    }
-
     HobotSurface *surf = &drv.surfaces[surface];
     surf->has_decoded_frame = 1;
-    surf->vpu_out_buf.vframe_buf.vir_ptr[0] = src_y;
-    surf->vpu_out_buf.vframe_buf.vir_ptr[1] = src_uv;
+    surf->vpu_out_buf.vframe_buf.vir_ptr[0] = frame;
+    surf->vpu_out_buf.vframe_buf.vir_ptr[1] = frame + Y_SIZE;
+    surf->vpu_out_buf.vframe_buf.stride = STRIDE;
+    surf->vpu_out_buf.vframe_buf.vstride = STRIDE;
+    surf->vpu_out_buf.vframe_buf.size = sizeof(frame);
+    surf->vpu_out_buf.vframe_buf.fd[0] = 7;
+    surf->vpu_out_buf.vframe_buf.fd[1] = 7;
+    surf->vpu_out_buf.vframe_buf.compSize[0] = Y_SIZE;
+    surf->vpu_out_buf.vframe_buf.compSize[1] = UV_SIZE;
+
+    VAImage first = {0};
     surf->vpu_out_buf.vframe_buf.stride = 64;
-    surf->vpu_out_buf.vframe_buf.vstride = 160;
-    surf->vpu_out_buf.vframe_buf.size = sizeof(src_y) + sizeof(src_uv);
-    surf->vpu_out_buf.vframe_buf.compSize[0] = sizeof(src_y);
-    surf->vpu_out_buf.vframe_buf.compSize[1] = sizeof(src_uv);
+    status = hobot_vaDeriveImage(&va_ctx, surface, &first);
+    if (status != VA_STATUS_ERROR_OPERATION_FAILED || drv.images[1].allocated ||
+        drv.buffers[1].allocated || surf->lock_count != 0) {
+        fprintf(stderr, "vaDeriveImage accepted an invalid backing stride: status=%d\n", status);
+        pthread_mutex_destroy(&drv.mutex);
+        return 0;
+    }
+    surf->vpu_out_buf.vframe_buf.stride = STRIDE;
+
+    mock_mem_invalidate_calls = 0;
+    mock_mem_flush_calls = 0;
+    mock_mem_invalidate_result = -1;
+    status = hobot_vaDeriveImage(&va_ctx, surface, &first);
+    unsigned int derived_size = drv.buffers[first.buf].size;
+    int passed = status == VA_STATUS_SUCCESS && first.pitches[0] == STRIDE &&
+                 first.pitches[1] == STRIDE && first.offsets[0] == 0 &&
+                 first.offsets[1] == Y_SIZE && first.data_size == IMAGE_SIZE &&
+                 drv.buffers[first.buf].data == frame && surf->raw_data == NULL &&
+                 surf->lock_count == 1 &&
+                 hobot_vaBufferSetNumElements(&va_ctx, first.buf, 1) ==
+                     VA_STATUS_ERROR_OPERATION_FAILED &&
+                 drv.buffers[first.buf].size == derived_size;
+    void *mapped_first = NULL;
+    if (passed) {
+        status = hobot_vaMapBuffer(&va_ctx, first.buf, &mapped_first);
+        passed = status == VA_STATUS_ERROR_OPERATION_FAILED && mapped_first == NULL &&
+                 drv.buffers[first.buf].map_count == 0 && surf->cpu_access_count == 0;
+    }
+    mock_mem_invalidate_result = 0;
+
+    VAImage second = {0};
+    if (passed) {
+        status = hobot_vaDeriveImage(&va_ctx, surface, &second);
+        passed = status == VA_STATUS_SUCCESS && second.buf != first.buf &&
+                 drv.buffers[second.buf].data == frame && surf->lock_count == 2;
+    }
+    if (passed) {
+        status = hobot_vaUnlockSurface(&va_ctx, surface);
+        passed = status == VA_STATUS_ERROR_OPERATION_FAILED && surf->lock_count == 2 &&
+                 surf->va_lock_count == 0 && surf->cpu_access_count == 0;
+    }
+    VASurfaceID peer_surface = VA_INVALID_SURFACE;
+    if (passed) {
+        status = hobot_vaCreateSurfaces2(&va_ctx, VA_RT_FORMAT_YUV420,
+                                         WIDTH, HEIGHT, &peer_surface, 1, NULL, 0);
+        passed = status == VA_STATUS_SUCCESS;
+    }
+    if (passed) {
+        HobotSurface *peer = &drv.surfaces[peer_surface];
+        peer->stride = PEER_STRIDE;
+        peer->raw_data_size = sizeof(peer_data);
+        peer->raw_data = peer_data;
+        peer->raw_data_valid = 1;
+    }
+    void *mapped_again = NULL;
+    void *mapped_second = NULL;
+    if (passed) {
+        passed = hobot_vaMapBuffer(&va_ctx, first.buf, &mapped_first) == VA_STATUS_SUCCESS &&
+                 mapped_first == frame &&
+                 hobot_vaMapBuffer(&va_ctx, first.buf, &mapped_again) == VA_STATUS_SUCCESS &&
+                 mapped_again == frame &&
+                 hobot_vaMapBuffer(&va_ctx, second.buf, &mapped_second) == VA_STATUS_SUCCESS &&
+                 mapped_second == frame && surf->cpu_access_count == 2 &&
+                 drv.buffers[first.buf].map_count == 2 &&
+                 drv.buffers[second.buf].map_count == 1 &&
+                 mock_mem_invalidate_calls == 2 && mock_mem_invalidate_fd == 7 &&
+                 mock_mem_invalidate_offset == 0 && mock_mem_invalidate_size == FRAME_SIZE;
+    }
+    if (passed) {
+        VADRMPRIMESurfaceDescriptor prime_desc = {0};
+        struct hobot_surface_info graph_info = {0};
+        passed = hobot_vaExportSurfaceHandle(&va_ctx, surface,
+                                              VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2,
+                                              VA_EXPORT_SURFACE_READ_WRITE,
+                                              &prime_desc) == VA_STATUS_ERROR_SURFACE_BUSY &&
+                 hobot_vaExportSurfaceHandle(&va_ctx, surface,
+                                              VA_SURFACE_ATTRIB_MEM_TYPE_HOBOT_GRAPH_BUF,
+                                              0, &graph_info) == VA_STATUS_ERROR_SURFACE_BUSY;
+    }
+    if (passed) {
+        void *surface_map = NULL;
+        passed = hobot_vaLockSurface(&va_ctx, surface, NULL, NULL, NULL, NULL,
+                                     NULL, NULL, NULL, NULL, &surface_map) ==
+                     VA_STATUS_SUCCESS && surface_map == frame &&
+                 surf->cpu_access_count == 3 && surf->va_lock_count == 1 &&
+                 mock_mem_invalidate_calls == 2 && mock_mem_flush_calls == 0 &&
+                 hobot_vaUnlockSurface(&va_ctx, surface) == VA_STATUS_SUCCESS &&
+                 surf->cpu_access_count == 2 && surf->va_lock_count == 0 &&
+                 mock_mem_flush_calls == 0;
+    }
+    if (passed) {
+        passed = hobot_vaGetImage(&va_ctx, peer_surface, 0, 0, WIDTH, HEIGHT,
+                                  first.image_id) == VA_STATUS_ERROR_SURFACE_BUSY &&
+                 hobot_vaPutImage(&va_ctx, peer_surface, first.image_id, 0, 0,
+                                  WIDTH, HEIGHT, 0, 0, WIDTH, HEIGHT) ==
+                     VA_STATUS_ERROR_SURFACE_BUSY;
+    }
+    if (passed) {
+        surf->raw_data_valid = 1;
+        ((uint8_t *)mapped_first)[0] = 0xa5;
+        passed = hobot_vaUnmapBuffer(&va_ctx, first.buf) == VA_STATUS_SUCCESS &&
+                 surf->cpu_access_count == 2 && mock_mem_flush_calls == 0 &&
+                 hobot_vaUnmapBuffer(&va_ctx, second.buf) == VA_STATUS_SUCCESS &&
+                 surf->cpu_access_count == 1 && mock_mem_flush_calls == 0;
+    }
+    mock_mem_flush_result = -1;
+    if (passed) {
+        status = hobot_vaUnmapBuffer(&va_ctx, first.buf);
+        passed = status == VA_STATUS_ERROR_OPERATION_FAILED &&
+                 surf->cpu_access_count == 0 && drv.buffers[first.buf].map_count == 0 &&
+                 !surf->raw_data_valid &&
+                 mock_mem_flush_calls == 1 && mock_mem_flush_fd == 7 &&
+                 mock_mem_flush_offset == 0 && mock_mem_flush_size == FRAME_SIZE;
+    }
+    if (passed) {
+        status = hobot_vaDestroyImage(&va_ctx, first.image_id);
+        passed = status == VA_STATUS_ERROR_OPERATION_FAILED &&
+                 drv.images[first.image_id].allocated &&
+                 surf->cpu_cache_flush_pending && surf->lock_count == 2 &&
+                 mock_mem_flush_calls == 2;
+    }
+    mock_mem_flush_result = 0;
+    if (passed) {
+        passed = hobot_vaMapBuffer(&va_ctx, second.buf, &mapped_second) == VA_STATUS_SUCCESS &&
+                 !surf->cpu_cache_flush_pending && surf->cpu_access_count == 1 &&
+                 hobot_vaUnmapBuffer(&va_ctx, second.buf) == VA_STATUS_SUCCESS &&
+                 surf->cpu_access_count == 0 &&
+                 mock_mem_invalidate_calls == 3 && mock_mem_flush_calls == 4;
+    }
+    if (passed) {
+        int invalidates_before = mock_mem_invalidate_calls;
+        int flushes_before = mock_mem_flush_calls;
+        status = hobot_vaGetImage(&va_ctx, peer_surface, 0, 0, WIDTH, HEIGHT,
+                                  first.image_id);
+        passed = status == VA_STATUS_SUCCESS &&
+                 mock_mem_invalidate_calls == invalidates_before + 1 &&
+                 mock_mem_flush_calls == flushes_before + 1 &&
+                 mock_mem_flush_fd == 7 && mock_mem_flush_size == FRAME_SIZE &&
+                 memcmp(frame, peer_data, WIDTH) == 0 &&
+                 memcmp(frame + Y_SIZE, peer_data + PEER_STRIDE * HEIGHT, WIDTH) == 0;
+        invalidates_before = mock_mem_invalidate_calls;
+        if (passed) {
+            status = hobot_vaPutImage(&va_ctx, peer_surface, first.image_id, 0, 0,
+                                      WIDTH, HEIGHT, 0, 0, WIDTH, HEIGHT);
+            passed = status == VA_STATUS_SUCCESS &&
+                     mock_mem_invalidate_calls == invalidates_before + 1 &&
+                     memcmp(peer_data, frame, WIDTH) == 0 &&
+                     memcmp(peer_data + PEER_STRIDE * HEIGHT,
+                            frame + Y_SIZE, WIDTH) == 0;
+        }
+    }
+    if (passed) {
+        passed = hobot_vaGetImage(&va_ctx, surface, 0, 0, WIDTH, HEIGHT,
+                                  first.image_id) == VA_STATUS_ERROR_SURFACE_BUSY &&
+                 hobot_vaPutImage(&va_ctx, surface, first.image_id, 0, 0,
+                                  WIDTH, HEIGHT, 0, 0, WIDTH, HEIGHT) ==
+                     VA_STATUS_ERROR_SURFACE_BUSY;
+    }
+    if (passed) {
+        status = hobot_vaDestroySurfaces(&va_ctx, &surface, 1);
+        passed = status == VA_STATUS_ERROR_SURFACE_BUSY && surf->allocated &&
+                 drv.images[first.image_id].allocated && surf->lock_count == 2;
+    }
+    if (passed)
+        passed = hobot_vaDestroyImage(&va_ctx, first.image_id) == VA_STATUS_SUCCESS &&
+                 surf->lock_count == 1 &&
+                 hobot_vaDestroyImage(&va_ctx, second.image_id) == VA_STATUS_SUCCESS &&
+                 surf->lock_count == 0;
+    surf->has_decoded_frame = 0;
+    memset(&surf->vpu_out_buf, 0, sizeof(surf->vpu_out_buf));
+    if (peer_surface > 0 && peer_surface < MAX_SURFACES &&
+        drv.surfaces[peer_surface].allocated) {
+        drv.surfaces[peer_surface].raw_data = NULL;
+        VAStatus peer_status = hobot_vaDestroySurfaces(&va_ctx, &peer_surface, 1);
+        if (peer_status != VA_STATUS_SUCCESS)
+            passed = 0;
+    }
+    if (passed) {
+        status = hobot_vaDestroySurfaces(&va_ctx, &surface, 1);
+        passed = status == VA_STATUS_SUCCESS && !surf->allocated;
+    }
+
+    VASurfaceID unsupported_surface = VA_INVALID_SURFACE;
+    if (passed) {
+        status = hobot_vaCreateSurfaces2(&va_ctx, VA_RT_FORMAT_YUV420,
+                                         64, 64, &unsupported_surface, 1, NULL, 0);
+        passed = status == VA_STATUS_SUCCESS;
+    }
+    if (passed) {
+        uint8_t split_storage[64 * 64 + 64 * 32 + 4096] = {0};
+        uint8_t *split_y = split_storage;
+        uint8_t *split_uv = split_storage + 8192;
+        const unsigned int split_size = 64 * 64 + 64 * 32;
+        HobotSurface *unsupported = &drv.surfaces[unsupported_surface];
+        unsupported->has_decoded_frame = 1;
+        unsupported->vpu_out_buf.vframe_buf.vir_ptr[0] = split_y;
+        unsupported->vpu_out_buf.vframe_buf.vir_ptr[1] = split_uv;
+        unsupported->vpu_out_buf.vframe_buf.stride = 64;
+        unsupported->vpu_out_buf.vframe_buf.vstride = 64;
+        unsupported->vpu_out_buf.vframe_buf.size = split_size;
+        unsupported->vpu_out_buf.vframe_buf.fd[0] = 8;
+        unsupported->vpu_out_buf.vframe_buf.fd[1] = 8;
+        unsupported->vpu_out_buf.vframe_buf.compSize[0] = 64 * 64;
+        unsupported->vpu_out_buf.vframe_buf.compSize[1] = 64 * 32;
+        VAImage rejected = {0};
+        status = hobot_vaDeriveImage(&va_ctx, unsupported_surface, &rejected);
+        passed = status == VA_STATUS_ERROR_OPERATION_FAILED &&
+                 !drv.images[1].allocated && !drv.buffers[1].allocated &&
+                 unsupported->lock_count == 0;
+        unsupported->has_decoded_frame = 0;
+        memset(&unsupported->vpu_out_buf, 0, sizeof(unsupported->vpu_out_buf));
+        if (passed)
+            passed = hobot_vaDestroySurfaces(&va_ctx, &unsupported_surface, 1) ==
+                     VA_STATUS_SUCCESS;
+    }
+
+    mock_mem_invalidate_result = 0;
+    mock_mem_flush_result = 0;
+    pthread_mutex_destroy(&drv.mutex);
+    if (!passed)
+        fprintf(stderr, "direct vaDeriveImage storage, sync, or busy-state regression failed: status=%d\n",
+                status);
+    return passed;
+}
+
+static int test_derived_image_buffer_handle_lifecycle(void)
+{
+    enum { WIDTH = 64, HEIGHT = 64, STRIDE = 64, Y_SIZE = STRIDE * HEIGHT,
+           FRAME_SIZE = Y_SIZE + STRIDE * (HEIGHT / 2) };
+    HobotDriverData drv = {0};
+    struct VADriverContext va_ctx = {0};
+    uint8_t frame[FRAME_SIZE] = {0};
+    int source_fd = open("/dev/null", O_RDONLY | O_CLOEXEC);
+    if (source_fd < 0 || pthread_mutex_init(&drv.mutex, NULL) != 0) {
+        if (source_fd >= 0)
+            close(source_fd);
+        return 0;
+    }
+    va_ctx.pDriverData = &drv;
+
+    VASurfaceID surface = VA_INVALID_SURFACE;
+    VAStatus status = hobot_vaCreateSurfaces2(&va_ctx, VA_RT_FORMAT_YUV420,
+                                               WIDTH, HEIGHT, &surface, 1,
+                                               NULL, 0);
+    if (status != VA_STATUS_SUCCESS) {
+        close(source_fd);
+        pthread_mutex_destroy(&drv.mutex);
+        return 0;
+    }
+    HobotSurface *surf = &drv.surfaces[surface];
+    surf->has_decoded_frame = 1;
+    surf->vpu_out_buf.vframe_buf.vir_ptr[0] = frame;
+    surf->vpu_out_buf.vframe_buf.vir_ptr[1] = frame + Y_SIZE;
+    surf->vpu_out_buf.vframe_buf.phy_ptr[0] = 0x100000;
+    surf->vpu_out_buf.vframe_buf.phy_ptr[1] = 0x100000 + Y_SIZE;
+    surf->vpu_out_buf.vframe_buf.stride = STRIDE;
+    surf->vpu_out_buf.vframe_buf.vstride = STRIDE;
+    surf->vpu_out_buf.vframe_buf.size = sizeof(frame);
+    surf->vpu_out_buf.vframe_buf.fd[0] = source_fd;
+    surf->vpu_out_buf.vframe_buf.fd[1] = source_fd;
+    surf->vpu_out_buf.vframe_buf.compSize[0] = Y_SIZE;
+    surf->vpu_out_buf.vframe_buf.compSize[1] = STRIDE * (HEIGHT / 2);
 
     VAImage image = {0};
     status = hobot_vaDeriveImage(&va_ctx, surface, &image);
-    if (status != VA_STATUS_ERROR_OPERATION_FAILED || drv.images[1].allocated ||
-        drv.buffers[1].allocated) {
-        fprintf(stderr, "invalid source NV12 stride accepted by vaDeriveImage: status=%d\n",
-                status);
-        pthread_mutex_destroy(&drv.mutex);
-        return 0;
+    int passed = status == VA_STATUS_SUCCESS;
+    VABufferInfo info = {0};
+    info.mem_type = VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2;
+    if (passed) {
+        passed = hobot_vaAcquireBufferHandle(&va_ctx, image.buf, &info) ==
+                     VA_STATUS_ERROR_UNSUPPORTED_MEMORY_TYPE &&
+                 !drv.buffers[image.buf].handle_acquired &&
+                 surf->external_handle_count == 0;
     }
-
-    surf->vpu_out_buf.vframe_buf.stride = 160;
-    status = hobot_vaDeriveImage(&va_ctx, surface, &image);
-    if (status != VA_STATUS_SUCCESS || image.pitches[0] != 192 ||
-        image.pitches[1] != 192 || image.offsets[1] != 192u * 66u ||
-        image.data_size != surf->raw_data_size) {
-        fprintf(stderr, "derived NV12 layout does not match staging buffer: status=%d pitch=%u/%u offset=%u size=%u\n",
-                status, image.pitches[0], image.pitches[1], image.offsets[1], image.data_size);
-        pthread_mutex_destroy(&drv.mutex);
-        return 0;
+    memset(&info, 0, sizeof(info));
+    info.mem_type = VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME;
+    if (passed) {
+        status = hobot_vaAcquireBufferHandle(&va_ctx, image.buf, &info);
+        struct stat st;
+        passed = status == VA_STATUS_SUCCESS &&
+                 info.handle != (uintptr_t)source_fd &&
+                 info.type == VAImageBufferType &&
+                 info.mem_type == VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME &&
+                 info.mem_size == sizeof(frame) &&
+                 fstat((int)info.handle, &st) == 0 &&
+                 drv.buffers[image.buf].handle_acquired &&
+                 drv.buffers[image.buf].acquired_fd == (int)info.handle &&
+                 surf->external_handle_count == 1;
     }
-
-    const unsigned char *dst_y = surf->raw_data;
-    const unsigned char *dst_uv = dst_y + image.offsets[1];
-    for (unsigned int y = 0; y < 66; y++) {
-        if (memcmp(dst_y + (size_t)y * 192, src_y + (size_t)y * 160, 130) != 0) {
-            fprintf(stderr, "derived luma row %u has incorrect pitch/content\n", y);
-            pthread_mutex_destroy(&drv.mutex);
-            return 0;
-        }
+    if (passed) {
+        VABufferInfo duplicate = {0};
+        duplicate.mem_type = VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME;
+        void *mapped = NULL;
+        VADRMPRIMESurfaceDescriptor desc = {0};
+        drv.configs[1].allocated = 1;
+        drv.configs[1].profile = VAProfileH264Main;
+        drv.configs[1].entrypoint = VAEntrypointVLD;
+        VAContextID context = VA_INVALID_ID;
+        passed = hobot_vaAcquireBufferHandle(&va_ctx, image.buf, &duplicate) ==
+                     VA_STATUS_ERROR_SURFACE_BUSY &&
+                 hobot_vaMapBuffer(&va_ctx, image.buf, &mapped) ==
+                     VA_STATUS_ERROR_SURFACE_BUSY && mapped == NULL &&
+                 hobot_vaSyncSurface(&va_ctx, surface) ==
+                     VA_STATUS_ERROR_SURFACE_BUSY &&
+                 hobot_vaExportSurfaceHandle(
+                     &va_ctx, surface, VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2,
+                     VA_EXPORT_SURFACE_READ_ONLY, &desc) ==
+                     VA_STATUS_ERROR_SURFACE_BUSY &&
+                 hobot_vaCreateContext(&va_ctx, 1, WIDTH, HEIGHT, 0,
+                                       &surface, 1, &context) ==
+                     VA_STATUS_ERROR_SURFACE_BUSY &&
+                 context == VA_INVALID_ID &&
+                 hobot_vaDestroyImage(&va_ctx, image.image_id) ==
+                     VA_STATUS_ERROR_OPERATION_FAILED &&
+                 hobot_vaDestroySurfaces(&va_ctx, &surface, 1) ==
+                     VA_STATUS_ERROR_SURFACE_BUSY;
     }
-    for (unsigned int y = 0; y < 33; y++) {
-        if (memcmp(dst_uv + (size_t)y * 192, src_uv + (size_t)y * 160, 130) != 0) {
-            fprintf(stderr, "derived chroma row %u has incorrect pitch/content\n", y);
-            pthread_mutex_destroy(&drv.mutex);
-            return 0;
-        }
+    uintptr_t acquired_handle = info.handle;
+    if (drv.buffers[image.buf].handle_acquired) {
+        VAStatus release_status = hobot_vaReleaseBufferHandle(&va_ctx, image.buf);
+        passed = passed && release_status == VA_STATUS_SUCCESS &&
+                 fcntl((int)acquired_handle, F_GETFD) == -1 && errno == EBADF &&
+                 !drv.buffers[image.buf].handle_acquired &&
+                 drv.buffers[image.buf].acquired_fd == -1 &&
+                 surf->external_handle_count == 0 &&
+                 hobot_vaReleaseBufferHandle(&va_ctx, image.buf) ==
+                     VA_STATUS_ERROR_OPERATION_FAILED &&
+                 hobot_vaSyncSurface(&va_ctx, surface) == VA_STATUS_SUCCESS;
+    } else {
+        passed = 0;
     }
-
-    void *derived_data = surf->raw_data;
-    status = hobot_vaDestroySurfaces(&va_ctx, &surface, 1);
-    if (status != VA_STATUS_ERROR_SURFACE_BUSY || !surf->allocated ||
-        surf->raw_data != derived_data || !drv.images[image.image_id].allocated) {
-        fprintf(stderr, "surface destruction did not protect a live derived image: status=%d allocated=%d\n",
-                status, surf->allocated);
-        pthread_mutex_destroy(&drv.mutex);
-        return 0;
-    }
-
-    if (hobot_vaDestroyImage(&va_ctx, image.image_id) != VA_STATUS_SUCCESS) {
-        pthread_mutex_destroy(&drv.mutex);
-        return 0;
-    }
+    if (drv.images[image.image_id].allocated)
+        passed = hobot_vaDestroyImage(&va_ctx, image.image_id) ==
+                     VA_STATUS_SUCCESS && passed;
     surf->has_decoded_frame = 0;
     memset(&surf->vpu_out_buf, 0, sizeof(surf->vpu_out_buf));
-    status = hobot_vaDestroySurfaces(&va_ctx, &surface, 1);
-    if (status != VA_STATUS_SUCCESS || surf->allocated) {
-        fprintf(stderr, "derived test surface cleanup failed: status=%d allocated=%d\n",
-                status, surf->allocated);
-        pthread_mutex_destroy(&drv.mutex);
-        return 0;
-    }
-
+    if (surf->allocated)
+        passed = hobot_vaDestroySurfaces(&va_ctx, &surface, 1) ==
+                     VA_STATUS_SUCCESS && passed;
+    close(source_fd);
     pthread_mutex_destroy(&drv.mutex);
-    return 1;
+    if (!passed)
+        fprintf(stderr, "derived-image DRM PRIME buffer-handle lifecycle failed: status=%d\n",
+                status);
+    return passed;
 }
 
 static int test_dequeued_output_recycle_failure_preserves_ownership(int corrupt_frame)
@@ -6252,6 +10820,162 @@ static int test_dequeued_output_recycle_failure_preserves_ownership(int corrupt_
     mock_queue_output_result = 0;
     mock_stop_result = 0;
     return 1;
+}
+
+static int test_dequeued_output_timeout_is_retried_on_next_sync(void)
+{
+    HobotDriverData drv = {0};
+    struct VADriverContext va_ctx = {0};
+    if (pthread_mutex_init(&drv.mutex, NULL) != 0)
+        return 0;
+    va_ctx.pDriverData = &drv;
+
+    HobotContext *hctx = &drv.contexts[1];
+    hctx->allocated = 1;
+    hctx->vpu_running = 1;
+    hctx->submitted_surfaces[hctx->sub_tail++] = 1;
+    drv.surfaces[1].allocated = 1;
+    drv.surfaces[1].context_id = 1;
+    drv.surfaces[1].decode_pending = 1;
+
+    mock_dequeue_result = 0;
+    mock_dequeue_output_invalid = 1;
+    mock_err_mb = 0;
+    mock_dequeue_output_calls = 0;
+    mock_queue_output_calls = 0;
+    mock_queue_output_result = 0;
+    mock_queue_output_wait_timeout = 1;
+
+    VAStatus status = hobot_vaSyncSurface2(&va_ctx, 1, 20000000ULL);
+    int retained_after_timeout = status == VA_STATUS_ERROR_TIMEDOUT &&
+        !hctx->decode_failed && hctx->dec_out_buf_valid &&
+        hctx->dec_out_buf.vframe_buf.phy_ptr[0] == 1 &&
+        hctx->dec_out_buf.vframe_buf.size == sizeof(mock_frame) &&
+        drv.surfaces[1].decode_pending && !hctx->sync_active &&
+        mock_dequeue_output_calls == 1 && mock_queue_output_calls == 1;
+
+    mock_dequeue_output_invalid = 0;
+    status = hobot_vaSyncSurface2(&va_ctx, 1, 20000000ULL);
+    int retained_after_retry_timeout = status == VA_STATUS_ERROR_TIMEDOUT &&
+        !hctx->decode_failed && hctx->dec_out_buf_valid &&
+        hctx->dec_out_buf.vframe_buf.phy_ptr[0] == 1 &&
+        hctx->dec_out_buf.vframe_buf.size == sizeof(mock_frame) &&
+        drv.surfaces[1].decode_pending && !hctx->sync_active &&
+        mock_dequeue_output_calls == 1 && mock_queue_output_calls == 2;
+
+    mock_queue_output_wait_timeout = 0;
+    status = hobot_vaSyncSurface2(&va_ctx, 1, 1000000000ULL);
+    int recovered = status == VA_STATUS_SUCCESS && !hctx->decode_failed &&
+        !hctx->dec_out_buf_valid && drv.surfaces[1].has_decoded_frame &&
+        !drv.surfaces[1].decode_pending && !hctx->sync_active &&
+        mock_dequeue_output_calls == 2 && mock_queue_output_calls == 3;
+
+    if (!retained_after_timeout || !retained_after_retry_timeout || !recovered)
+        fprintf(stderr,
+                "dequeued output timeout retry failed: retained=%d retry_retained=%d recovered=%d status=%d valid=%d failed=%d dequeue=%d queue=%d\n",
+                retained_after_timeout, retained_after_retry_timeout, recovered,
+                status, hctx->dec_out_buf_valid, hctx->decode_failed,
+                mock_dequeue_output_calls, mock_queue_output_calls);
+    if (drv.sync_cond_initialized)
+        pthread_cond_destroy(&drv.sync_cond);
+    pthread_mutex_destroy(&drv.mutex);
+    mock_dequeue_result = 0;
+    mock_dequeue_output_invalid = 0;
+    mock_err_mb = 0;
+    mock_queue_output_result = 0;
+    mock_queue_output_wait_timeout = 0;
+    return retained_after_timeout && retained_after_retry_timeout && recovered;
+}
+
+static int test_video_decode_result_is_validated(void)
+{
+    const struct {
+        int result;
+        VAStatus expected_status;
+        int expected_error;
+        int expected_anomaly;
+    } cases[] = {
+        {0x00, VA_STATUS_ERROR_DECODING_ERROR, 1, 1},
+        {0x02, VA_STATUS_ERROR_DECODING_ERROR, 1, 1},
+        {0x10, VA_STATUS_SUCCESS, 0, 1},
+        {0x01, VA_STATUS_SUCCESS, 0, 0},
+    };
+    int passed = 1;
+
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        HobotDriverData drv = {0};
+        struct VADriverContext va_ctx = {0};
+        if (pthread_mutex_init(&drv.mutex, NULL) != 0)
+            return 0;
+        va_ctx.pDriverData = &drv;
+
+        HobotContext *hctx = &drv.contexts[1];
+        hctx->allocated = 1;
+        hctx->vpu_initialized = 1;
+        hctx->vpu_running = 1;
+        hctx->submitted_surfaces[hctx->sub_tail++] = 1;
+
+        HobotSurface *surf = &drv.surfaces[1];
+        surf->allocated = 1;
+        surf->context_id = 1;
+        surf->decode_pending = 1;
+
+        mock_dequeue_result = 0;
+        mock_dequeue_output_invalid = 0;
+        mock_decode_result = cases[i].result;
+        mock_err_mb = 0;
+        mock_dequeue_output_calls = 0;
+        mock_queue_output_result = 0;
+        mock_queue_output_calls = 0;
+        recycled_output_count = 0;
+        mock_stop_result = 0;
+        mock_release_result = 0;
+
+        VAStatus status = hobot_vaSyncSurface(&va_ctx, 1);
+        int frame_state_valid = cases[i].expected_error ?
+            (!surf->has_decoded_frame && surf->decode_error &&
+             !surf->decode_pending && mock_queue_output_calls == 1 &&
+             recycled_output_count == 1) :
+            (surf->has_decoded_frame && !surf->decode_error &&
+             !surf->decode_pending && surf->dma_fd == 7 &&
+             mock_queue_output_calls == 0);
+        int result_valid = status == cases[i].expected_status && frame_state_valid &&
+            hctx->watchdog_anomaly_count == cases[i].expected_anomaly &&
+            mock_dequeue_output_calls == 1 && hctx->sub_head == hctx->sub_tail;
+        if (!result_valid) {
+            fprintf(stderr,
+                    "decoder result handling failed: result=0x%x status=%d pending=%d error=%d frame=%d anomaly=%d recycled=%d\n",
+                    cases[i].result, status, surf->decode_pending,
+                    surf->decode_error, surf->has_decoded_frame,
+                    hctx->watchdog_anomaly_count, recycled_output_count);
+            passed = 0;
+        }
+
+        VAStatus destroy_status = hobot_vaDestroyContext(&va_ctx, 1);
+        if (destroy_status != VA_STATUS_SUCCESS || hctx->allocated ||
+            mock_queue_output_calls != 1) {
+            fprintf(stderr,
+                    "decoder result test teardown failed: result=0x%x status=%d queues=%d\n",
+                    cases[i].result, destroy_status, mock_queue_output_calls);
+            passed = 0;
+        }
+        pthread_mutex_destroy(&drv.mutex);
+        if (!passed)
+            break;
+    }
+
+    char watchdog_path[128];
+    if (hobot_watchdog_path_for_pid(watchdog_path, sizeof(watchdog_path),
+                                    (int)getpid()))
+        remove(watchdog_path);
+    mock_decode_result = HOBOT_DECODE_RESULT_SUCCESS;
+    mock_dequeue_result = 0;
+    mock_dequeue_output_invalid = 0;
+    mock_err_mb = 0;
+    mock_queue_output_result = 0;
+    mock_stop_result = 0;
+    mock_release_result = 0;
+    return passed;
 }
 
 static int test_buffer_size_overflow_rejected(void)
@@ -6449,6 +11173,69 @@ static int test_coded_buffer_honors_requested_capacity(void)
     return 1;
 }
 
+static int test_legacy_surface_attribute_query(void)
+{
+    struct VADriverVTable vtable = {0};
+    struct VADriverContext va_ctx = {0};
+    va_ctx.vtable = &vtable;
+    int saved_open_result = mock_mem_module_open_result;
+    int saved_close_result = mock_mem_module_close_result;
+    mock_mem_module_open_result = 0;
+    mock_mem_module_close_result = 0;
+    VAStatus init_status = __vaDriverInit_1_0(&va_ctx);
+    if (init_status != VA_STATUS_SUCCESS || !va_ctx.pDriverData ||
+        !vtable.vaGetSurfaceAttributes) {
+        mock_mem_module_open_result = saved_open_result;
+        mock_mem_module_close_result = saved_close_result;
+        return 0;
+    }
+    HobotDriverData *drv = (HobotDriverData *)va_ctx.pDriverData;
+    drv->configs[1].allocated = 1;
+    drv->configs[1].profile = VAProfileHEVCMain;
+    drv->configs[1].entrypoint = VAEntrypointVLD;
+
+    VASurfaceAttrib attrs[7] = {0};
+    VAStatus status = vtable.vaGetSurfaceAttributes(&va_ctx, 1, attrs, 7);
+    int passed = status == VA_STATUS_SUCCESS &&
+        attrs[0].type == VASurfaceAttribPixelFormat &&
+        attrs[0].flags == (VA_SURFACE_ATTRIB_GETTABLE | VA_SURFACE_ATTRIB_SETTABLE) &&
+        attrs[0].value.type == VAGenericValueTypeInteger &&
+        attrs[0].value.value.i == (int)VA_FOURCC_NV12 &&
+        attrs[1].type == VASurfaceAttribMemoryType &&
+        attrs[1].value.value.i == (VA_SURFACE_ATTRIB_MEM_TYPE_VA |
+                                   VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2) &&
+        attrs[2].type == VASurfaceAttribExternalBufferDescriptor &&
+        attrs[2].flags == VA_SURFACE_ATTRIB_SETTABLE &&
+        attrs[2].value.type == VAGenericValueTypePointer &&
+        attrs[2].value.value.p == NULL &&
+        attrs[3].type == VASurfaceAttribMinWidth &&
+        attrs[3].value.value.i == 64 &&
+        attrs[4].type == VASurfaceAttribMinHeight &&
+        attrs[4].value.value.i == 64 &&
+        attrs[5].type == VASurfaceAttribMaxWidth &&
+        attrs[5].value.value.i == 8192 &&
+        attrs[6].type == VASurfaceAttribMaxHeight &&
+        attrs[6].value.value.i == 4096;
+
+    if (vtable.vaGetSurfaceAttributes(&va_ctx, 1, attrs, 6) !=
+            VA_STATUS_ERROR_MAX_NUM_EXCEEDED ||
+        vtable.vaGetSurfaceAttributes(&va_ctx, 2, attrs, 7) !=
+            VA_STATUS_ERROR_INVALID_CONFIG ||
+        vtable.vaGetSurfaceAttributes(&va_ctx, 1, NULL, 7) !=
+            VA_STATUS_SUCCESS)
+        passed = 0;
+
+    VAStatus terminate_status = vtable.vaTerminate(&va_ctx);
+    if (terminate_status != VA_STATUS_SUCCESS || va_ctx.pDriverData != NULL)
+        passed = 0;
+    if (!passed)
+        fprintf(stderr, "legacy surface-attribute vtable query failed: init=%d query=%d terminate=%d\n",
+                init_status, status, terminate_status);
+    mock_mem_module_open_result = saved_open_result;
+    mock_mem_module_close_result = saved_close_result;
+    return passed;
+}
+
 static int test_unsupported_va_operations_report_status(void)
 {
     HobotDriverData drv = {0};
@@ -6469,12 +11256,51 @@ static int test_unsupported_va_operations_report_status(void)
     }
 
     VASubpictureID subpicture = 0;
+    VASurfaceID subpicture_target = 1;
     if (hobot_vaCreateSubpicture(&va_ctx, 1, &subpicture) !=
             VA_STATUS_ERROR_UNIMPLEMENTED || subpicture != VA_INVALID_ID ||
         hobot_vaDestroySubpicture(&va_ctx, 1) != VA_STATUS_ERROR_UNIMPLEMENTED ||
         hobot_vaSetSubpictureImage(&va_ctx, 1, 1) != VA_STATUS_ERROR_UNIMPLEMENTED ||
+        hobot_vaSetSubpictureChromakey(&va_ctx, 1, 0, 0, 0) !=
+            VA_STATUS_ERROR_UNIMPLEMENTED ||
         hobot_vaSetSubpictureGlobalAlpha(&va_ctx, 1, 1.0f) != VA_STATUS_ERROR_UNIMPLEMENTED) {
         fprintf(stderr, "unsupported subpicture operation reported success\n");
+        pthread_mutex_destroy(&drv.mutex);
+        return 0;
+    }
+    if (hobot_vaAssociateSubpicture(&va_ctx, 1, &subpicture_target, 1,
+                                    0, 0, 2, 2, 0, 0, 2, 2, 0) !=
+            VA_STATUS_ERROR_UNIMPLEMENTED ||
+        hobot_vaDeassociateSubpicture(&va_ctx, 1, &subpicture_target, 1) !=
+            VA_STATUS_ERROR_UNIMPLEMENTED) {
+        fprintf(stderr, "unsupported subpicture association reported success\n");
+        pthread_mutex_destroy(&drv.mutex);
+        return 0;
+    }
+
+    VABufferInfo buffer_info = {0};
+    VAMFContextID mf_context = 0;
+    VAContextID mf_context_id = 1;
+    unsigned int processing_rate = 99;
+    VACopyObject copy_src = {0};
+    VACopyObject copy_dst = {0};
+    VACopyOption copy_option = {0};
+    drv.configs[1].allocated = 1;
+    if (hobot_vaAcquireBufferHandle(&va_ctx, 1, &buffer_info) !=
+            VA_STATUS_ERROR_INVALID_BUFFER ||
+        hobot_vaReleaseBufferHandle(&va_ctx, 1) !=
+            VA_STATUS_ERROR_INVALID_BUFFER ||
+        hobot_vaCreateMFContext(&va_ctx, &mf_context) !=
+            VA_STATUS_ERROR_UNIMPLEMENTED || mf_context != VA_INVALID_ID ||
+        hobot_vaMFAddContext(&va_ctx, 1, 1) != VA_STATUS_ERROR_UNIMPLEMENTED ||
+        hobot_vaMFReleaseContext(&va_ctx, 1, 1) != VA_STATUS_ERROR_UNIMPLEMENTED ||
+        hobot_vaMFSubmit(&va_ctx, 1, &mf_context_id, 1) !=
+            VA_STATUS_ERROR_UNIMPLEMENTED ||
+        hobot_vaQueryProcessingRate(&va_ctx, 1, NULL, &processing_rate) !=
+            VA_STATUS_ERROR_UNIMPLEMENTED || processing_rate != 0 ||
+        hobot_vaCopy(&va_ctx, &copy_dst, &copy_src, copy_option) !=
+            VA_STATUS_ERROR_UNIMPLEMENTED) {
+        fprintf(stderr, "unsupported extension callback contract failed\n");
         pthread_mutex_destroy(&drv.mutex);
         return 0;
     }
@@ -6499,6 +11325,23 @@ static int test_unsupported_va_operations_report_status(void)
                            NULL, 0, 0) != VA_STATUS_ERROR_INVALID_SURFACE ||
         hobot_vaSetImagePalette(&va_ctx, 1, NULL) != VA_STATUS_ERROR_UNIMPLEMENTED) {
         fprintf(stderr, "unsupported render/palette operation reported success\n");
+        pthread_mutex_destroy(&drv.mutex);
+        return 0;
+    }
+
+    drv.buffers[2] = (HobotBuffer){
+        .id = 2,
+        .allocated = 1,
+        .type = VAEncCodedBufferType,
+        .size = 32,
+        .capacity = 32,
+        .element_size = 1,
+        .num_elements = 32
+    };
+    if (hobot_vaBufferSetNumElements(&va_ctx, 2, 16) !=
+            VA_STATUS_ERROR_UNIMPLEMENTED ||
+        drv.buffers[2].size != 32 || drv.buffers[2].num_elements != 32) {
+        fprintf(stderr, "coded-buffer element resize changed fixed capacity\n");
         pthread_mutex_destroy(&drv.mutex);
         return 0;
     }
@@ -6938,7 +11781,9 @@ static int test_put_image_lazily_allocates_and_uploads_dma_surface(void)
     if (passed) {
         status = hobot_vaDeriveImage(&va_ctx, 1, &derived);
         passed = status == VA_STATUS_SUCCESS && derived.image_id > 0 &&
-                 drv.buffers[derived.buf].data == surf->raw_data;
+                 drv.buffers[derived.buf].data == mock_graph_data &&
+                 derived.offsets[1] == WIDTH * HEIGHT &&
+                 derived.data_size == DATA_SIZE && surf->lock_count == 1;
         if (passed)
             passed = hobot_vaDestroyImage(&va_ctx, derived.image_id) == VA_STATUS_SUCCESS;
     }
@@ -7035,6 +11880,22 @@ static int test_put_image_recycles_decoded_surface_before_upload(void)
                  ((uint8_t *)surf->raw_data)[Y_SIZE] == 140 &&
                  ((uint8_t *)surf->raw_data)[Y_SIZE + WIDTH + 2] == 60 &&
                  ((uint8_t *)surf->raw_data)[Y_SIZE + WIDTH + 3] == 70;
+
+    surf->has_decoded_frame = 1;
+    surf->output_context_id = 2;
+    surf->vpu_out_buf.vframe_buf.phy_ptr[0] = 0;
+    surf->vpu_out_buf.vframe_buf.size = DATA_SIZE;
+    surf->vpu_out_buf.vframe_buf.stride = WIDTH;
+    surf->vpu_out_buf.vframe_buf.vstride = HEIGHT;
+    surf->vpu_out_buf.vframe_buf.vir_ptr[0] = mock_graph_data;
+    surf->vpu_out_buf.vframe_buf.vir_ptr[1] = mock_graph_data + Y_SIZE;
+    surf->vpu_out_buf.vframe_buf.compSize[0] = Y_SIZE;
+    surf->vpu_out_buf.vframe_buf.compSize[1] = Y_SIZE / 2;
+    surf->raw_data_valid = 0;
+    status = hobot_vaPutImage(&va_ctx, 1, 1, 0, 0, 2, 2, 2, 2, 2, 2);
+    passed = passed && status == VA_STATUS_SUCCESS && mock_queue_output_calls == 3 &&
+             recycled_output_count == 1 && !surf->has_decoded_frame &&
+             surf->output_context_id == 0 && surf->raw_data_dirty;
     if (surf->raw_data)
         free(surf->raw_data);
     pthread_mutex_destroy(&drv.mutex);
@@ -7301,6 +12162,7 @@ static int test_config_capabilities_match_encoder(void)
         { .type = VAConfigAttribRateControl },
         { .type = VAConfigAttribEncPackedHeaders },
         { .type = VAConfigAttribEncMaxRefFrames },
+        { .type = VAConfigAttribPredictionDirection },
         { .type = VAConfigAttribEncMaxSlices },
         { .type = VAConfigAttribEncSliceStructure },
         { .type = VAConfigAttribEncQualityRange }
@@ -7309,13 +12171,17 @@ static int test_config_capabilities_match_encoder(void)
                                                    VAEntrypointEncSlice,
                                                    attrs, sizeof(attrs) / sizeof(attrs[0]));
     if (status != VA_STATUS_SUCCESS || attrs[0].value != VA_RT_FORMAT_YUV420 ||
-        attrs[1].value != VA_RC_CBR || attrs[2].value != VA_ENC_PACKED_HEADER_NONE ||
-        attrs[3].value != 1 || attrs[4].value != 1 ||
-        attrs[5].value != VA_ATTRIB_NOT_SUPPORTED ||
-        attrs[6].value != VA_ATTRIB_NOT_SUPPORTED) {
-        fprintf(stderr, "H.264 encoder capabilities are inaccurate: status=%d rt=%u rc=%u packed=%u refs=%u max_slices=%u slice=%u quality=%u\n",
+        attrs[1].value != (VA_RC_CBR | VA_RC_VBR | VA_RC_CQP) ||
+        attrs[2].value != VA_ENC_PACKED_HEADER_NONE ||
+        attrs[3].value != 1 ||
+        attrs[4].value != VA_PREDICTION_DIRECTION_PREVIOUS ||
+        attrs[5].value != 1 ||
+        attrs[6].value != VA_ATTRIB_NOT_SUPPORTED ||
+        attrs[7].value != VA_ATTRIB_NOT_SUPPORTED) {
+        fprintf(stderr, "H.264 encoder capabilities are inaccurate: status=%d rt=%u rc=%u packed=%u refs=%u direction=%u max_slices=%u slice=%u quality=%u\n",
                 status, attrs[0].value, attrs[1].value, attrs[2].value,
-                attrs[3].value, attrs[4].value, attrs[5].value, attrs[6].value);
+                attrs[3].value, attrs[4].value, attrs[5].value, attrs[6].value,
+                attrs[7].value);
         pthread_mutex_destroy(&drv.mutex);
         return 0;
     }
@@ -7326,8 +12192,8 @@ static int test_config_capabilities_match_encoder(void)
     };
     status = hobot_vaGetConfigAttributes(&va_ctx, VAProfileHEVCMain,
                                           VAEntrypointVLD, hevc_limits, 2);
-    if (status != VA_STATUS_SUCCESS || hevc_limits[0].value != 3840 ||
-        hevc_limits[1].value != 2160) {
+    if (status != VA_STATUS_SUCCESS || hevc_limits[0].value != 8192 ||
+        hevc_limits[1].value != 4096) {
         fprintf(stderr, "HEVC picture-size capabilities are inaccurate: status=%d width=%u height=%u\n",
                 status, hevc_limits[0].value, hevc_limits[1].value);
         pthread_mutex_destroy(&drv.mutex);
@@ -7345,7 +12211,7 @@ static int test_config_capabilities_match_encoder(void)
         pthread_mutex_destroy(&drv.mutex);
         return 0;
     }
-    VASurfaceAttrib hevc_surface_attrs[6] = {0};
+    VASurfaceAttrib hevc_surface_attrs[7] = {0};
     unsigned int hevc_surface_attr_count =
         sizeof(hevc_surface_attrs) / sizeof(hevc_surface_attrs[0]);
     status = hobot_vaQuerySurfaceAttributes(&va_ctx, hevc_vld_config,
@@ -7361,8 +12227,8 @@ static int test_config_capabilities_match_encoder(void)
     }
     VAStatus hevc_vld_destroy_status =
         hobot_vaDestroyConfig(&va_ctx, hevc_vld_config);
-    if (status != VA_STATUS_SUCCESS || hevc_surface_max_width != 3840 ||
-        hevc_surface_max_height != 2160 ||
+    if (status != VA_STATUS_SUCCESS || hevc_surface_max_width != 8192 ||
+        hevc_surface_max_height != 4096 ||
         hevc_vld_destroy_status != VA_STATUS_SUCCESS) {
         fprintf(stderr, "HEVC surface-size capabilities mismatch: status=%d width=%u height=%u\n",
                 status, hevc_surface_max_width, hevc_surface_max_height);
@@ -7381,7 +12247,7 @@ static int test_config_capabilities_match_encoder(void)
         pthread_mutex_destroy(&drv.mutex);
         return 0;
     }
-    VASurfaceAttrib h264_surface_attrs[6] = {0};
+    VASurfaceAttrib h264_surface_attrs[7] = {0};
     unsigned int h264_surface_attr_count =
         sizeof(h264_surface_attrs) / sizeof(h264_surface_attrs[0]);
     status = hobot_vaQuerySurfaceAttributes(&va_ctx, h264_vld_config,
@@ -7416,7 +12282,8 @@ static int test_config_capabilities_match_encoder(void)
         { .type = VAConfigAttribRateControl },
         { .type = VAConfigAttribEncMaxRefFrames },
         { .type = VAConfigAttribEncMaxSlices },
-        { .type = VAConfigAttribEncPackedHeaders }
+        { .type = VAConfigAttribEncPackedHeaders },
+        { .type = VAConfigAttribPredictionDirection }
     };
     VAStatus hevc_attr_status = hobot_vaGetConfigAttributes(
         &va_ctx, VAProfileHEVCMain, VAEntrypointEncSlice,
@@ -7426,14 +12293,15 @@ static int test_config_capabilities_match_encoder(void)
         hevc_entrypoints[1] != VAEntrypointEncSlice ||
         hevc_attr_status != VA_STATUS_SUCCESS ||
         hevc_encode_attrs[0].value != VA_RT_FORMAT_YUV420 ||
-        hevc_encode_attrs[1].value != VA_RC_CBR ||
+        hevc_encode_attrs[1].value != (VA_RC_CBR | VA_RC_VBR | VA_RC_CQP) ||
         hevc_encode_attrs[2].value != 1 || hevc_encode_attrs[3].value != 1 ||
-        hevc_encode_attrs[4].value != VA_ENC_PACKED_HEADER_NONE) {
-        fprintf(stderr, "HEVC Main encode capabilities are inaccurate: entrypoints=%d status=%d/%d attrs=%u/%u/%u/%u/%u\n",
+        hevc_encode_attrs[4].value != VA_ENC_PACKED_HEADER_NONE ||
+        hevc_encode_attrs[5].value != VA_PREDICTION_DIRECTION_PREVIOUS) {
+        fprintf(stderr, "HEVC Main encode capabilities are inaccurate: entrypoints=%d status=%d/%d attrs=%u/%u/%u/%u/%u/%u\n",
                 hevc_entrypoint_count, status, hevc_attr_status,
                 hevc_encode_attrs[0].value, hevc_encode_attrs[1].value,
                 hevc_encode_attrs[2].value, hevc_encode_attrs[3].value,
-                hevc_encode_attrs[4].value);
+                hevc_encode_attrs[4].value, hevc_encode_attrs[5].value);
         pthread_mutex_destroy(&drv.mutex);
         return 0;
     }
@@ -7488,6 +12356,35 @@ static int test_config_capabilities_match_encoder(void)
         fprintf(stderr, "HEVC config query did not return its stored attributes: status=%d profile=%d entrypoint=%d count=%d\n",
                 status, queried_config_profile, queried_config_entrypoint,
                 queried_config_attr_count);
+        pthread_mutex_destroy(&drv.mutex);
+        return 0;
+    }
+
+    VAConfigAttrib hevc_cqp_create_attrs[] = {
+        { .type = VAConfigAttribRTFormat, .value = VA_RT_FORMAT_YUV420 },
+        { .type = VAConfigAttribRateControl, .value = VA_RC_CQP }
+    };
+    VAConfigID hevc_cqp_config = VA_INVALID_ID;
+    if (hobot_vaCreateConfig(&va_ctx, VAProfileHEVCMain,
+                             VAEntrypointEncSlice, hevc_cqp_create_attrs, 2,
+                             &hevc_cqp_config) != VA_STATUS_SUCCESS ||
+        hevc_cqp_config == VA_INVALID_ID ||
+        hobot_vaQueryConfigAttributes(&va_ctx, hevc_cqp_config,
+                                      &queried_config_profile,
+                                      &queried_config_entrypoint,
+                                      queried_config_attrs,
+                                      &queried_config_attr_count) !=
+            VA_STATUS_SUCCESS ||
+        queried_config_profile != VAProfileHEVCMain ||
+        queried_config_entrypoint != VAEntrypointEncSlice ||
+        queried_config_attr_count != 2 ||
+        queried_config_attrs[0].type != VAConfigAttribRTFormat ||
+        queried_config_attrs[0].value != VA_RT_FORMAT_YUV420 ||
+        queried_config_attrs[1].type != VAConfigAttribRateControl ||
+        queried_config_attrs[1].value != VA_RC_CQP ||
+        hobot_vaDestroyConfig(&va_ctx, hevc_cqp_config) !=
+            VA_STATUS_SUCCESS) {
+        fprintf(stderr, "HEVC Main CQP encode config create/query/destroy failed\n");
         pthread_mutex_destroy(&drv.mutex);
         return 0;
     }
@@ -7547,11 +12444,17 @@ static int test_config_capabilities_match_encoder(void)
         { .type = VAConfigAttribRateControl, .value = VA_RC_CBR }
     };
     VAConfigID cb_encoder_config = VA_INVALID_ID;
-    if (hobot_vaGetConfigAttributes(&va_ctx, VAProfileH264ConstrainedBaseline,
-                                    VAEntrypointEncSlice, cb_encoder_attrs, 2) !=
-            VA_STATUS_SUCCESS ||
+    status = hobot_vaGetConfigAttributes(&va_ctx, VAProfileH264ConstrainedBaseline,
+                                          VAEntrypointEncSlice, cb_encoder_attrs, 2);
+    if (status != VA_STATUS_SUCCESS ||
         cb_encoder_attrs[0].value != VA_RT_FORMAT_YUV420 ||
-        cb_encoder_attrs[1].value != VA_RC_CBR ||
+        cb_encoder_attrs[1].value != (VA_RC_CBR | VA_RC_VBR | VA_RC_CQP)) {
+        fprintf(stderr, "Constrained Baseline encoder capabilities are inaccurate\n");
+        pthread_mutex_destroy(&drv.mutex);
+        return 0;
+    }
+    cb_encoder_attrs[1].value = VA_RC_CBR;
+    if (
         hobot_vaCreateConfig(&va_ctx, VAProfileH264ConstrainedBaseline,
                              VAEntrypointEncSlice, cb_encoder_attrs, 2,
                              &cb_encoder_config) != VA_STATUS_SUCCESS ||
@@ -7599,20 +12502,73 @@ static int test_config_capabilities_match_encoder(void)
     };
     status = hobot_vaGetConfigAttributes(&va_ctx, VAProfileJPEGBaseline,
                                           VAEntrypointVLD, jpeg_decode_attrs, 2);
-    VAConfigID jpeg_decode_config = VA_INVALID_ID;
+    const unsigned int jpeg_rotation_mask =
+        (1u << (VA_ROTATION_270 + 1u)) - 1u;
     if (status != VA_STATUS_SUCCESS ||
         jpeg_decode_attrs[0].value != VA_RT_FORMAT_YUV420 ||
-        jpeg_decode_attrs[1].value != (1u << VA_ROTATION_NONE) ||
-        hobot_vaCreateConfig(&va_ctx, VAProfileJPEGBaseline, VAEntrypointVLD,
-                             jpeg_decode_attrs, 2, &jpeg_decode_config) !=
-            VA_STATUS_SUCCESS || jpeg_decode_config == VA_INVALID_ID ||
-        !drv.configs[jpeg_decode_config].allocated ||
-        drv.configs[jpeg_decode_config].entrypoint != VAEntrypointVLD ||
-        hobot_vaDestroyConfig(&va_ctx, jpeg_decode_config) != VA_STATUS_SUCCESS) {
-        fprintf(stderr, "supported JPEG VLD config rejected: status=%d rt=%u decode=%u\n",
+        jpeg_decode_attrs[1].value != jpeg_rotation_mask) {
+        fprintf(stderr, "JPEG VLD capabilities are inaccurate: status=%d rt=%u decode=%u\n",
                 status, jpeg_decode_attrs[0].value, jpeg_decode_attrs[1].value);
         pthread_mutex_destroy(&drv.mutex);
         return 0;
+    }
+    VAConfigID read_only_jpeg_config = VA_INVALID_ID;
+    if (hobot_vaCreateConfig(&va_ctx, VAProfileJPEGBaseline,
+                             VAEntrypointVLD, &jpeg_decode_attrs[1], 1,
+                             &read_only_jpeg_config) !=
+            VA_STATUS_ERROR_ATTR_NOT_SUPPORTED ||
+        read_only_jpeg_config != VA_INVALID_ID) {
+        fprintf(stderr, "read-only JPEG capability was accepted as a config input\n");
+        pthread_mutex_destroy(&drv.mutex);
+        return 0;
+    }
+    VAConfigID jpeg_decode_config = VA_INVALID_ID;
+    if (hobot_vaCreateConfig(&va_ctx, VAProfileJPEGBaseline,
+                             VAEntrypointVLD, &jpeg_decode_attrs[0], 1,
+                             &jpeg_decode_config) != VA_STATUS_SUCCESS ||
+        jpeg_decode_config == VA_INVALID_ID ||
+        !drv.configs[jpeg_decode_config].allocated ||
+        drv.configs[jpeg_decode_config].entrypoint != VAEntrypointVLD ||
+        hobot_vaDestroyConfig(&va_ctx, jpeg_decode_config) != VA_STATUS_SUCCESS) {
+        fprintf(stderr, "JPEG VLD config rejected its writable RT format\n");
+        pthread_mutex_destroy(&drv.mutex);
+        return 0;
+    }
+    static const struct {
+        VAProfile profile;
+        VAEntrypoint entrypoint;
+        VAConfigAttrib attrib;
+    } read_only_attributes[] = {
+        {VAProfileJPEGBaseline, VAEntrypointVLD,
+         {.type = VAConfigAttribDecJPEG, .value = 0xf}},
+        {VAProfileH264High, VAEntrypointEncSlice,
+         {.type = VAConfigAttribEncMaxRefFrames, .value = 1}},
+        {VAProfileH264High, VAEntrypointEncSlice,
+         {.type = VAConfigAttribEncMaxSlices, .value = 1}},
+        {VAProfileH264High, VAEntrypointEncSlice,
+         {.type = VAConfigAttribPredictionDirection,
+          .value = VA_PREDICTION_DIRECTION_PREVIOUS}},
+        {VAProfileH264High, VAEntrypointEncSlice,
+         {.type = VAConfigAttribEncQuantization,
+          .value = VA_ENC_QUANTIZATION_NONE}},
+        {VAProfileH264High, VAEntrypointEncSlice,
+         {.type = VAConfigAttribEncIntraRefresh,
+          .value = VA_ENC_INTRA_REFRESH_NONE}}
+    };
+    for (size_t i = 0;
+         i < sizeof(read_only_attributes) / sizeof(read_only_attributes[0]); i++) {
+        VAConfigID read_only_config = VA_INVALID_ID;
+        VAConfigAttrib input = read_only_attributes[i].attrib;
+        if (hobot_vaCreateConfig(&va_ctx, read_only_attributes[i].profile,
+                                 read_only_attributes[i].entrypoint,
+                                 &input, 1, &read_only_config) !=
+                VA_STATUS_ERROR_ATTR_NOT_SUPPORTED ||
+            read_only_config != VA_INVALID_ID) {
+            fprintf(stderr, "read-only config attribute %d was accepted\n",
+                    read_only_attributes[i].attrib.type);
+            pthread_mutex_destroy(&drv.mutex);
+            return 0;
+        }
     }
 
     VAConfigAttrib create_attrs[] = {
@@ -7634,11 +12590,36 @@ static int test_config_capabilities_match_encoder(void)
         return 0;
     }
 
+    create_attrs[1].value = VA_RC_CQP;
+    status = hobot_vaCreateConfig(&va_ctx, VAProfileH264High,
+                                  VAEntrypointEncSlice, create_attrs, 2,
+                                  &config);
+    if (status != VA_STATUS_SUCCESS || !drv.configs[config].allocated ||
+        drv.configs[config].rate_control != VA_RC_CQP ||
+        hobot_vaDestroyConfig(&va_ctx, config) != VA_STATUS_SUCCESS) {
+        fprintf(stderr, "supported H.264 CQP config rejected: status=%d id=%u\n",
+                status, config);
+        pthread_mutex_destroy(&drv.mutex);
+        return 0;
+    }
+
     create_attrs[1].value = VA_RC_VBR;
     status = hobot_vaCreateConfig(&va_ctx, VAProfileH264High, VAEntrypointEncSlice,
                                   create_attrs, 2, &config);
+    if (status != VA_STATUS_SUCCESS || config == VA_INVALID_ID ||
+        !drv.configs[config].allocated || drv.configs[config].rate_control != VA_RC_VBR ||
+        hobot_vaDestroyConfig(&va_ctx, config) != VA_STATUS_SUCCESS) {
+        fprintf(stderr, "supported H.264 VBR config rejected: status=%d id=%u\n",
+                status, config);
+        pthread_mutex_destroy(&drv.mutex);
+        return 0;
+    }
+
+    create_attrs[1].value = VA_RC_AVBR;
+    status = hobot_vaCreateConfig(&va_ctx, VAProfileH264High, VAEntrypointEncSlice,
+                                  create_attrs, 2, &config);
     if (status != VA_STATUS_ERROR_ATTR_NOT_SUPPORTED || drv.configs[1].allocated) {
-        fprintf(stderr, "unsupported H.264 VBR config accepted: status=%d\n", status);
+        fprintf(stderr, "unsupported H.264 AVBR config accepted: status=%d\n", status);
         pthread_mutex_destroy(&drv.mutex);
         return 0;
     }
@@ -7673,13 +12654,26 @@ enum {
     SYNC_ISOLATION_SYNC,
     SYNC_ISOLATION_SYNC_WAITER,
     SYNC_ISOLATION_QUERY,
-    SYNC_ISOLATION_BEGIN
+    SYNC_ISOLATION_BEGIN,
+    SYNC_ISOLATION_SYNC2,
+    SYNC_ISOLATION_SYNC_BUFFER
 };
 
 static void *sync_isolation_worker(void *opaque)
 {
     SyncIsolationWorker *worker = opaque;
-    if (worker->operation == SYNC_ISOLATION_SYNC ||
+    pthread_mutex_lock(&mock_dequeue_gate_mutex);
+    worker->started = 1;
+    pthread_cond_broadcast(&mock_dequeue_gate_cond);
+    pthread_mutex_unlock(&mock_dequeue_gate_mutex);
+
+    if (worker->operation == SYNC_ISOLATION_SYNC2) {
+        worker->status = hobot_vaSyncSurface2(worker->ctx, worker->surface,
+                                               worker->timeout_ns);
+    } else if (worker->operation == SYNC_ISOLATION_SYNC_BUFFER) {
+        worker->status = hobot_vaSyncBuffer(worker->ctx, worker->buffer,
+                                            worker->timeout_ns);
+    } else if (worker->operation == SYNC_ISOLATION_SYNC ||
         worker->operation == SYNC_ISOLATION_SYNC_WAITER) {
         worker->status = hobot_vaSyncSurface(worker->ctx, worker->surface);
     } else if (worker->operation == SYNC_ISOLATION_QUERY) {
@@ -7847,6 +12841,254 @@ release_and_join:
     return passed;
 }
 
+static int test_va_sync_surface2_timeout_and_completion(void)
+{
+    HobotDriverData drv = {0};
+    struct VADriverContext va_ctx = {0};
+    if (pthread_mutex_init(&drv.mutex, NULL) != 0)
+        return 0;
+    va_ctx.pDriverData = &drv;
+
+    HobotContext *hctx = &drv.contexts[1];
+    hctx->allocated = 1;
+    hctx->vpu_running = 1;
+    hctx->submitted_surfaces[hctx->sub_tail++] = 1;
+    drv.surfaces[1].allocated = 1;
+    drv.surfaces[1].context_id = 1;
+    drv.surfaces[1].decode_pending = 1;
+
+    mock_dequeue_result = 0;
+    mock_dequeue_output_invalid = 0;
+    mock_err_mb = 0;
+    mock_dequeue_output_calls = 0;
+    mock_queue_output_calls = 0;
+    pthread_mutex_lock(&mock_dequeue_gate_mutex);
+    mock_dequeue_block_enabled = 0;
+    mock_dequeue_respect_timeout = 0;
+    mock_dequeue_entered = 0;
+    mock_dequeue_release = 0;
+    pthread_mutex_unlock(&mock_dequeue_gate_mutex);
+
+    VAStatus status = hobot_vaSyncSurface2(&va_ctx, 1, 0);
+    int zero_timeout_pending = status == VA_STATUS_ERROR_TIMEDOUT &&
+        drv.surfaces[1].decode_pending && !hctx->sync_active &&
+        mock_dequeue_output_calls == 0;
+
+    pthread_mutex_lock(&mock_dequeue_gate_mutex);
+    mock_dequeue_block_enabled = 1;
+    mock_dequeue_respect_timeout = 1;
+    pthread_mutex_unlock(&mock_dequeue_gate_mutex);
+    struct timespec start;
+    struct timespec end;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    status = hobot_vaSyncSurface2(&va_ctx, 1, 20000000ULL);
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    int64_t elapsed_ns = ((int64_t)end.tv_sec - (int64_t)start.tv_sec) *
+                         1000000000LL + end.tv_nsec - start.tv_nsec;
+    int dequeue_timeout = status == VA_STATUS_ERROR_TIMEDOUT &&
+        elapsed_ns >= 10000000LL && elapsed_ns < 500000000LL &&
+        drv.surfaces[1].decode_pending && !hctx->sync_active &&
+        mock_dequeue_output_calls == 1;
+
+    pthread_mutex_lock(&mock_dequeue_gate_mutex);
+    mock_dequeue_block_enabled = 0;
+    mock_dequeue_respect_timeout = 0;
+    pthread_mutex_unlock(&mock_dequeue_gate_mutex);
+    mock_dequeue_result = 0;
+    status = hobot_vaSyncSurface2(&va_ctx, 1, 1000000000ULL);
+    int completed = status == VA_STATUS_SUCCESS &&
+        drv.surfaces[1].has_decoded_frame && !drv.surfaces[1].decode_pending &&
+        !hctx->sync_active && mock_dequeue_output_calls == 2;
+    status = hobot_vaSyncSurface2(&va_ctx, 1, 0);
+    int ready_zero_timeout = status == VA_STATUS_SUCCESS &&
+        mock_dequeue_output_calls == 2;
+
+    drv.surfaces[1].has_decoded_frame = 0;
+    drv.surfaces[1].dma_fd = -1;
+    drv.surfaces[1].decode_pending = 1;
+    drv.surfaces[1].decode_error = 0;
+    drv.surfaces[2].allocated = 1;
+    drv.surfaces[2].context_id = 1;
+    drv.surfaces[2].has_decoded_frame = 1;
+    drv.surfaces[2].output_context_id = 1;
+    drv.surfaces[2].dma_fd = 7;
+    drv.surfaces[2].vpu_out_buf.vframe_buf.phy_ptr[0] = 1;
+    drv.surfaces[2].vpu_out_buf.vframe_buf.size = sizeof(mock_frame);
+    drv.surfaces[2].vpu_out_buf.vframe_buf.fd[0] = 7;
+    hctx->sub_head = 0;
+    hctx->sub_tail = 2;
+    hctx->submitted_surfaces[0] = 2;
+    hctx->submitted_surfaces[1] = 1;
+    mock_queue_output_calls = 0;
+    status = hobot_vaSyncSurface2(&va_ctx, 1, 0);
+    int recycle_timeout_preserves_ownership =
+        status == VA_STATUS_ERROR_TIMEDOUT && drv.surfaces[1].decode_pending &&
+        drv.surfaces[2].has_decoded_frame &&
+        drv.surfaces[2].vpu_out_buf.vframe_buf.phy_ptr[0] == 1 &&
+        mock_queue_output_calls == 0 && !hctx->sync_active;
+
+    VAStatus invalid_surface = hobot_vaSyncSurface2(
+        &va_ctx, VA_INVALID_SURFACE, VA_TIMEOUT_INFINITE);
+
+    int passed = zero_timeout_pending && dequeue_timeout && completed &&
+                 ready_zero_timeout && recycle_timeout_preserves_ownership &&
+                 invalid_surface == VA_STATUS_ERROR_INVALID_SURFACE;
+    if (!passed)
+        fprintf(stderr, "vaSyncSurface2 timeout/completion failed: zero=%d dequeue=%d elapsed=%lld completed=%d ready=%d recycle=%d invalid=%d status=%d calls=%d\n",
+                zero_timeout_pending, dequeue_timeout,
+                (long long)elapsed_ns, completed, ready_zero_timeout,
+                recycle_timeout_preserves_ownership,
+                invalid_surface, status, mock_dequeue_output_calls);
+    if (drv.sync_cond_initialized)
+        pthread_cond_destroy(&drv.sync_cond);
+    pthread_mutex_destroy(&drv.mutex);
+    pthread_mutex_lock(&mock_dequeue_gate_mutex);
+    mock_dequeue_block_enabled = 0;
+    mock_dequeue_respect_timeout = 0;
+    mock_dequeue_entered = 0;
+    mock_dequeue_release = 0;
+    pthread_mutex_unlock(&mock_dequeue_gate_mutex);
+    return passed;
+}
+
+static int test_va_sync_surface2_mutex_timeout(void)
+{
+    HobotDriverData drv = {0};
+    struct VADriverContext va_ctx = {0};
+    if (pthread_mutex_init(&drv.mutex, NULL) != 0)
+        return 0;
+    va_ctx.pDriverData = &drv;
+    drv.surfaces[1].allocated = 1;
+    drv.surfaces[1].has_decoded_frame = 1;
+
+    SyncIsolationWorker worker = {
+        .ctx = &va_ctx,
+        .operation = SYNC_ISOLATION_SYNC2,
+        .surface = 1,
+        .status = VA_STATUS_ERROR_UNKNOWN,
+        .timeout_ns = 20000000ULL
+    };
+    pthread_t thread;
+    pthread_mutex_lock(&drv.mutex);
+    struct timespec start;
+    struct timespec end;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    int created = pthread_create(&thread, NULL, sync_isolation_worker, &worker) == 0;
+    int started = created && wait_for_gate_flag(&worker.started, 250);
+    int completed = started && wait_for_gate_flag(&worker.completed, 500);
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    pthread_mutex_unlock(&drv.mutex);
+    if (created)
+        pthread_join(thread, NULL);
+
+    int64_t elapsed_ns = ((int64_t)end.tv_sec - (int64_t)start.tv_sec) *
+                         1000000000LL + end.tv_nsec - start.tv_nsec;
+    int passed = started && completed &&
+                 worker.status == VA_STATUS_ERROR_TIMEDOUT &&
+                 elapsed_ns >= 10000000LL && elapsed_ns < 500000000LL;
+    if (!passed)
+        fprintf(stderr, "vaSyncSurface2 mutex timeout failed: created=%d started=%d completed=%d status=%d elapsed=%lld\n",
+                created, started, completed, worker.status,
+                (long long)elapsed_ns);
+    pthread_mutex_destroy(&drv.mutex);
+    return passed;
+}
+
+static int test_va_sync_buffer_contract(void)
+{
+    HobotDriverData drv = {0};
+    struct VADriverContext va_ctx = {0};
+    if (pthread_mutex_init(&drv.mutex, NULL) != 0)
+        return 0;
+    va_ctx.pDriverData = &drv;
+    drv.buffers[1].allocated = 1;
+    drv.buffers[1].id = 1;
+    drv.buffers[1].type = VAImageBufferType;
+    drv.buffers[2].allocated = 1;
+    drv.buffers[2].id = 2;
+    drv.buffers[2].type = VAEncCodedBufferType;
+
+    VAStatus ready_zero = hobot_vaSyncBuffer(&va_ctx, 1, 0);
+    VAStatus ready_infinite = hobot_vaSyncBuffer(&va_ctx, 2, VA_TIMEOUT_INFINITE);
+    VAStatus invalid = hobot_vaSyncBuffer(&va_ctx, VA_INVALID_ID, 0);
+    VAStatus out_of_range = hobot_vaSyncBuffer(&va_ctx, MAX_BUFFERS, 0);
+    pthread_mutex_destroy(&drv.mutex);
+
+    int passed = ready_zero == VA_STATUS_SUCCESS &&
+                 ready_infinite == VA_STATUS_SUCCESS &&
+                 invalid == VA_STATUS_ERROR_INVALID_BUFFER &&
+                 out_of_range == VA_STATUS_ERROR_INVALID_BUFFER;
+    if (!passed)
+        fprintf(stderr, "vaSyncBuffer validation failed: zero=%d infinite=%d invalid=%d range=%d\n",
+                ready_zero, ready_infinite, invalid, out_of_range);
+    return passed;
+}
+
+static int test_va_sync_buffer_mutex_timeout(void)
+{
+    HobotDriverData drv = {0};
+    struct VADriverContext va_ctx = {0};
+    if (pthread_mutex_init(&drv.mutex, NULL) != 0)
+        return 0;
+    va_ctx.pDriverData = &drv;
+    drv.buffers[1].allocated = 1;
+    drv.buffers[1].id = 1;
+
+    SyncIsolationWorker worker = {
+        .ctx = &va_ctx,
+        .operation = SYNC_ISOLATION_SYNC_BUFFER,
+        .buffer = 1,
+        .status = VA_STATUS_ERROR_UNKNOWN,
+        .timeout_ns = 20000000ULL
+    };
+    pthread_t thread;
+    pthread_mutex_lock(&drv.mutex);
+    struct timespec start;
+    struct timespec end;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    int created = pthread_create(&thread, NULL, sync_isolation_worker, &worker) == 0;
+    int started = created && wait_for_gate_flag(&worker.started, 250);
+    int completed = started && wait_for_gate_flag(&worker.completed, 500);
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    pthread_mutex_unlock(&drv.mutex);
+    if (created)
+        pthread_join(thread, NULL);
+
+    int64_t elapsed_ns = ((int64_t)end.tv_sec - (int64_t)start.tv_sec) *
+                         1000000000LL + end.tv_nsec - start.tv_nsec;
+    int finite_timeout = started && completed &&
+                         worker.status == VA_STATUS_ERROR_TIMEDOUT &&
+                         elapsed_ns >= 10000000LL && elapsed_ns < 500000000LL;
+
+    pthread_mutex_lock(&mock_dequeue_gate_mutex);
+    worker.started = 0;
+    worker.completed = 0;
+    pthread_mutex_unlock(&mock_dequeue_gate_mutex);
+    worker.status = VA_STATUS_ERROR_UNKNOWN;
+    worker.timeout_ns = 0;
+    pthread_mutex_lock(&drv.mutex);
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    created = pthread_create(&thread, NULL, sync_isolation_worker, &worker) == 0;
+    started = created && wait_for_gate_flag(&worker.started, 250);
+    completed = started && wait_for_gate_flag(&worker.completed, 500);
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    pthread_mutex_unlock(&drv.mutex);
+    if (created)
+        pthread_join(thread, NULL);
+    elapsed_ns = ((int64_t)end.tv_sec - (int64_t)start.tv_sec) *
+                 1000000000LL + end.tv_nsec - start.tv_nsec;
+    int zero_timeout = started && completed &&
+                       worker.status == VA_STATUS_ERROR_TIMEDOUT &&
+                       elapsed_ns >= 0 && elapsed_ns < 500000000LL;
+    int passed = finite_timeout && zero_timeout;
+    if (!passed)
+        fprintf(stderr, "vaSyncBuffer mutex timeout failed: finite=%d zero=%d status=%d elapsed=%lld\n",
+                finite_timeout, zero_timeout, worker.status,
+                (long long)elapsed_ns);
+    pthread_mutex_destroy(&drv.mutex);
+    return passed;
+}
+
 static void *buffer_stress_worker(void *opaque)
 {
     BufferStressWorker *worker = opaque;
@@ -7973,6 +13215,8 @@ static int test_h264_deferred_encoder_configuration(void)
     cropped_seq.picture_height_in_mbs = 23;
     cropped_seq.seq_fields.bits.chroma_format_idc = 1;
     cropped_seq.seq_fields.bits.frame_mbs_only_flag = 1;
+    cropped_seq.ip_period = 1;
+    cropped_seq.max_num_ref_frames = 1;
     cropped_seq.frame_cropping_flag = 1;
     cropped_seq.frame_crop_bottom_offset = 4;
     cropped_seq.level_idc = MC_H264_LEVEL4_1;
@@ -8090,6 +13334,7 @@ static int test_h264_deferred_encoder_configuration(void)
     mock_vui_get_calls = 0;
     mock_vui_set_calls = 0;
     mock_initialized_h264_profile = MC_H264_PROFILE_UNSPECIFIED;
+    mock_initialized_h264_gop_preset_idx = 0;
     memset(&mock_vui_config, 0, sizeof(mock_vui_config));
     memset(&mock_vui_set_config, 0, sizeof(mock_vui_set_config));
 
@@ -8098,6 +13343,7 @@ static int test_h264_deferred_encoder_configuration(void)
         mock_vui_get_calls != 1 || mock_vui_set_calls != 1 ||
         hctx.vpu_ctx.video_enc_params.h264_enc_config.h264_level != MC_H264_LEVEL4_1 ||
         mock_initialized_h264_profile != MC_H264_PROFILE_HP ||
+        mock_initialized_h264_gop_preset_idx != 9 ||
         hctx.vpu_ctx.video_enc_params.enable_user_pts != 0 ||
         mock_vui_set_config.h264_vui.video_signal_type_present_flag != 1 ||
         mock_vui_set_config.h264_vui.video_full_range_flag != 0 ||
@@ -8107,6 +13353,32 @@ static int test_h264_deferred_encoder_configuration(void)
         hctx.vpu_ctx.video_enc_params.crop_rect.width != 640 ||
         hctx.vpu_ctx.video_enc_params.crop_rect.height != 360) {
         fprintf(stderr, "deferred H.264 setup did not apply validated level/VUI parameters\n");
+        return 0;
+    }
+
+    HobotContext intra_ctx = {0};
+    intra_ctx.id = 11;
+    intra_ctx.width = 640;
+    intra_ctx.height = 368;
+    intra_ctx.profile = VAProfileH264High;
+    intra_ctx.encoder_init_deferred = 1;
+    intra_ctx.h264_sequence_valid = 1;
+    intra_ctx.h264_sequence = cropped_seq;
+    intra_ctx.h264_sequence.max_num_ref_frames = 0;
+    intra_ctx.vpu_ctx.codec_id = MEDIA_CODEC_ID_H264;
+    intra_ctx.vpu_ctx.encoder = 1;
+    intra_ctx.vpu_ctx.video_enc_params.rc_params.mode = MC_AV_RC_MODE_H264CBR;
+    mock_initialize_result = 0;
+    mock_configure_result = 0;
+    mock_start_result = 0;
+    mock_stop_result = 0;
+    mock_release_result = 0;
+    mock_vui_get_result = 0;
+    mock_vui_set_result = 0;
+    if (hobot_start_deferred_h264_encoder(&intra_ctx) != 0 ||
+        mock_initialized_h264_gop_preset_idx != 1 ||
+        intra_ctx.vpu_ctx.video_enc_params.gop_params.gop_preset_idx != 1) {
+        fprintf(stderr, "zero-reference H.264 sequence did not select all-intra GOP preset 1\n");
         return 0;
     }
 
@@ -8567,51 +13839,80 @@ int main(void)
         return 1;
     }
     init_status = init_vtable.vaTerminate(&init_ctx);
-    if (init_status != VA_STATUS_ERROR_OPERATION_FAILED || init_ctx.pDriverData ||
+    if (init_status != VA_STATUS_ERROR_OPERATION_FAILED || !init_ctx.pDriverData ||
         mock_mem_module_close_calls != 2) {
-        fprintf(stderr, "memory module close failure was not propagated after teardown: status=%d data=%p close=%d\n",
+        fprintf(stderr, "memory module close failure did not preserve retry state: status=%d data=%p close=%d\n",
                 init_status, init_ctx.pDriverData, mock_mem_module_close_calls);
         return 1;
     }
     mock_mem_module_close_result = 0;
+    init_status = init_vtable.vaTerminate(&init_ctx);
+    if (init_status != VA_STATUS_SUCCESS || init_ctx.pDriverData ||
+        mock_mem_module_close_calls != 3) {
+        fprintf(stderr, "memory module close retry did not finish teardown: status=%d data=%p close=%d\n",
+                init_status, init_ctx.pDriverData, mock_mem_module_close_calls);
+        return 1;
+    }
 
     if (!test_watchdog_ipc_is_pid_scoped_and_serialized() ||
+        !test_video_decode_result_is_validated() ||
         !test_preallocated_surface_free_failure_preserves_ownership() ||
         !test_terminate_preallocated_free_failure_is_retryable() ||
         !test_va_trace_concurrent_first_use() ||
+        !test_external_encoder_consumed_callback_is_single_flight() ||
+        !test_external_encoder_output_error_preserves_surface_ownership() ||
         !test_h264_deferred_encoder_configuration() ||
         !test_decoder_input_queue_failure_preserves_ownership() ||
         !test_surface_recycles_through_original_context() ||
         !test_encoder_surface_keeps_decoder_buffer_owner() ||
         !test_encoder_parameter_buffers_reject_truncation() ||
+        !test_fixed_record_parameters_reject_array_shape() ||
         !test_hevc_main_subset_parameter_validation() ||
+        !test_hevc_pcm_sps_serialization() ||
+        !test_hevc_tiles_pps_serialization() ||
         !test_hevc_rps_slice_validation() ||
+        !test_hevc_three_sps_rps_index_rewrite() ||
+        !test_hevc_rasl_nal_type_validation() ||
         !test_hevc_two_rps_multislice_p_validation() ||
+        !test_hevc_two_rps_b_sao_validation() ||
+        !test_hevc_two_rps_multireference_list_modification() ||
         !test_hevc_two_rps_multislice_b_validation() ||
         !test_hevc_two_rps_multislice_idr_validation() ||
         !test_hevc_main_encoder_parameter_validation() ||
+        !test_hevc_encoder_sequence_reconfiguration_contract() ||
         !test_hevc_encoder_disables_unsupported_sao() ||
         !test_hevc_sps_conformance_window_crop() ||
         !test_hevc_context_rejects_oversized_resolution() ||
         !test_h264_encoder_slice_constraints() ||
+        !test_h264_cqp_uses_effective_slice_qp() ||
         !test_h264_hrd_vbv_window() ||
         !test_encoder_control_errors_are_propagated() ||
         !test_h264_sequence_parameters_are_transactional() ||
+        !test_h264_zero_reference_requires_intra_slice() ||
         !test_jpeg_picture_quality_updates_vpu_and_rolls_back_on_error() ||
         !test_jpeg_empty_app9_is_stripped_only_when_exact() ||
         !test_jpeg_huffman_accepts_only_hardware_defaults() ||
         !test_jpeg_decode_header_is_bounded_baseline_420() ||
+        !test_jpeg_decode_rejected_parameters_do_not_mutate_cache() ||
+        !test_jpeg_rotation_mapping_and_deferred_start() ||
         !test_encoder_end_picture_coded_buffer_contract() ||
         !test_encoder_input_queue_failure_preserves_ownership() ||
         !test_encoder_terminate_retries_retained_buffers() ||
+        !test_decoder_terminate_retries_retained_output() ||
         !test_buffer_mapping_lifecycle() ||
+        !test_active_encoder_retains_coded_buffer() ||
         !test_render_picture_prevalidates_all_buffers() ||
         !test_h264_parameter_synthesis_rejects_unrepresentable_sps() ||
         !test_pending_surface_is_synced_before_reuse() ||
         !test_idle_surface_sync_is_ready_without_decoder_owner() ||
         !test_surface_info_validates_nv12_layout_and_addresses() ||
         !test_surface_sync_lock_contract() ||
+        !test_va_sync_surface2_timeout_and_completion() ||
+        !test_va_sync_surface2_mutex_timeout() ||
+        !test_va_sync_buffer_contract() ||
+        !test_va_sync_buffer_mutex_timeout() ||
         !test_va_lock_surface_lifetime() ||
+        !test_active_encoder_surface_excludes_competing_access() ||
         !test_fatal_dequeue_poison_requires_context_teardown() ||
         !test_sync_preserves_output_on_old_buffer_recycle_failure() ||
         !test_sync_does_not_recycle_locked_output_surface() ||
@@ -8620,17 +13921,28 @@ int main(void)
         !test_decoder_picture_failure_cleanup() ||
         !test_decoder_h264_slice_parameters() ||
         !test_h264_profile_sps_headers() ||
+        !test_h264_interlaced_picture_parameters() ||
         !test_h264_constrained_baseline_output_headers() ||
+        !test_h264_pps_reference_defaults_from_slice_parameters() ||
+        !test_h264_pps_defaults_with_picture_and_slices_in_one_render() ||
+        !test_h264_pps_defaults_when_picture_and_slices_are_separate() ||
         !test_h264_constrained_baseline_header_rejection() ||
         !test_surface_creation_validation() ||
+        !test_prime2_surface_import() ||
         !test_dequeued_output_recycle_failure_preserves_ownership(0) ||
         !test_dequeued_output_recycle_failure_preserves_ownership(1) ||
+        !test_dequeued_output_timeout_is_retried_on_next_sync() ||
         !test_buffer_size_overflow_rejected() ||
         !test_buffer_num_elements_tracks_valid_size() ||
         !test_coded_buffer_honors_requested_capacity() ||
+        !test_legacy_surface_attribute_query() ||
         !test_unsupported_va_operations_report_status() ||
         !test_export_rejects_invalid_flags() ||
         !test_context_target_count_is_bounded() ||
+        !test_context_flags_are_validated() ||
+        !test_context_render_target_lifetime() ||
+        !test_encoder_picture_reference_lifetime() ||
+        !test_hevc_decoder_rejects_unallocated_reference_surface() ||
         !test_api_array_counts_are_bounded() ||
         !test_begin_picture_rejects_undersized_surface() ||
         !test_put_image_updates_preallocated_dma_surface() ||
@@ -8640,8 +13952,10 @@ int main(void)
         !test_image_size_and_rectangle_bounds() ||
         !test_decoded_nv12_plane_bounds() ||
         !test_begin_picture_rejects_stopped_context() ||
-        !test_query_surface_status_tracks_pending_decode() ||
-        !test_derived_image_reports_staging_layout() ||
+        !test_query_surface_status_tracks_pending_work() ||
+        !test_query_surface_error_is_explicitly_unimplemented() ||
+        !test_derived_image_maps_surface_storage() ||
+        !test_derived_image_buffer_handle_lifecycle() ||
         !test_config_capabilities_match_encoder() ||
         !test_sync_does_not_block_unrelated_context() ||
         !test_buffer_api_concurrent_access())
@@ -8766,11 +14080,20 @@ int main(void)
     mock_configure_result = -1;
     mock_stop_result = 0;
     mock_release_result = -1;
+    VASurfaceID orphan_target = 12;
+    VASurfaceID recovered_target = 13;
+    drv.surfaces[orphan_target].allocated = 1;
+    drv.surfaces[recovered_target].allocated = 1;
     VAContextID failed_context = VA_INVALID_ID;
-    status = hobot_vaCreateContext(&va_ctx, 1, 1280, 720, 0, NULL, 0, &failed_context);
+    status = hobot_vaCreateContext(&va_ctx, 1, 1280, 720, 0,
+                                   &orphan_target, 1, &failed_context);
     if (status != VA_STATUS_ERROR_OPERATION_FAILED || !drv.contexts[1].allocated ||
         !drv.contexts[1].vpu_initialized || drv.contexts[1].vpu_running ||
-        !drv.contexts[1].cleanup_orphaned) {
+        !drv.contexts[1].cleanup_orphaned ||
+        drv.surfaces[orphan_target].context_usage_mask !=
+            hobot_context_usage_bit(1) ||
+        hobot_vaDestroySurfaces(&va_ctx, &orphan_target, 1) !=
+            VA_STATUS_ERROR_SURFACE_BUSY) {
         fprintf(stderr, "create cleanup failure state was not preserved: status=%d allocated=%d initialized=%d running=%d\n",
                 status, drv.contexts[1].allocated, drv.contexts[1].vpu_initialized,
                 drv.contexts[1].vpu_running);
@@ -8785,6 +14108,8 @@ int main(void)
     if (status != VA_STATUS_ERROR_OPERATION_FAILED || recovered_context != VA_INVALID_ID ||
         !drv.contexts[1].allocated || !drv.contexts[1].vpu_initialized ||
         !drv.contexts[1].cleanup_orphaned || drv.contexts[2].allocated ||
+        drv.surfaces[orphan_target].context_usage_mask !=
+            hobot_context_usage_bit(1) ||
         mock_release_calls != 4) {
         fprintf(stderr, "failed orphan retry changed preserved state: status=%d id=%u allocated=%d initialized=%d orphan=%d releases=%d\n",
                 status, recovered_context, drv.contexts[1].allocated,
@@ -8795,11 +14120,19 @@ int main(void)
     }
 
     mock_release_result = 0;
-    status = hobot_vaCreateContext(&va_ctx, 1, 1280, 720, 0, NULL, 0,
+    status = hobot_vaCreateContext(&va_ctx, 1, 1280, 720, 0,
+                                   &recovered_target, 1,
                                    &recovered_context);
     if (status != VA_STATUS_SUCCESS || recovered_context != 1 ||
         !drv.contexts[1].allocated || !drv.contexts[1].vpu_running ||
-        drv.contexts[1].cleanup_orphaned || mock_release_calls != 5) {
+        drv.contexts[1].cleanup_orphaned || mock_release_calls != 5 ||
+        drv.surfaces[orphan_target].context_usage_mask != 0 ||
+        drv.surfaces[recovered_target].context_usage_mask !=
+            hobot_context_usage_bit(recovered_context) ||
+        hobot_vaDestroySurfaces(&va_ctx, &orphan_target, 1) !=
+            VA_STATUS_SUCCESS ||
+        hobot_vaDestroySurfaces(&va_ctx, &recovered_target, 1) !=
+            VA_STATUS_ERROR_SURFACE_BUSY) {
         fprintf(stderr, "orphan context recovery failed: status=%d id=%u allocated=%d running=%d orphan=%d releases=%d\n",
                 status, recovered_context, drv.contexts[1].allocated,
                 drv.contexts[1].vpu_running, drv.contexts[1].cleanup_orphaned,
@@ -8809,7 +14142,10 @@ int main(void)
     }
     status = hobot_vaDestroyContext(&va_ctx, recovered_context);
     if (status != VA_STATUS_SUCCESS || drv.contexts[1].allocated ||
-        drv.contexts[1].vpu_initialized) {
+        drv.contexts[1].vpu_initialized ||
+        drv.surfaces[recovered_target].context_usage_mask != 0 ||
+        hobot_vaDestroySurfaces(&va_ctx, &recovered_target, 1) !=
+            VA_STATUS_SUCCESS) {
         fprintf(stderr, "recovered context teardown failed: status=%d allocated=%d initialized=%d\n",
                 status, drv.contexts[1].allocated, drv.contexts[1].vpu_initialized);
         pthread_mutex_destroy(&drv.mutex);

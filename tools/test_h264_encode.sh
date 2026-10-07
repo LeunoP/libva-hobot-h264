@@ -3,9 +3,21 @@ set -euo pipefail
 
 ffmpeg_bin=${FFMPEG:-ffmpeg}
 ffprobe_bin=${FFPROBE:-ffprobe}
-drm_device=${HOBOT_DRM_DEVICE:-/dev/dri/card0}
+drm_device=${HOBOT_DRM_DEVICE:-/dev/dri/renderD128}
 driver_name=${LIBVA_DRIVER_NAME:-hobot}
 cycles=${HOBOT_H264_ENCODE_CYCLES:-3}
+rate_control=${HOBOT_H264_ENCODE_RC_MODE:-CBR}
+qp=${HOBOT_H264_ENCODE_QP:-26}
+h264_profile=${HOBOT_H264_ENCODE_PROFILE:-high}
+case "$h264_profile" in
+    constrained_baseline) expected_profile='Constrained Baseline' ;;
+    main) expected_profile=Main ;;
+    high) expected_profile=High ;;
+    *)
+        printf 'HOBOT_H264_ENCODE_PROFILE must be constrained_baseline, main, or high\n' >&2
+        exit 2
+        ;;
+esac
 
 command -v "$ffmpeg_bin" >/dev/null 2>&1 || {
     printf 'missing ffmpeg: %s\n' "$ffmpeg_bin" >&2
@@ -25,6 +37,14 @@ command -v "$ffprobe_bin" >/dev/null 2>&1 || {
 }
 [[ "$cycles" =~ ^[1-9][0-9]*$ ]] || {
     printf 'HOBOT_H264_ENCODE_CYCLES must be a positive integer\n' >&2
+    exit 2
+}
+if [[ "$rate_control" != CBR && "$rate_control" != VBR && "$rate_control" != CQP ]]; then
+    printf 'HOBOT_H264_ENCODE_RC_MODE must be CBR, VBR or CQP\n' >&2
+    exit 2
+fi
+[[ "$qp" =~ ^([1-9]|[1-4][0-9]|5[01])$ ]] || {
+    printf 'HOBOT_H264_ENCODE_QP must be in [1, 51]; use test_h264_crop_encode.sh for direct VA QP 0 validation\n' >&2
     exit 2
 }
 if [[ $# -gt 1 ]]; then
@@ -58,6 +78,7 @@ for ((cycle = 1; cycle <= cycles; cycle++)); do
             height=720
             frames=60
             bitrate=5M
+            max_bitrate=8M
             bufsize=10M
             source_rate=60
             expected_fps=60/1
@@ -70,6 +91,7 @@ for ((cycle = 1; cycle <= cycles; cycle++)); do
             height=360
             frames=30
             bitrate=2M
+            max_bitrate=3M
             bufsize=4M
             source_rate=60
             expected_fps=60/1
@@ -82,6 +104,7 @@ for ((cycle = 1; cycle <= cycles; cycle++)); do
             height=720
             frames=30
             bitrate=5M
+            max_bitrate=8M
             bufsize=10M
             source_rate=30000/1001
             expected_fps=30000/1001
@@ -95,18 +118,27 @@ for ((cycle = 1; cycle <= cycles; cycle++)); do
         hardware_hashes="$output_dir/hardware-${width}x${height}-${scenario}-${suffix}.framemd5"
         header_log="$output_dir/headers-${width}x${height}-${scenario}-${suffix}.log"
 
+        rate_control_args=(-rc_mode "$rate_control")
+        if [[ "$rate_control" == CBR ]]; then
+            rate_control_args+=(-b:v "$bitrate" -maxrate "$bitrate" -bufsize "$bufsize")
+        elif [[ "$rate_control" == VBR ]]; then
+            rate_control_args+=(-b:v "$bitrate" -maxrate "$max_bitrate" -bufsize "$bufsize")
+        else
+            rate_control_args+=(-qp "$qp")
+        fi
+
         env "${driver_env[@]}" "$ffmpeg_bin" -hide_banner -loglevel error -y \
             -vaapi_device "$drm_device" -f lavfi \
             -i "testsrc2=size=${width}x${height}:rate=${source_rate}" \
-            -vf 'format=nv12,hwupload' -c:v h264_vaapi -profile:v high -level:v 4.1 \
-            -b:v "$bitrate" -maxrate "$bitrate" -bufsize "$bufsize" \
+            -vf 'format=nv12,hwupload' -c:v h264_vaapi -profile:v "$h264_profile" -level:v 4.1 \
+            "${rate_control_args[@]}" \
             -g 60 -bf 0 -frames:v "$frames" "$clip"
 
         stats=$("$ffprobe_bin" -v error -count_frames -select_streams v:0 \
             -show_entries stream=profile,level,avg_frame_rate,color_range,nb_read_frames \
             -of csv=p=0 "$clip")
-        IFS=, read -r profile level color_range fps actual_frames <<< "$stats"
-        if [[ "$profile" != High || "$level" != 41 || "$fps" != "$expected_fps" ||
+        IFS=, read -r actual_profile level color_range fps actual_frames <<< "$stats"
+        if [[ "$actual_profile" != "$expected_profile" || "$level" != 41 || "$fps" != "$expected_fps" ||
               "$color_range" != tv || "$actual_frames" != "$frames" ]]; then
             printf 'unexpected stream metadata in %s cycle %s: %s\n' \
                 "$scenario" "$suffix" "$stats" >&2
@@ -114,7 +146,7 @@ for ((cycle = 1; cycle <= cycles; cycle++)); do
         fi
 
         "$ffmpeg_bin" -hide_banner -loglevel verbose -i "$clip" -map 0:v:0 \
-            -c:v copy -bsf:v trace_headers -frames:v 1 -f null - >"$header_log" 2>&1
+            -c:v copy -bsf:v trace_headers -frames:v 4 -f null - >"$header_log" 2>&1
         for expected in \
             'level_idc[[:space:]].*= 41$' \
             "num_units_in_tick[[:space:]].*= ${expected_num_units}$" \
@@ -127,6 +159,19 @@ for ((cycle = 1; cycle <= cycles; cycle++)); do
                 exit 1
             fi
         done
+        if [[ "$rate_control" == CQP ]] &&
+           ! awk -v expected="$qp" '
+                /pic_init_qp_minus26/ { base_qp = $NF + 26 }
+                /slice_qp_delta/ {
+                    if (base_qp + $NF != expected) invalid = 1
+                    slices++
+                }
+                END { exit (invalid || slices == 0) }
+            ' "$header_log"; then
+            printf 'CQP output did not preserve requested QP %s in %s cycle %s\n' \
+                "$qp" "$scenario" "$suffix" >&2
+            exit 1
+        fi
         if [[ "$crop_bottom" -gt 0 ]] &&
            ! grep -Eq "frame_crop_bottom_offset[[:space:]].*= ${crop_bottom}$" "$header_log"; then
             printf 'unexpected bottom crop in %s cycle %s\n' "$scenario" "$suffix" >&2
@@ -144,10 +189,11 @@ for ((cycle = 1; cycle <= cycles; cycle++)); do
                 "$scenario" "$suffix" >&2
             exit 1
         fi
-        printf 'PASS cycle %s %s: H.264 High L4.1 %s, crop/range VUI, %s matching decode frames\n' \
-            "$suffix" "$scenario" "$expected_fps" "$frames"
+        printf 'PASS cycle %s %s: H.264 %s L4.1 %s %s, crop/range VUI, %s matching decode frames\n' \
+            "$suffix" "$scenario" "$expected_profile" "$rate_control" \
+            "$expected_fps" "$frames"
     done
 done
 
-printf 'PASS: %s cycles each of aligned, cropped and fractional-FPS H.264; artifacts: %s\n' \
-    "$cycles" "$output_dir"
+printf 'PASS: %s cycles each of aligned, cropped and fractional-FPS H.264 %s %s; artifacts: %s\n' \
+    "$cycles" "$expected_profile" "$rate_control" "$output_dir"

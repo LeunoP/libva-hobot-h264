@@ -3,7 +3,7 @@ set -euo pipefail
 
 ffmpeg_bin=${FFMPEG:-ffmpeg}
 ffprobe_bin=${FFPROBE:-ffprobe}
-drm_device=${HOBOT_DRM_DEVICE:-/dev/dri/card0}
+drm_device=${HOBOT_DRM_DEVICE:-/dev/dri/renderD128}
 driver_name=${LIBVA_DRIVER_NAME:-hobot}
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 fixture="$script_dir/testdata/hevc_main_640x360_two_slices_single_sps_rps_p3.hevc"
@@ -55,13 +55,13 @@ trace_log="$output_dir/trace_headers.log"
 "$ffmpeg_bin" -hide_banner -loglevel trace -f hevc -i "$fixture" \
     -c:v copy -bsf:v trace_headers -f null - 2>"$trace_log"
 
-rps_count_check=$(awk '/\[trace_headers @/ && /num_short_term_ref_pic_sets/ {
+if ! awk '/\[trace_headers @/ && /num_short_term_ref_pic_sets/ {
     if ($NF != "1") invalid = 1
     seen++
-} END { print seen + 0; exit !(seen > 0 && !invalid) }' "$trace_log") || {
+} END { exit !(seen > 0 && !invalid) }' "$trace_log"; then
     printf 'fixture must signal exactly one SPS short-term RPS\n' >&2
     exit 1
-}
+fi
 slice_flags=$(awk '/\[trace_headers @/ && /first_slice_segment_in_pic_flag/ { print $NF }' \
     "$trace_log" | paste -sd, -)
 slice_addresses=$(awk '/\[trace_headers @/ && /slice_segment_address/ { print $NF }' \
