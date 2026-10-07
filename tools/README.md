@@ -1,20 +1,36 @@
-# Verification and Benchmark Tools
+# Verification tools
 
-This directory contains standalone test and benchmark tools for validating hardware zero-copy video playback pipelines on the D-Robotics RDK-X5 platform.
+The tools in this directory cover VA capability/state checks and hardware regressions. Hardware tests must run on an RDK-X5 with the vendor VPU stack available. A passing fixture verifies that case only; it does not imply support for arbitrary bitstreams.
 
-### 1. `test_directviv.c`
-Validates that Vivante GC8000L proprietary OpenGL ES direct texture extension (`GL_VIV_direct_texture` / `glTexDirectVIVMap`) can bind contiguous NV12 physical memory allocated via Hobot ION memory manager directly to a `GL_TEXTURE_2D` texture.
+## Build and run
 
-### 2. `test_render_directviv.c`
-Creates a `GL_VIV_NV12` direct texture and executes a complete GLES shader rendering pipeline to sample the NV12 texture into an RGB framebuffer, validating GPU hardware color space conversion.
+```bash
+make build-va-tests
+make test-va-state
+LIBVA_DRIVER_NAME=hobot /tmp/libva-hobot-tests/test_va_config
+```
 
-### 3. `test_nv12_overlay.c`
-Validates importing Hobot NV12 DMA-BUF into DRM KMS (`/dev/dri/card0`) using `drmPrimeFDToHandle` and `drmModeAddFB2` for hardware overlay planes.
+To load a candidate driver from the repository instead of the installed copy:
 
-### 4. `test_va_directviv_bench.c`
-Full end-to-end benchmark pipeline:
-1. Initializes VA-API with `libva-hobot` driver on `/dev/dri/card0`.
-2. Hardware decodes high-bitrate H.264 video streams frame-by-frame via Wave521 VPU.
-3. Exports each decoded surface's contiguous physical address via `vaExportSurfaceHandle`.
-4. Maps physical addresses directly into Vivante GLES 2D textures using `glTexDirectVIVMap`.
-5. Renders textured quads at up to 180+ FPS with zero CPU copying and zero frame drops.
+```bash
+make -j"$(nproc)"
+LIBVA_DRIVER_NAME=hobot LIBVA_DRIVERS_PATH="$PWD" <test-command>
+```
+
+Read each script's usage and environment-variable section before running it. Tests that take media inputs or output paths require those arguments. Scripts may save logs and encoded streams under a temporary or caller-selected directory.
+
+## Test index
+
+| Area | Tests |
+|---|---|
+| VA capabilities and mock state | `test_va_config.c`, `test_va_surface_state.c` |
+| Surface export/import and sync | `test_va_surface_export.c`, `test_va_surface_import.c` |
+| H.264 decode | `test_h264_bframe_decode.sh`, `test_h264_b_pyramid_decode.sh`, `test_h264_profile_decode.sh`, `test_h264_multislice_decode.sh` |
+| HEVC decode | `test_hevc_main_decode.sh`; single-/two-/three-RPS and inline-RPS tests; multislice, SAO, TMVP, weighted prediction, open-GOP, PCM, tiles, and WPP tests (`test_hevc_*_decode.sh`) |
+| H.264 encode | `test_h264_encode.sh`, `test_h264_encode_profiles.sh`, `test_h264_crop_encode.sh` |
+| HEVC encode | `test_hevc_main_encode.sh`, `test_hevc_cqp_encode.sh`, `test_hevc_wpp_encode.sh`, `test_vbr_encode.sh` |
+| JPEG | `test_va_jpeg_decode.sh`, `test_va_jpeg_rotation.sh`, `test_va_jpeg_encode.c` |
+| Concurrency and performance | `test_vpu_concurrent_decode.sh`, `test_vpu_multicontext_decode.sh`, `test_hevc_4k60_throughput.sh`, `test_va_directviv_bench.c` |
+| DirectVIV/DRM smoke tests | `test_directviv.c`, `test_render_directviv.c`, `test_nv12_overlay.c` |
+
+HEVC bitstream fixtures are in [`testdata/`](testdata/); their test mapping is listed in [`testdata/README.md`](testdata/README.md). Decode regressions compare hardware output with a software reference where the test supports that comparison. Throughput and rendering benchmarks measure only their stated workload and setup.
