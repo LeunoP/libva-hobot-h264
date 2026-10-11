@@ -81,7 +81,22 @@ int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IONBF, 0);
     setvbuf(stderr, NULL, _IONBF, 0);
 
-    const char *video_path = (argc > 1) ? argv[1] : "/home/rho412/test_1080p60.mp4";
+    char default_video_path[4096];
+    const char *video_path;
+    if (argc > 1) {
+        video_path = argv[1];
+    } else {
+        const char *home = getenv("HOME");
+        if (!home || !*home)
+            home = ".";
+        int path_len = snprintf(default_video_path, sizeof(default_video_path),
+                                "%s/Videos/test_1080p60.mp4", home);
+        if (path_len < 0 || (size_t)path_len >= sizeof(default_video_path)) {
+            fprintf(stderr, "Default video path is too long\n");
+            return 1;
+        }
+        video_path = default_video_path;
+    }
     printf("===============================================================\n");
     printf("RDK-X5 Real VPU H.264 -> DirectVIV -> GLES Benchmark\n");
     printf("Target video: %s\n", video_path);
