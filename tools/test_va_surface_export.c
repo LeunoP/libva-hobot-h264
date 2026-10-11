@@ -182,7 +182,22 @@ static int receive_frames(AVCodecContext *decoder, VADisplay display,
 
 int main(int argc, char **argv)
 {
-    const char *path = argc > 1 ? argv[1] : "/home/rho412/test_1080p60.mp4";
+    char default_path[4096];
+    const char *path;
+    if (argc > 1) {
+        path = argv[1];
+    } else {
+        const char *home = getenv("HOME");
+        if (!home || !*home)
+            home = ".";
+        int path_len = snprintf(default_path, sizeof(default_path),
+                                "%s/Videos/test_1080p60.mp4", home);
+        if (path_len < 0 || (size_t)path_len >= sizeof(default_path)) {
+            fprintf(stderr, "Default video path is too long\n");
+            return 1;
+        }
+        path = default_path;
+    }
     AVFormatContext *format = NULL;
     AVCodecContext *decoder = NULL;
     AVBufferRef *device = NULL;
